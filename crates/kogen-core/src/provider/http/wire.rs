@@ -1,0 +1,279 @@
+mod body;
+
+use serde_json::Value;
+use std::fmt;
+use url::Url;
+
+use crate::provider::auth::RequestCredential;
+use crate::provider::session::{
+    ConversationBinding, derive_cache_key, derive_lite_session_id, derive_thread_id,
+};
+use crate::provider::{ProviderErrorKind, ProviderFailure};
+
+#[cfg(test)]
+mod tests;
+
+const OWNED_ENDPOINT: &str = "https://api.openai.com/v1/responses";
+const INJECTED_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApiMode {
+    Responses,
+    Lite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseMode {
+    Owned,
+    Injected,
+    Lite,
+}
+
+#[derive(Clone, Debug)]
+pub struct WireConfig {
+    pub endpoint_override: Option<Url>,
+    pub mode: ResponseMode,
+    pub supports_generation_cap: bool,
+    pub user_agent_version: String,
+}
+
+impl WireConfig {
+    pub fn from_auth(auth: &RequestCredential, mode: ApiMode) -> Result<Self, ProviderFailure> {
+        let injected = matches!(auth, RequestCredential::Injected(_));
+        let mode = match (injected, mode) {
+            (false, ApiMode::Responses) => ResponseMode::Owned,
+            (true, ApiMode::Responses) => ResponseMode::Injected,
+            (_, ApiMode::Lite) => ResponseMode::Lite,
+        };
+        let endpoint_override = std::env::var("KOGEN_PROVIDER_URL")
+            .ok()
+            .map(|endpoint| {
+                Url::parse(&endpoint)
+                    .ok()
+                    .filter(|url| {
+                        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                    })
+                    .ok_or_else(|| {
+                        ProviderFailure::new(
+                            ProviderErrorKind::Malformed,
+                            "ChatGPT provider URL is invalid.",
+                        )
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            endpoint_override,
+            mode,
+            supports_generation_cap: false,
+            user_agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> Url {
+        if let Some(endpoint) = &self.endpoint_override {
+            return endpoint.clone();
+        }
+        let raw = if self.mode == ResponseMode::Owned {
+            OWNED_ENDPOINT
+        } else {
+            INJECTED_ENDPOINT
+        };
+        Url::parse(raw).expect("constant Responses endpoint")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestContext {
+    pub model: String,
+    pub effort: String,
+    pub instructions: String,
+    pub shared_instructions: String,
+    pub role_instructions: String,
+    pub input: Vec<Value>,
+    pub tools: Vec<Value>,
+    pub callable_tools: Vec<String>,
+    pub tool_choice: String,
+    pub development_request: bool,
+    pub generation_tokens: Option<u64>,
+    pub cache_key: String,
+    pub thread_id: String,
+    pub lite_session_id: String,
+}
+
+impl RequestContext {
+    pub fn for_conversation(
+        binding: &ConversationBinding,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+        instructions: impl Into<String>,
+        input: Vec<Value>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            model: model.into(),
+            effort: effort.into(),
+            instructions: instructions.into(),
+            shared_instructions: String::new(),
+            role_instructions: String::new(),
+            input,
+            tools: Vec::new(),
+            callable_tools: Vec::new(),
+            tool_choice: "auto".to_owned(),
+            development_request: false,
+            generation_tokens: None,
+            cache_key: derive_cache_key(&binding.run_dir)?,
+            thread_id: derive_thread_id(binding)?,
+            lite_session_id: derive_lite_session_id(&binding.run_dir)?,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct WireRequest {
+    pub endpoint: Url,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl fmt::Debug for WireRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                if name == "authorization" {
+                    (name.as_str(), "Bearer [REDACTED]")
+                } else {
+                    (name.as_str(), value.as_str())
+                }
+            })
+            .collect();
+        formatter
+            .debug_struct("WireRequest")
+            .field("endpoint", &self.endpoint)
+            .field("headers", &headers)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
+impl WireRequest {
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+pub fn validate_generation_cap(
+    endpoint: &Url,
+    mode: ResponseMode,
+    model: &str,
+    generation_tokens: Option<u64>,
+    supports_generation_cap: bool,
+) -> Result<(), ProviderFailure> {
+    if mode == ResponseMode::Lite && (model != "gpt-6-luna" || generation_tokens.is_some()) {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::Unsupported,
+            "Unsupported adapter or model-generation cap for this backend.",
+        ));
+    }
+    if generation_tokens.is_some_and(|tokens| !(1..=100_000).contains(&tokens)) {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::Unsupported,
+            "Model-generation cap must be between 1 and 100000.",
+        ));
+    }
+    if generation_tokens.is_some()
+        && endpoint.as_str() != OWNED_ENDPOINT
+        && !supports_generation_cap
+    {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::Unsupported,
+            "Model-generation cap is unsupported on this endpoint/adapter.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn build_wire_request(
+    request: &RequestContext,
+    auth: &RequestCredential,
+    config: &WireConfig,
+) -> Result<WireRequest, ProviderFailure> {
+    let endpoint = config.endpoint();
+    if request.cache_key.is_empty() || request.thread_id.is_empty() {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::Malformed,
+            "ChatGPT request is missing its cache or conversation identity.",
+        ));
+    }
+    validate_generation_cap(
+        &endpoint,
+        config.mode,
+        &request.model,
+        request.generation_tokens,
+        config.supports_generation_cap,
+    )?;
+    if config.mode == ResponseMode::Lite && !matches!(auth, RequestCredential::Injected(_)) {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::Unsupported,
+            "Unsupported adapter or model-generation cap for this backend.",
+        ));
+    }
+    let account_id = auth.account_id();
+    if config.mode == ResponseMode::Injected && account_id.is_none() {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::Login,
+            "Codex login is missing, invalid, or expired.",
+        ));
+    }
+    let body = body::encode(request, config.mode).map_err(|_| {
+        ProviderFailure::new(
+            ProviderErrorKind::Malformed,
+            "Could not encode ChatGPT request.",
+        )
+    })?;
+    let mut headers = vec![
+        (
+            "authorization".to_owned(),
+            format!("Bearer {}", auth.access_token()),
+        ),
+        ("content-type".to_owned(), "application/json".to_owned()),
+        ("accept".to_owned(), "text/event-stream".to_owned()),
+        (
+            "user-agent".to_owned(),
+            match config.mode {
+                ResponseMode::Owned => "kogen/0.1".to_owned(),
+                _ => format!("kogen/{}", config.user_agent_version),
+            },
+        ),
+    ];
+    if matches!(config.mode, ResponseMode::Injected | ResponseMode::Lite) {
+        headers.push((
+            "chatgpt-account-id".to_owned(),
+            account_id.unwrap_or_default(),
+        ));
+        headers.push((
+            "openai-beta".to_owned(),
+            "responses=experimental".to_owned(),
+        ));
+        headers.push(("originator".to_owned(), "kogen".to_owned()));
+    }
+    headers.push(("session-id".to_owned(), request.cache_key.clone()));
+    headers.push(("thread-id".to_owned(), request.thread_id.clone()));
+    if config.mode == ResponseMode::Lite {
+        headers.push((
+            "x-openai-internal-codex-responses-lite".to_owned(),
+            "true".to_owned(),
+        ));
+        headers.push(("session_id".to_owned(), request.lite_session_id.clone()));
+    }
+    Ok(WireRequest {
+        endpoint,
+        headers,
+        body,
+    })
+}
