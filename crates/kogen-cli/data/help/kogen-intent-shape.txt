@@ -1,0 +1,11 @@
+Usage: kogen intent shape <slug> <file|-> [options]
+
+Shapes .kogen/intents/<slug>/intent.md and its acceptance test from the request in <file>
+(- reads stdin). Waits until the shaper finishes, with no time limit. Never approves.
+Shaping defaults to gpt-6.1-sol at high effort. An explicit build.roles.shaper in
+project or machine config overrides this default.
+
+Options:
+  --project <checkout>  Project checkout (default: current directory)
+  --origin <repo>       Git repository holding Intent state and the target branch
+  --base <branch>       Target branch (project setting, origin HEAD, then current branch)

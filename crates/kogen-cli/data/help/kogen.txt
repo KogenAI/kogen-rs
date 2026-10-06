@@ -1,0 +1,12 @@
+Commands:
+  status     Show the queue, Builds and Intents
+  intent     Shape, approve or remove an Intent
+  queue      Build approved Intents one at a time
+  provider   Manage Kogen's provider logins
+  version    Show the Kogen version
+  help       List commands
+
+Intent shaping defaults to gpt-6.1-sol at high effort; an explicit build.roles.shaper
+in project or machine config overrides this default.
+
+Run kogen <command> to see its subcommands and options.
