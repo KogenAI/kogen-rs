@@ -1,8 +1,8 @@
 mod approve;
 mod intent;
 mod queue;
-mod setup_cache;
 mod recovery;
+mod setup_cache;
 mod status;
 mod temp;
 
