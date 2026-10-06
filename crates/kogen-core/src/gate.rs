@@ -6,6 +6,8 @@ mod tree;
 mod verification;
 mod workspace;
 
+pub mod adapters;
+
 pub mod ledger;
 
 pub use ledger::{
