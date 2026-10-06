@@ -1,1 +1,22 @@
 //! Durable run journal and process custody.
+//!
+//! `ProcessPort` is the shared production seam for approval checks, gate
+//! checks, acceptance adapters, and tools. Callers provide the exact argv and
+//! exact child environment; this module never invokes a shell implicitly.
+
+mod environment;
+mod process;
+mod sandbox;
+mod script;
+mod watchdog;
+
+pub use environment::{
+    EnvironmentError, EnvironmentMap, EnvironmentRequest, build_child_environment, host_environment,
+};
+pub use process::{
+    ChildEnvironment, DEFAULT_PROCESS_TIMEOUT, OUTPUT_TAIL_BYTES, ProcessError, ProcessPort,
+    ProcessRequest, ProcessResult, ProcessSupervisor, SandboxObservation, SandboxStatus,
+    StdinSource,
+};
+pub use sandbox::{SandboxIntegrityPort, SandboxPolicy, SandboxedProcessPort};
+pub use script::{DEFAULT_SHELL_TIMEOUT, ScriptError, run_private_script};
