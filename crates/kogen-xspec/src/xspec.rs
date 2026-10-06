@@ -1,6 +1,7 @@
 mod approve;
 mod intent;
 mod queue;
+mod rebase;
 mod recovery;
 mod setup_cache;
 mod status;
@@ -18,6 +19,7 @@ pub struct Adapter {
     setup_cache: setup_cache::Replay,
     status: kogen_core::status::StatusReplay,
     recovery: kogen_core::recovery::RecoveryModel,
+    landing: kogen_core::git::landing::LandingModel,
 }
 
 #[derive(Clone, Copy)]
@@ -28,6 +30,7 @@ enum Slice {
     SetupCache,
     Status,
     Recovery,
+    Rebase,
 }
 
 impl Adapter {
@@ -39,6 +42,7 @@ impl Adapter {
             "setup-cache" => Slice::SetupCache,
             "status" => Slice::Status,
             "recovery" => Slice::Recovery,
+            "rebase" => Slice::Rebase,
             _ => return Err(format!("unknown private slice `{name}`")),
         };
         let project = TempProject::new()?;
@@ -52,6 +56,7 @@ impl Adapter {
             setup_cache,
             status: kogen_core::status::StatusReplay::new(),
             recovery: kogen_core::recovery::RecoveryModel::new(),
+            landing: kogen_core::git::landing::LandingModel::new(),
         })
     }
 
@@ -78,6 +83,7 @@ impl Adapter {
                         Slice::SetupCache => self.setup_cache.apply(&event),
                         Slice::Status => status::apply(&mut self.status, &event),
                         Slice::Recovery => recovery::apply(&mut self.recovery, &event),
+                        Slice::Rebase => rebase::apply(&mut self.landing, &event),
                     }
                 }
             }
@@ -96,6 +102,7 @@ impl Adapter {
         self.queue = QueueScheduler::new();
         self.status = kogen_core::status::StatusReplay::new();
         self.recovery = kogen_core::recovery::RecoveryModel::new();
+        self.landing = kogen_core::git::landing::LandingModel::new();
         Ok(self.observation())
     }
 
@@ -110,6 +117,8 @@ impl Adapter {
                 .expect("status observations are serializable"),
             Slice::Recovery => serde_json::to_value(self.recovery.observe())
                 .expect("recovery observations are serializable"),
+            Slice::Rebase => serde_json::to_value(self.landing.observe())
+                .expect("landing observations are serializable"),
         }
     }
 }
@@ -128,6 +137,7 @@ fn initial_state(slice: Slice) -> Value {
             "last": "ok",
         }),
         Slice::Status | Slice::Recovery => Value::Null,
+        Slice::Rebase => json!(kogen_core::git::landing::LandingModel::new().observe()),
     }
 }
 

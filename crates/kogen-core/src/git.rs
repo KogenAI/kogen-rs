@@ -1,5 +1,7 @@
 //! Small, explicit Git operations shared by approval and later ref owners.
 
+pub mod landing;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
