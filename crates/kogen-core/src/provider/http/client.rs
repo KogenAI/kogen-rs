@@ -141,13 +141,21 @@ pub fn respond(
     home: Option<&Path>,
     account_label: Option<&str>,
 ) -> Result<ProviderCall, ProviderCallFailure> {
+    if wire_config.mode == super::wire::ResponseMode::Grok {
+        if request.model.is_empty() {
+            request.model = crate::provider::grok::DEFAULT_MODEL.to_owned();
+        }
+        if request.effort.is_empty() {
+            request.effort = crate::provider::grok::DEFAULT_EFFORT.to_owned();
+        }
+    }
     let mut events = Vec::new();
     let mut attempts = Vec::new();
     let mut spent = 0_u64;
     let open = serde_json::json!({
         "role": options.role,
         "model": model_class(&request.model),
-        "fallbackOn": options.fallback_on,
+        "fallbackOn": options.fallback_on && wire_config.mode != super::wire::ResponseMode::Grok,
         "bounded": options.wall_budget_ms.is_some(),
         "wall": options.wall_budget_ms.unwrap_or(0),
         "mode": options.mode,
@@ -185,6 +193,7 @@ pub fn respond(
                 });
             }
             Err(failure) => {
+                let mut refresh_failure = None;
                 let has_items = !attempt.received_items.is_empty();
                 let result = serde_json::json!({
                     "kind": failure.kind.as_str(),
@@ -194,11 +203,21 @@ pub fn respond(
                 update_wall(policy, options.wall_budget_ms, spent);
                 policy.apply("Result", Some(&result));
                 if policy.decision == "refresh" {
-                    if let Some(credential) = refresh_owned(auth, home, account_label) {
-                        *auth = RequestCredential::Owned(credential);
-                        continue;
+                    if let (Some(home), Some(label)) = (home, account_label) {
+                        match auth::refresh_request_after_401(home, label, auth) {
+                            Ok(Some(credential)) => {
+                                *auth = credential;
+                                continue;
+                            }
+                            Ok(None) => policy.apply("Result", Some(&result)),
+                            Err(refresh_error) => {
+                                refresh_failure = Some(refresh_error);
+                                policy.apply("Result", Some(&result));
+                            }
+                        }
+                    } else {
+                        policy.apply("Result", Some(&result));
                     }
-                    policy.apply("Result", Some(&result));
                 }
                 if policy.decision == "pause" {
                     let wait_ms = policy.delay;
@@ -208,10 +227,18 @@ pub fn respond(
                         budget_paused: true,
                     });
                     clock.sleep_ms(wait_ms);
-                    return Err(call_error(failure, events, attempts));
+                    return Err(call_error(
+                        refresh_failure.unwrap_or(failure),
+                        events,
+                        attempts,
+                    ));
                 }
                 if policy.phase == "stopped" || policy.decision == "incomplete" {
-                    return Err(call_error(failure, events, attempts));
+                    return Err(call_error(
+                        refresh_failure.unwrap_or(failure),
+                        events,
+                        attempts,
+                    ));
                 }
                 if policy.decision == "switch" {
                     let from_model = format!("{}/{}", request.model, request.effort);
@@ -264,7 +291,9 @@ fn update_wall(policy: &mut RetryReplay, budget: Option<u64>, spent: u64) {
 }
 
 fn model_class(model: &str) -> &'static str {
-    if model == "gpt-6.1-sol" {
+    if model.starts_with("grok-") {
+        "grok"
+    } else if model == "gpt-6.1-sol" {
         "sol"
     } else {
         "luna"
@@ -289,20 +318,6 @@ fn text_from_items(items: &[serde_json::Value]) -> String {
     text
 }
 
-fn refresh_owned(
-    credential: &RequestCredential,
-    home: Option<&Path>,
-    account_label: Option<&str>,
-) -> Option<auth::Credential> {
-    let RequestCredential::Owned(current) = credential else {
-        return None;
-    };
-    let (Some(home), Some(label)) = (home, account_label) else {
-        return None;
-    };
-    auth::refresh_after_401(home, label, &current.access_token).ok()
-}
-
 fn call_error(
     failure: ProviderFailure,
     events: Vec<RequestEvent>,
@@ -317,3 +332,7 @@ fn call_error(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "client/grok_tests.rs"]
+mod grok_tests;

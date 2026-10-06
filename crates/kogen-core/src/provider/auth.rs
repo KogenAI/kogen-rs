@@ -8,8 +8,10 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{RunAccount, provider_error};
+use super::{ProviderFailure, RunAccount, provider_error};
 
+#[path = "auth/grok.rs"]
+pub(crate) mod grok;
 #[path = "auth/jwt.rs"]
 mod jwt;
 #[path = "auth/oauth.rs"]
@@ -39,9 +41,21 @@ pub struct InjectedCredential {
     pub expires_at: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct GrokCredential {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+    pub scopes: Vec<String>,
+    pub email: Option<String>,
+    pub client_id: String,
+    pub token_endpoint: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestCredential {
     Owned(Credential),
+    Grok(GrokCredential),
     Injected(InjectedCredential),
 }
 
@@ -50,6 +64,7 @@ impl RequestCredential {
     pub fn access_token(&self) -> &str {
         match self {
             Self::Owned(credential) => &credential.access_token,
+            Self::Grok(credential) => &credential.access_token,
             Self::Injected(credential) => &credential.access_token,
         }
     }
@@ -58,6 +73,7 @@ impl RequestCredential {
     pub fn account_id(&self) -> Option<String> {
         match self {
             Self::Owned(credential) => account_id_from_id_token(&credential.id_token),
+            Self::Grok(_) => None,
             Self::Injected(credential) => Some(credential.account_id.clone()),
         }
     }
@@ -69,28 +85,31 @@ pub fn credential_for_request(
     home: &Path,
     account: &RunAccount,
 ) -> Result<RequestCredential, super::CoreError> {
-    if account.provider != "chatgpt" {
-        return Err(provider_error(
+    match account.provider.as_str() {
+        "chatgpt" => {
+            if let Some(path) = std::env::var_os("KOGEN_AUTH_PATH") {
+                return read_injected(Path::new(&path)).map(RequestCredential::Injected);
+            }
+            let credential = store::get(home, &account.label)?.ok_or_else(|| {
+                provider_error(
+                    "login",
+                    format!(
+                        "Selected account {} has no saved login; run kogen provider login chatgpt to sign in",
+                        account.label
+                    ),
+                )
+            })?;
+            if credential.expires_at <= now_seconds().saturating_add(300) {
+                return refresh::refresh(home, &account.label, None).map(RequestCredential::Owned);
+            }
+            Ok(RequestCredential::Owned(credential))
+        }
+        "grok" => grok::credential_for_request(home, &account.label).map(RequestCredential::Grok),
+        _ => Err(provider_error(
             "unsupported_provider",
-            "ChatGPT credentials requested for a non-ChatGPT run",
-        ));
+            "unsupported provider credentials requested",
+        )),
     }
-    if let Some(path) = std::env::var_os("KOGEN_AUTH_PATH") {
-        return read_injected(Path::new(&path)).map(RequestCredential::Injected);
-    }
-    let credential = store::get(home, &account.label)?.ok_or_else(|| {
-        provider_error(
-            "login",
-            format!(
-                "Selected account {} has no saved login; run kogen provider login chatgpt to sign in",
-                account.label
-            ),
-        )
-    })?;
-    if credential.expires_at <= now_seconds().saturating_add(300) {
-        return refresh::refresh(home, &account.label, None).map(RequestCredential::Owned);
-    }
-    Ok(RequestCredential::Owned(credential))
 }
 
 /// Refresh after an API 401 only when this is still the token the server
@@ -101,6 +120,25 @@ pub fn refresh_after_401(
     rejected_access_token: &str,
 ) -> Result<Credential, super::CoreError> {
     refresh::refresh(home, label, Some(rejected_access_token))
+}
+
+pub(crate) fn refresh_request_after_401(
+    home: &Path,
+    label: &str,
+    credential: &RequestCredential,
+) -> Result<Option<RequestCredential>, ProviderFailure> {
+    match credential {
+        RequestCredential::Owned(current) => {
+            refresh::refresh(home, label, Some(&current.access_token))
+                .map(RequestCredential::Owned)
+                .map(Some)
+                .or(Ok(None))
+        }
+        RequestCredential::Grok(current) => grok::refresh_after_401(home, label, current)
+            .map(RequestCredential::Grok)
+            .map(Some),
+        RequestCredential::Injected(_) => Ok(None),
+    }
 }
 
 pub fn read_injected(path: &Path) -> Result<InjectedCredential, super::CoreError> {

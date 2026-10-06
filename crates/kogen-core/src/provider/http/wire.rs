@@ -15,6 +15,7 @@ mod tests;
 
 const OWNED_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const INJECTED_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const GROK_ENDPOINT: &str = "https://cli-chat-proxy.grok.com/v1/responses";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiMode {
@@ -27,6 +28,7 @@ pub enum ResponseMode {
     Owned,
     Injected,
     Lite,
+    Grok,
 }
 
 #[derive(Clone, Debug)]
@@ -39,10 +41,10 @@ pub struct WireConfig {
 
 impl WireConfig {
     pub fn from_auth(auth: &RequestCredential, mode: ApiMode) -> Result<Self, ProviderFailure> {
-        let injected = matches!(auth, RequestCredential::Injected(_));
-        let mode = match (injected, mode) {
-            (false, ApiMode::Responses) => ResponseMode::Owned,
-            (true, ApiMode::Responses) => ResponseMode::Injected,
+        let mode = match (auth, mode) {
+            (RequestCredential::Grok(_), _) => ResponseMode::Grok,
+            (RequestCredential::Injected(_), ApiMode::Responses) => ResponseMode::Injected,
+            (_, ApiMode::Responses) => ResponseMode::Owned,
             (_, ApiMode::Lite) => ResponseMode::Lite,
         };
         let endpoint_override = std::env::var("KOGEN_PROVIDER_URL")
@@ -76,6 +78,8 @@ impl WireConfig {
         }
         let raw = if self.mode == ResponseMode::Owned {
             OWNED_ENDPOINT
+        } else if self.mode == ResponseMode::Grok {
+            GROK_ENDPOINT
         } else {
             INJECTED_ENDPOINT
         };
@@ -131,6 +135,7 @@ impl RequestContext {
 #[derive(Clone)]
 pub struct WireRequest {
     pub endpoint: Url,
+    pub mode: ResponseMode,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
@@ -203,8 +208,20 @@ pub fn build_wire_request(
     auth: &RequestCredential,
     config: &WireConfig,
 ) -> Result<WireRequest, ProviderFailure> {
+    let mut normalized_request = request.clone();
+    if config.mode == ResponseMode::Grok {
+        if normalized_request.model.is_empty() {
+            normalized_request.model = crate::provider::grok::DEFAULT_MODEL.to_owned();
+        }
+        if normalized_request.effort.is_empty() {
+            normalized_request.effort = crate::provider::grok::DEFAULT_EFFORT.to_owned();
+        }
+    }
+    let request = &normalized_request;
     let endpoint = config.endpoint();
-    if request.cache_key.is_empty() || request.thread_id.is_empty() {
+    if config.mode != ResponseMode::Grok
+        && (request.cache_key.is_empty() || request.thread_id.is_empty())
+    {
         return Err(ProviderFailure::new(
             ProviderErrorKind::Malformed,
             "ChatGPT request is missing its cache or conversation identity.",
@@ -223,6 +240,12 @@ pub fn build_wire_request(
             "Unsupported adapter or model-generation cap for this backend.",
         ));
     }
+    if config.mode == ResponseMode::Grok && !matches!(auth, RequestCredential::Grok(_)) {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::Login,
+            "Grok login is missing or invalid; run `kogen provider login grok`.",
+        ));
+    }
     let account_id = auth.account_id();
     if config.mode == ResponseMode::Injected && account_id.is_none() {
         return Err(ProviderFailure::new(
@@ -233,9 +256,50 @@ pub fn build_wire_request(
     let body = body::encode(request, config.mode).map_err(|_| {
         ProviderFailure::new(
             ProviderErrorKind::Malformed,
-            "Could not encode ChatGPT request.",
+            if config.mode == ResponseMode::Grok {
+                "Could not encode Grok request."
+            } else {
+                "Could not encode ChatGPT request."
+            },
         )
     })?;
+    if config.mode == ResponseMode::Grok {
+        let mut headers = vec![
+            (
+                "authorization".to_owned(),
+                format!("Bearer {}", auth.access_token()),
+            ),
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("accept".to_owned(), "text/event-stream".to_owned()),
+            ("x-xai-token-auth".to_owned(), "xai-grok-cli".to_owned()),
+            (
+                "x-authenticateresponse".to_owned(),
+                "authenticate-response".to_owned(),
+            ),
+            ("x-grok-model-override".to_owned(), request.model.clone()),
+            ("x-grok-client-identifier".to_owned(), "kogen".to_owned()),
+            ("x-grok-client-mode".to_owned(), "headless".to_owned()),
+            (
+                "x-grok-client-version".to_owned(),
+                config.user_agent_version.clone(),
+            ),
+            (
+                "user-agent".to_owned(),
+                format!("kogen/{}", config.user_agent_version),
+            ),
+            ("x-grok-req-id".to_owned(), request_id()),
+        ];
+        if !request.cache_key.is_empty() {
+            headers.push(("x-grok-conv-id".to_owned(), request.cache_key.clone()));
+            headers.push(("x-grok-session-id".to_owned(), request.cache_key.clone()));
+        }
+        return Ok(WireRequest {
+            endpoint,
+            mode: config.mode,
+            headers,
+            body,
+        });
+    }
     let mut headers = vec![
         (
             "authorization".to_owned(),
@@ -273,7 +337,35 @@ pub fn build_wire_request(
     }
     Ok(WireRequest {
         endpoint,
+        mode: config.mode,
         headers,
         body,
     })
+}
+
+fn request_id() -> String {
+    use rand::RngCore as _;
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }

@@ -20,8 +20,16 @@ use super::super::{accounts, environment_error, provider_error};
 use super::Credential;
 
 pub(crate) fn get(home: &Path, label: &str) -> Result<Option<Credential>, super::super::CoreError> {
-    validate_label(label)?;
-    let path = credential_path(home, label);
+    get_for(home, "chatgpt", label)
+}
+
+pub(crate) fn get_for<T: serde::de::DeserializeOwned>(
+    home: &Path,
+    provider: &str,
+    label: &str,
+) -> Result<Option<T>, super::super::CoreError> {
+    validate_identity(provider, label)?;
+    let path = credential_path(home, provider, label);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -30,7 +38,7 @@ pub(crate) fn get(home: &Path, label: &str) -> Result<Option<Credential>, super:
     let plaintext = if encrypted_store() {
         #[cfg(target_os = "macos")]
         {
-            decrypt(home, label, &bytes)?
+            decrypt(home, provider, label, &bytes)?
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -49,14 +57,23 @@ pub(crate) fn put(
     label: &str,
     credential: &Credential,
 ) -> Result<(), super::super::CoreError> {
-    validate_label(label)?;
-    let path = credential_path(home, label);
+    put_for(home, "chatgpt", label, credential)
+}
+
+pub(crate) fn put_for<T: serde::Serialize>(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    credential: &T,
+) -> Result<(), super::super::CoreError> {
+    validate_identity(provider, label)?;
+    let path = credential_path(home, provider, label);
     let plaintext = serde_json::to_vec(credential)
         .map_err(|_| environment_error("credential_write_failed", "could not encode credential"))?;
     let bytes = if encrypted_store() {
         #[cfg(target_os = "macos")]
         {
-            encrypt(home, label, &plaintext)?
+            encrypt(home, provider, label, &plaintext)?
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -74,8 +91,16 @@ pub(crate) fn put(
 }
 
 pub(crate) fn delete(home: &Path, label: &str) -> Result<(), super::super::CoreError> {
-    validate_label(label)?;
-    let path = credential_path(home, label);
+    delete_for(home, "chatgpt", label)
+}
+
+pub(crate) fn delete_for(
+    home: &Path,
+    provider: &str,
+    label: &str,
+) -> Result<(), super::super::CoreError> {
+    validate_identity(provider, label)?;
+    let path = credential_path(home, provider, label);
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -88,21 +113,27 @@ pub(crate) fn delete(home: &Path, label: &str) -> Result<(), super::super::CoreE
     }
     #[cfg(target_os = "macos")]
     if encrypted_store() {
-        keychain_delete(label)?;
+        keychain_delete(provider, label)?;
     }
     Ok(())
 }
 
-fn credential_path(home: &Path, label: &str) -> PathBuf {
+fn credential_path(home: &Path, provider: &str, label: &str) -> PathBuf {
     let suffix = if encrypted_store() && cfg!(target_os = "macos") {
         "enc"
     } else {
         "json"
     };
     home.join(".kogen/credentials")
-        .join(format!("chatgpt-{label}.{suffix}"))
+        .join(format!("{provider}-{label}.{suffix}"))
 }
 
+#[cfg(test)]
+fn encrypted_store() -> bool {
+    false
+}
+
+#[cfg(not(test))]
 fn encrypted_store() -> bool {
     if std::env::var("KOGEN_CREDENTIAL_STORE").as_deref() == Ok("file") {
         return false;
@@ -119,6 +150,16 @@ fn validate_label(label: &str) -> Result<(), super::super::CoreError> {
             "invalid account label",
         ))
     }
+}
+
+fn validate_identity(provider: &str, label: &str) -> Result<(), super::super::CoreError> {
+    if !matches!(provider, "chatgpt" | "grok") {
+        return Err(provider_error(
+            "unsupported_provider",
+            "unsupported credential provider",
+        ));
+    }
+    validate_label(label)
 }
 
 fn invalid_credential(path: &Path) -> super::super::CoreError {
@@ -160,8 +201,13 @@ fn set_private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn encrypt(home: &Path, label: &str, plaintext: &[u8]) -> Result<Vec<u8>, super::super::CoreError> {
-    let key = get_or_create_key(home, label)?;
+fn encrypt(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, super::super::CoreError> {
+    let key = get_or_create_key(home, provider, label)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|_| environment_error("credential_store_unavailable", "invalid Keychain key"))?;
     let mut nonce_bytes = [0_u8; 12];
@@ -180,14 +226,19 @@ fn encrypt(home: &Path, label: &str, plaintext: &[u8]) -> Result<Vec<u8>, super:
 }
 
 #[cfg(target_os = "macos")]
-fn decrypt(_home: &Path, label: &str, bytes: &[u8]) -> Result<Vec<u8>, super::super::CoreError> {
+fn decrypt(
+    _home: &Path,
+    provider: &str,
+    label: &str,
+    bytes: &[u8],
+) -> Result<Vec<u8>, super::super::CoreError> {
     if bytes.len() < 12 {
         return Err(environment_error(
             "credential_store_unavailable",
             "encrypted credential is invalid",
         ));
     }
-    let key = keychain_get(label)?.ok_or_else(|| {
+    let key = keychain_get(provider, label)?.ok_or_else(|| {
         environment_error(
             "credential_store_unavailable",
             "credential key is missing from Keychain",
@@ -206,11 +257,15 @@ fn decrypt(_home: &Path, label: &str, bytes: &[u8]) -> Result<Vec<u8>, super::su
 }
 
 #[cfg(target_os = "macos")]
-fn get_or_create_key(home: &Path, label: &str) -> Result<Vec<u8>, super::super::CoreError> {
-    if let Some(key) = keychain_get(label)? {
+fn get_or_create_key(
+    home: &Path,
+    provider: &str,
+    label: &str,
+) -> Result<Vec<u8>, super::super::CoreError> {
+    if let Some(key) = keychain_get(provider, label)? {
         return Ok(key);
     }
-    if credential_path(home, label).exists() {
+    if credential_path(home, provider, label).exists() {
         return Err(environment_error(
             "credential_store_unavailable",
             "credential key is missing from Keychain",
@@ -219,7 +274,7 @@ fn get_or_create_key(home: &Path, label: &str) -> Result<Vec<u8>, super::super::
     let mut key = vec![0_u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut key);
     let encoded = base64::engine::general_purpose::STANDARD.encode(&key);
-    let account = format!("chatgpt:{label}:key");
+    let account = format!("{provider}:{label}:key");
     let mut child = Command::new("security")
         .args([
             "add-generic-password",
@@ -259,8 +314,8 @@ fn get_or_create_key(home: &Path, label: &str) -> Result<Vec<u8>, super::super::
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_get(label: &str) -> Result<Option<Vec<u8>>, super::super::CoreError> {
-    let account = format!("chatgpt:{label}:key");
+fn keychain_get(provider: &str, label: &str) -> Result<Option<Vec<u8>>, super::super::CoreError> {
+    let account = format!("{provider}:{label}:key");
     let output = Command::new("security")
         .args(["find-generic-password", "-s", "kogen", "-a", &account, "-w"])
         .stdout(Stdio::piped())
@@ -288,8 +343,8 @@ fn keychain_get(label: &str) -> Result<Option<Vec<u8>>, super::super::CoreError>
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_delete(label: &str) -> Result<(), super::super::CoreError> {
-    let account = format!("chatgpt:{label}:key");
+fn keychain_delete(provider: &str, label: &str) -> Result<(), super::super::CoreError> {
+    let account = format!("{provider}:{label}:key");
     let output = Command::new("security")
         .args(["delete-generic-password", "-s", "kogen", "-a", &account])
         .stdout(Stdio::null())

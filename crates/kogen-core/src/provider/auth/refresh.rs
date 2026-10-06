@@ -43,3 +43,11 @@ pub(super) fn refresh(
     super::super::chatgpt::record_refresh(home, label, &updated)?;
     Ok(updated)
 }
+
+pub(super) fn acquire_lock(
+    home: &Path,
+    provider: &str,
+    label: &str,
+) -> Result<impl Drop, crate::error::CoreError> {
+    lock::RefreshLock::acquire_for(home, provider, label)
+}

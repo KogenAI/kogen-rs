@@ -1,6 +1,7 @@
 use kogen_core::ExitCode;
 use kogen_core::error::{CliOutput, CoreError, ErrorClass};
 use kogen_core::provider::chatgpt;
+use kogen_core::provider::grok;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -21,8 +22,22 @@ pub fn dispatch(command: Command) -> CliOutput {
             });
             provider_output(output)
         }
+        Command::ProviderLogin { provider } if provider == "grok" => {
+            let Some(home) = home_dir() else {
+                return home_error();
+            };
+            let output = grok::login(&home, |line| {
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(line.as_bytes());
+                let _ = stdout.flush();
+            });
+            provider_output(output)
+        }
         Command::ProviderLogout { provider } if provider == "chatgpt" => {
             provider_output(with_home(chatgpt::logout))
+        }
+        Command::ProviderLogout { provider } if provider == "grok" => {
+            provider_output(with_home(grok::logout))
         }
         Command::ProviderUse {
             provider,
@@ -33,6 +48,16 @@ pub fn dispatch(command: Command) -> CliOutput {
                 return home_error();
             };
             provider_output(chatgpt::use_account(&home, &label, project.as_deref()))
+        }
+        Command::ProviderUse {
+            provider,
+            label,
+            project,
+        } if provider == "grok" => {
+            let Some(home) = home_dir() else {
+                return home_error();
+            };
+            provider_output(grok::use_account(&home, &label, project.as_deref()))
         }
         Command::ProviderLogin { provider }
         | Command::ProviderLogout { provider }

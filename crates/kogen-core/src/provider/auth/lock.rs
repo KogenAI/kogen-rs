@@ -21,6 +21,14 @@ pub(super) struct RefreshLock {
 
 impl RefreshLock {
     pub(super) fn acquire(home: &Path, label: &str) -> Result<Self, crate::error::CoreError> {
+        Self::acquire_for(home, "chatgpt", label)
+    }
+
+    pub(super) fn acquire_for(
+        home: &Path,
+        provider: &str,
+        label: &str,
+    ) -> Result<Self, crate::error::CoreError> {
         let parent = home.join(".kogen/locks");
         fs::create_dir_all(&parent).map_err(|_| {
             environment_error(
@@ -34,7 +42,7 @@ impl RefreshLock {
                 "could not secure credential lock directory",
             )
         })?;
-        let path = parent.join(format!("chatgpt-{label}.lock"));
+        let path = parent.join(format!("{provider}-{label}.lock"));
         let wait = scaled(WAIT_MS);
         let stale = scaled(STALE_MS);
         let started = std::time::Instant::now();
@@ -79,10 +87,12 @@ impl RefreshLock {
                         continue;
                     }
                     if started.elapsed() >= wait {
-                        return Err(provider_error(
-                            "login",
-                            "timed out waiting for ChatGPT token refresh",
-                        ));
+                        let message = if provider == "grok" {
+                            "Grok session refresh timed out."
+                        } else {
+                            "timed out waiting for ChatGPT token refresh"
+                        };
+                        return Err(provider_error("login", message));
                     }
                     thread::sleep(Duration::from_millis(POLL_MS));
                 }

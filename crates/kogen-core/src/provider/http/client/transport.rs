@@ -1,7 +1,7 @@
 //! Tokio-backed streaming HTTP effect for the Responses client.
 
 use super::{HttpAttempt, HttpPort, RequestDeadlines};
-use crate::provider::http::wire::WireRequest;
+use crate::provider::http::wire::{ResponseMode, WireRequest};
 use crate::provider::sse::{MAX_RESPONSE_BYTES, SseAssembler};
 use crate::provider::{ProviderErrorKind, ProviderFailure};
 use futures_util::StreamExt as _;
@@ -20,10 +20,11 @@ impl ReqwestPort {
         let runtime = Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|_| transport_failure())?;
+            .map_err(|_| transport_failure(ResponseMode::Owned))?;
         let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_secs(300))
             .build()
-            .map_err(|_| transport_failure())?;
+            .map_err(|_| transport_failure(ResponseMode::Owned))?;
         Ok(Self {
             client,
             runtime: Arc::new(runtime),
@@ -55,7 +56,11 @@ async fn execute_async(
             return failed_attempt(
                 ProviderFailure::new(
                     ProviderErrorKind::Malformed,
-                    "Could not encode ChatGPT request.",
+                    if request.mode == ResponseMode::Grok {
+                        "Could not encode Grok request."
+                    } else {
+                        "Could not encode ChatGPT request."
+                    },
                 ),
                 start,
                 Vec::new(),
@@ -76,10 +81,10 @@ async fn execute_async(
     let response = match sent {
         Ok(Ok(response)) => response,
         Ok(Err(error)) if error.is_timeout() => {
-            return failed_attempt(timeout_failure(), start, Vec::new(), 0);
+            return failed_attempt(timeout_failure(request.mode), start, Vec::new(), 0);
         }
-        Ok(Err(_)) => return failed_attempt(transport_failure(), start, Vec::new(), 0),
-        Err(_) => return failed_attempt(timeout_failure(), start, Vec::new(), 0),
+        Ok(Err(_)) => return failed_attempt(transport_failure(request.mode), start, Vec::new(), 0),
+        Err(_) => return failed_attempt(timeout_failure(request.mode), start, Vec::new(), 0),
     };
     let status = response.status().as_u16();
     let retry_after = response
@@ -93,6 +98,7 @@ async fn execute_async(
     let mut last_byte = TokioInstant::now();
     let mut parser = SseAssembler::new();
     let mut error_body = Vec::new();
+    let mut error_body_too_large = false;
     loop {
         let idle_deadline = if seen_body {
             last_byte + deadlines.idle
@@ -103,7 +109,7 @@ async fn execute_async(
         match timeout_at(deadline, stream.next()).await {
             Err(_) => {
                 let failure = if TokioInstant::now() >= total_deadline || !seen_body {
-                    timeout_failure()
+                    timeout_failure(request.mode)
                 } else {
                     ProviderFailure::new(
                         ProviderErrorKind::Stall,
@@ -130,9 +136,9 @@ async fn execute_async(
                         ),
                     )
                 } else if error.is_timeout() {
-                    timeout_failure()
+                    timeout_failure(request.mode)
                 } else {
-                    transport_failure()
+                    transport_failure(request.mode)
                 };
                 return failed_attempt(
                     failure,
@@ -151,7 +157,16 @@ async fn execute_async(
                 body_bytes = body_bytes.saturating_add(chunk.len() as u64);
                 if (200..300).contains(&status) {
                     if parser.feed(&chunk).is_err() {
-                        let failure = parser.finish().err().unwrap_or_else(malformed_failure);
+                        let failure = if request.mode == ResponseMode::Grok
+                            && body_bytes as usize > MAX_RESPONSE_BYTES
+                        {
+                            size_limit_failure()
+                        } else {
+                            normalize_failure(
+                                parser.finish().err().unwrap_or_else(malformed_failure),
+                                request.mode,
+                            )
+                        };
                         return failed_attempt(
                             failure,
                             start,
@@ -161,6 +176,7 @@ async fn execute_async(
                     }
                 } else {
                     if error_body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                        error_body_too_large = true;
                         break;
                     }
                     error_body.extend_from_slice(&chunk);
@@ -169,7 +185,11 @@ async fn execute_async(
         }
     }
     if !(200..300).contains(&status) {
-        let failure = classify_http_error(status, &error_body, retry_after);
+        let failure = if error_body_too_large && request.mode == ResponseMode::Grok {
+            size_limit_failure()
+        } else {
+            classify_http_error(status, &error_body, retry_after, request.mode)
+        };
         return failed_attempt(failure, start, Vec::new(), body_bytes);
     }
     match parser.finish() {
@@ -180,7 +200,7 @@ async fn execute_async(
             body_bytes_received: body_bytes,
         },
         Err(failure) => failed_attempt(
-            failure,
+            normalize_failure(failure, request.mode),
             start,
             parser.collected_items().to_vec(),
             body_bytes,
@@ -202,8 +222,20 @@ fn failed_attempt(
     }
 }
 
-fn classify_http_error(status: u16, body: &[u8], retry_after: Option<u64>) -> ProviderFailure {
+fn classify_http_error(
+    status: u16,
+    body: &[u8],
+    retry_after: Option<u64>,
+    mode: ResponseMode,
+) -> ProviderFailure {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if mode == ResponseMode::Grok {
+        let mut failure = classify_grok_http_error(status, &text);
+        if matches!(status, 429 | 503) {
+            failure.retry_after_ms = retry_after.or_else(|| retry_after_from_body(body));
+        }
+        return failure;
+    }
     let mut failure = if status == 401 || status == 403 {
         ProviderFailure::new(
             ProviderErrorKind::Login,
@@ -231,6 +263,41 @@ fn classify_http_error(status: u16, body: &[u8], retry_after: Option<u64>) -> Pr
     failure
 }
 
+fn classify_grok_http_error(status: u16, body: &str) -> ProviderFailure {
+    let usage_limit = ["usage_limit", "usage limit", "quota exceeded", "rate limit"]
+        .iter()
+        .any(|needle| body.contains(needle));
+    let overloaded = ["server_is_overloaded", "overloaded", "overload"]
+        .iter()
+        .any(|needle| body.contains(needle));
+    if status == 401 {
+        ProviderFailure::new(
+            ProviderErrorKind::Login,
+            "Grok rejected this session; run `kogen provider login grok`.",
+        )
+    } else if status == 403 {
+        ProviderFailure::new(
+            ProviderErrorKind::Login,
+            "This Grok account cannot access the requested model.",
+        )
+    } else if status == 429 || usage_limit {
+        ProviderFailure::new(
+            ProviderErrorKind::UsageLimit,
+            "Grok subscription usage limit reached.",
+        )
+    } else if (500..600).contains(&status) || overloaded {
+        ProviderFailure::new(
+            ProviderErrorKind::Overload,
+            "Grok service is temporarily overloaded.",
+        )
+    } else {
+        ProviderFailure::new(
+            ProviderErrorKind::Malformed,
+            format!("Grok rejected the request (HTTP {status})."),
+        )
+    }
+}
+
 fn parse_retry_after(value: &str) -> Option<u64> {
     let seconds = value.parse::<f64>().ok()?;
     (seconds.is_finite() && seconds >= 0.0).then_some((seconds * 1000.0).round() as u64)
@@ -242,14 +309,25 @@ fn retry_after_from_body(body: &[u8]) -> Option<u64> {
     (seconds.is_finite() && seconds >= 0.0).then_some((seconds * 1000.0).round() as u64)
 }
 
-fn timeout_failure() -> ProviderFailure {
-    ProviderFailure::new(ProviderErrorKind::Timeout, "ChatGPT request timed out.")
+fn timeout_failure(mode: ResponseMode) -> ProviderFailure {
+    ProviderFailure::new(
+        ProviderErrorKind::Timeout,
+        if mode == ResponseMode::Grok {
+            "Grok request timed out."
+        } else {
+            "ChatGPT request timed out."
+        },
+    )
 }
 
-fn transport_failure() -> ProviderFailure {
+fn transport_failure(mode: ResponseMode) -> ProviderFailure {
     ProviderFailure::new(
         ProviderErrorKind::Transport,
-        "ChatGPT request could not connect.",
+        if mode == ResponseMode::Grok {
+            "Grok request could not connect."
+        } else {
+            "ChatGPT request could not connect."
+        },
     )
 }
 
@@ -259,3 +337,29 @@ fn malformed_failure() -> ProviderFailure {
         "ChatGPT returned a malformed response.",
     )
 }
+
+fn size_limit_failure() -> ProviderFailure {
+    ProviderFailure::new(
+        ProviderErrorKind::Malformed,
+        "Grok response exceeded the size limit.",
+    )
+}
+
+fn normalize_failure(mut failure: ProviderFailure, mode: ResponseMode) -> ProviderFailure {
+    if mode != ResponseMode::Grok {
+        return failure;
+    }
+    failure.message = match failure.kind {
+        ProviderErrorKind::UsageLimit => "Grok subscription usage limit reached.".to_owned(),
+        ProviderErrorKind::Overload => "Grok service is temporarily overloaded.".to_owned(),
+        ProviderErrorKind::Timeout => "Grok request timed out.".to_owned(),
+        ProviderErrorKind::Transport => "Grok request could not connect.".to_owned(),
+        ProviderErrorKind::Malformed => "Grok returned a malformed response stream.".to_owned(),
+        _ => failure.message,
+    };
+    failure
+}
+
+#[cfg(test)]
+#[path = "transport/tests.rs"]
+mod tests;

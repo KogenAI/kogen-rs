@@ -96,7 +96,33 @@ pub fn select_account(
 }
 
 pub fn set_use(home: &Path, label: &str, project: Option<&Path>) -> Result<(), super::CoreError> {
+    set_provider_use(home, "chatgpt", label, project)
+}
+
+pub fn set_provider_use(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    project: Option<&Path>,
+) -> Result<(), super::CoreError> {
+    if !matches!(provider, "chatgpt" | "grok") {
+        return Err(provider_error(
+            "invalid_provider",
+            "provider must be chatgpt or grok",
+        ));
+    }
+    if !valid_label(label) {
+        return Err(provider_error(
+            "invalid_account_label",
+            "invalid account label",
+        ));
+    }
     let mut file = read(home)?;
+    let account_map = if provider == "grok" {
+        &mut file.grok
+    } else {
+        &mut file.chatgpt
+    };
     if let Some(project) = project {
         let path = fs::canonicalize(project).map_err(|_| {
             super::environment_error(
@@ -104,10 +130,11 @@ pub fn set_use(home: &Path, label: &str, project: Option<&Path>) -> Result<(), s
                 format!("project path {} does not exist", project.display()),
             )
         })?;
-        file.chatgpt.default = None;
-        file.chatgpt.projects.insert(path, label.to_owned());
+        account_map.projects.insert(path.clone(), label.to_owned());
+        file.selection.projects.insert(path, provider.to_owned());
     } else {
-        file.chatgpt.default = Some(label.to_owned());
+        account_map.default = Some(label.to_owned());
+        file.selection.default = Some(provider.to_owned());
     }
     write(home, &file)
 }

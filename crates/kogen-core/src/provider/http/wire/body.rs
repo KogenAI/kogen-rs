@@ -84,7 +84,7 @@ impl<'a> WireBody<'a> {
         reasoning.insert("effort".to_owned(), Value::String(request.effort.clone()));
         if mode == ResponseMode::Lite {
             reasoning.insert("context".to_owned(), Value::String("all_turns".to_owned()));
-        } else if request.model != "gpt-6-luna" {
+        } else if mode != ResponseMode::Grok && request.model != "gpt-6-luna" {
             reasoning.insert("summary".to_owned(), Value::String("auto".to_owned()));
         }
         let mut allowed_tools = request.callable_tools.clone();
@@ -116,13 +116,15 @@ impl Serialize for WireBody<'_> {
     {
         let lite = self.mode == ResponseMode::Lite;
         let injected = matches!(self.mode, ResponseMode::Injected | ResponseMode::Lite);
-        let include_tools = self.mode == ResponseMode::Injected;
-        let include = injected;
+        let include_tools = matches!(self.mode, ResponseMode::Injected | ResponseMode::Grok);
+        let include = injected || self.mode == ResponseMode::Grok;
         let include_cache_key = !self.request.cache_key.is_empty();
         let include_text = self.request.model == "gpt-6-luna";
         let include_cap =
             self.request.development_request && self.request.generation_tokens.is_some();
-        let count = 8
+        let include_controls = self.mode != ResponseMode::Grok;
+        let count = 6
+            + 2 * usize::from(include_controls)
             + usize::from(include_tools)
             + usize::from(include)
             + usize::from(include_cache_key)
@@ -146,8 +148,10 @@ impl Serialize for WireBody<'_> {
         if include_cache_key {
             map.serialize_entry("prompt_cache_key", &self.request.cache_key)?;
         }
-        map.serialize_entry("tool_choice", &self.tool_choice)?;
-        map.serialize_entry("parallel_tool_calls", &false)?;
+        if include_controls {
+            map.serialize_entry("tool_choice", &self.tool_choice)?;
+            map.serialize_entry("parallel_tool_calls", &false)?;
+        }
         if include_text {
             map.serialize_entry("text", &json!({"verbosity":"low"}))?;
         }

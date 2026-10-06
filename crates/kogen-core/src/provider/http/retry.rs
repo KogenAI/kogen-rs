@@ -91,7 +91,7 @@ impl RetryReplay {
             return;
         };
         if !matches!(role, "builder" | "planner")
-            || !matches!(model, "luna" | "sol")
+            || !matches!(model, "luna" | "sol" | "grok")
             || !matches!(mode, "build" | "shape")
         {
             self.last = "bad_open".to_owned();

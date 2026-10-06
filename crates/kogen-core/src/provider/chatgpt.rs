@@ -131,7 +131,7 @@ pub fn use_account(
             ),
         ));
     }
-    accounts::set_use(home, label, project)?;
+    accounts::set_provider_use(home, "chatgpt", label, project)?;
     if let Some(project) = project {
         let path = fs::canonicalize(project).map_err(|_| {
             environment_error(
@@ -177,7 +177,7 @@ pub(crate) fn record_refresh(
     write_profiles(home, &profiles)
 }
 
-fn read_profiles(home: &Path) -> Result<Value, super::CoreError> {
+pub(super) fn read_profiles(home: &Path) -> Result<Value, super::CoreError> {
     let path = accounts::profiles_path(home);
     match fs::read(&path) {
         Ok(bytes) => {
@@ -267,7 +267,7 @@ fn update_profile_signed_out(profiles: &mut Value, label: &str, remote_revoked: 
     record.insert("remote_revoked".to_owned(), Value::Bool(remote_revoked));
 }
 
-fn write_profiles(home: &Path, profiles: &Value) -> Result<(), super::CoreError> {
+pub(super) fn write_profiles(home: &Path, profiles: &Value) -> Result<(), super::CoreError> {
     let path = accounts::profiles_path(home);
     let bytes = serde_json::to_vec(profiles)
         .map_err(|_| environment_error("profiles_write_failed", "could not encode profiles"))?;

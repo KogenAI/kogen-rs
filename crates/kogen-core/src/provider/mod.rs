@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod auth;
 pub mod chatgpt;
+pub mod grok;
 pub mod http;
 pub mod session;
 pub mod sse;
