@@ -12,7 +12,7 @@ fn main() {
         legacy_fail("expected a slice name");
     };
     if args.next().is_some() {
-        if matches!(slice.as_str(), "intent" | "approve") {
+        if matches!(slice.as_str(), "intent" | "approve" | "queue") {
             fail("expected exactly one private slice name");
         }
         legacy_fail("expected exactly one slice name");
@@ -21,7 +21,7 @@ fn main() {
     match slice.as_str() {
         "stream" => run_replay(RetryReplay::default()),
         "session" => run_replay(SessionReplay::default()),
-        "intent" | "approve" => run_private(&slice),
+        "intent" | "approve" | "queue" => run_private(&slice),
         _ => legacy_fail(&format!("unsupported slice {slice:?}")),
     }
 }

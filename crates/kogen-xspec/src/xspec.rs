@@ -1,7 +1,9 @@
 mod approve;
 mod intent;
+mod queue;
 mod temp;
 
+use kogen_core::queue::QueueScheduler;
 use serde_json::{Value, json};
 use temp::{ApprovalSummary, SourceBytes, TempProject};
 
@@ -9,12 +11,14 @@ pub struct Adapter {
     slice: Slice,
     state: Value,
     project: TempProject,
+    queue: QueueScheduler,
 }
 
 #[derive(Clone, Copy)]
 enum Slice {
     Intent,
     Approve,
+    Queue,
 }
 
 impl Adapter {
@@ -22,6 +26,7 @@ impl Adapter {
         let slice = match name {
             "intent" => Slice::Intent,
             "approve" => Slice::Approve,
+            "queue" => Slice::Queue,
             _ => return Err(format!("unknown private slice `{name}`")),
         };
         let project = TempProject::new()?;
@@ -30,6 +35,7 @@ impl Adapter {
             slice,
             state,
             project,
+            queue: QueueScheduler::new(),
         })
     }
 
@@ -52,6 +58,7 @@ impl Adapter {
                     match self.slice {
                         Slice::Intent => intent::apply(self, &event),
                         Slice::Approve => approve::apply(self, &event),
+                        Slice::Queue => queue::apply(&mut self.queue, &event),
                     }
                 }
             }
@@ -62,6 +69,7 @@ impl Adapter {
     fn reset(&mut self) -> Result<Value, String> {
         self.project.reset()?;
         self.state = initial_state(self.slice);
+        self.queue = QueueScheduler::new();
         Ok(self.observation())
     }
 
@@ -69,6 +77,8 @@ impl Adapter {
         match self.slice {
             Slice::Intent => intent::observe(self),
             Slice::Approve => approve::observe(self),
+            Slice::Queue => serde_json::to_value(self.queue.observe())
+                .expect("queue observations are serializable"),
         }
     }
 }
@@ -77,6 +87,7 @@ fn initial_state(slice: Slice) -> Value {
     match slice {
         Slice::Intent => kogen_core::approval::replay::intent_initial(),
         Slice::Approve => kogen_core::approval::replay::approve_initial(),
+        Slice::Queue => Value::Null,
     }
 }
 
