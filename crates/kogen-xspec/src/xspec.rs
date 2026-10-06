@@ -2,6 +2,8 @@ mod approve;
 mod intent;
 mod queue;
 mod setup_cache;
+mod recovery;
+mod status;
 mod temp;
 
 use kogen_core::queue::QueueScheduler;
@@ -14,6 +16,8 @@ pub struct Adapter {
     project: TempProject,
     queue: QueueScheduler,
     setup_cache: setup_cache::Replay,
+    status: kogen_core::status::StatusReplay,
+    recovery: kogen_core::recovery::RecoveryModel,
 }
 
 #[derive(Clone, Copy)]
@@ -22,6 +26,8 @@ enum Slice {
     Approve,
     Queue,
     SetupCache,
+    Status,
+    Recovery,
 }
 
 impl Adapter {
@@ -31,6 +37,8 @@ impl Adapter {
             "approve" => Slice::Approve,
             "queue" => Slice::Queue,
             "setup-cache" => Slice::SetupCache,
+            "status" => Slice::Status,
+            "recovery" => Slice::Recovery,
             _ => return Err(format!("unknown private slice `{name}`")),
         };
         let project = TempProject::new()?;
@@ -42,6 +50,8 @@ impl Adapter {
             project,
             queue: QueueScheduler::new(),
             setup_cache,
+            status: kogen_core::status::StatusReplay::new(),
+            recovery: kogen_core::recovery::RecoveryModel::new(),
         })
     }
 
@@ -66,6 +76,8 @@ impl Adapter {
                         Slice::Approve => approve::apply(self, &event),
                         Slice::Queue => queue::apply(&mut self.queue, &event),
                         Slice::SetupCache => self.setup_cache.apply(&event),
+                        Slice::Status => status::apply(&mut self.status, &event),
+                        Slice::Recovery => recovery::apply(&mut self.recovery, &event),
                     }
                 }
             }
@@ -77,9 +89,13 @@ impl Adapter {
         if matches!(self.slice, Slice::SetupCache) {
             return self.setup_cache.reset();
         }
-        self.project.reset()?;
+        if matches!(self.slice, Slice::Intent | Slice::Approve) {
+            self.project.reset()?;
+        }
         self.state = initial_state(self.slice);
         self.queue = QueueScheduler::new();
+        self.status = kogen_core::status::StatusReplay::new();
+        self.recovery = kogen_core::recovery::RecoveryModel::new();
         Ok(self.observation())
     }
 
@@ -90,6 +106,10 @@ impl Adapter {
             Slice::Queue => serde_json::to_value(self.queue.observe())
                 .expect("queue observations are serializable"),
             Slice::SetupCache => self.setup_cache.observe(),
+            Slice::Status => serde_json::to_value(self.status.observe())
+                .expect("status observations are serializable"),
+            Slice::Recovery => serde_json::to_value(self.recovery.observe())
+                .expect("recovery observations are serializable"),
         }
     }
 }
@@ -107,6 +127,7 @@ fn initial_state(slice: Slice) -> Value {
             "setupRuns": 0,
             "last": "ok",
         }),
+        Slice::Status | Slice::Recovery => Value::Null,
     }
 }
 

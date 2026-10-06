@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use crate::request::Command;
 
+mod status;
+
 pub fn dispatch(command: Command) -> CliOutput {
     match command {
         Command::Version => CliOutput::success(version_line()),
@@ -90,6 +92,15 @@ pub fn dispatch(command: Command) -> CliOutput {
             project,
         } => match resolve_project(project) {
             Ok(project) => kogen_core::approval::remove(&project, &slug, force),
+            Err(error) => error.into_cli_output(),
+        },
+        Command::Status {
+            slug,
+            watch,
+            json,
+            project,
+        } => match resolve_project(project) {
+            Ok(project) => status::command(&project, slug.as_deref(), watch, json),
             Err(error) => error.into_cli_output(),
         },
         _ => CoreError::new(

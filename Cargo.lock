@@ -595,6 +595,7 @@ name = "kogen"
 version = "0.1.0"
 dependencies = [
  "kogen-core",
+ "serde_json",
 ]
 
 [[package]]
