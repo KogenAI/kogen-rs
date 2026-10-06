@@ -1,0 +1,5 @@
+# 07 Acceptance gate and protection (G kernel, 5–6 h)
+
+Own `kogen-core::gate` except the package 03 ledger port; build the private tree/index verification interface. Depends on 03 and 04. Install the approved test in a workspace, evaluate each tagged A item, run configured checks against base and candidate, compare tree identity, restore protected files, and refuse red/unverified candidates. Use spec §2.4–2.5, §3.7–3.9.4. Keep auditor demotion and selector ranking out of this green gate kernel.
+
+Acceptance: `build-09`, `build-10`, `build-11`, `build-12`, `build-13`, `build-14`, `build-15`, `build-16`, `build-17`, `build-18`, `build-19`, `build-20`, `build-21`, `build-23`, `build-40`, `approval-15`, `approval-16`, `custody-09`. Quint: full `gate` (5 hand and 500 × 25 seeds 17, 23, 41) is diagnostic because it models L demotion/ranking; there is no separate guaranteed gate slice yet. Black-box cases and unit tests prove the green/no-change/failed-check kernel. No verification bypass for a candidate with a model `finish` call.

@@ -1,0 +1,21 @@
+# Dependency order. G = GUARANTEED kernel; L = LIKELY; D = diagnostic.
+# Parallel means distinct owners can work after all named prerequisites are merged.
+01-public-cli                 G  deps: none             parallel: 02,03
+02-project-intent-formats     G  deps: none             parallel: 01,03
+03-process-and-ledger         G  deps: none             parallel: 01,02
+04-approval-and-refs          G  deps: 01,02,03         parallel: 09
+05-serial-queue               G  deps: 04               parallel: 09
+06-status-and-recovery        G  deps: 05               parallel: 09
+07-gate-and-protection        G  deps: 03,04            parallel: 05,09
+08-cas-landing                G  deps: 06,07            parallel: 10
+09-chatgpt-accounts           G  deps: 01               parallel: 04,05,06,07
+10-chatgpt-stream-and-cache   G  deps: 03,09            parallel: 08
+11-grok-provider              G-name/L-wire deps: 09,10 parallel: 12
+12-shaping                    L  deps: 02,03,10         parallel: 11
+13-ladder-and-selection       L  deps: 07,08,10         parallel: 12,14
+14-setup-cache                L  deps: 03,07            parallel: 12,13
+15-stack-adapters             L  deps: 03,07            parallel: 12,13,14
+
+# Integration after 01-11: run all applicable v1.1 profiles, six named v1.2
+# cases, all G-slice replays, then the separate live >95% warm-cache smoke.
+# Existing v1.1/v1.2 conflicts are reported, not papered over.

@@ -1,0 +1,5 @@
+# 11 Grok on the existing provider verbs (G name, L wire, 4–6 h)
+
+Own `kogen-core::provider::grok` and Grok account rows. Depends on 09 and 10. The CLI name is already admitted in package 01; implement Grok `login`, `logout`, `use`, device-code OAuth/refresh, selected account/model, request headers/body and error mapping per spec §4.10. Share SSE, cache history, retries and credential abstraction with ChatGPT. Never add a public flag or command.
+
+Acceptance: `v1.2-01-fixed-cli-help-and-grok` and the proposed `P10` observations in `../../../kogen-spec/spec/CONFORMANCE-v1.2-CASES.md` (no named suite file yet for full Grok wire). Rerun the retry and cache scenarios using Grok fake HTTP as local integration checks; `provider-11` through `provider-18` and `v1.2-03-consecutive-request-byte-prefix` remain ChatGPT black-box IDs. Quint: `stream` all 10 and `session` all 7 hand scenarios at 500 × 25 seeds 17, 23, 41 using shared production policy; `accounts` 9 hand plus generated seeds are diagnostic. Report the suite coverage gap explicitly until P10 is versioned into a black-box case.

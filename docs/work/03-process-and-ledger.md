@@ -1,0 +1,5 @@
+# 03 Process custody and acceptance ledger (G, 4–6 h)
+
+Own `kogen-core::run` process supervisor and `gate::ledger` submodule. Depends on no package. Implement argv-only child spawning, separate process groups, deadline, TERM/KILL/reap, output log/tail, private script transport for the shell tool, filtered child environment and mise seam, and command acceptance adapter with JSONL ledger. Use spec §2.4 and §5.1–5.3. Expose a port so approval and gate use identical runner semantics. Leave Git landing to package 08.
+
+Acceptance after the approval/build callers are wired: `approval-10`, `approval-11`, `approval-12`, `approval-13`, `approval-19`, `build-11`, `build-12`, `build-13`, `build-14`, `build-18`, `build-19`, `build-20`, `build-39`, `build-40`, `custody-01`, `custody-02`, `custody-03`, `custody-04`, `custody-06`, `custody-07`, `custody-08`. Ownership of those behaviors remains here even when a later package first makes the cases runnable. Quint: none; no custody or ledger slice exists. Unit verification must include a chatty deadline child and a grandchild cleanup, plus ledger absence, malformed row and tree mutation.
