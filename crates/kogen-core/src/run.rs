@@ -8,6 +8,7 @@ mod environment;
 mod process;
 mod sandbox;
 mod script;
+pub mod setup_cache;
 mod watchdog;
 
 pub use environment::{

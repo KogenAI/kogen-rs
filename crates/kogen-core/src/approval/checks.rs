@@ -1,20 +1,22 @@
 use super::model::{BaselineCache, BaselineRow, Finding};
 mod acceptance;
+mod cache;
 
 use crate::git::GitRepo;
 use crate::project::ProjectResolution;
+use crate::run::setup_cache::{SetupCacheKey, SetupCacheRequest, run_setup as run_cached_setup};
 use crate::run::{
     EnvironmentRequest, ProcessPort, ProcessRequest, ProcessResult, ProcessSupervisor,
     build_child_environment, host_environment,
 };
 pub(super) use acceptance::{check_error, stage_and_check};
+use cache::{read_cache, write_cache};
 use serde_yaml::Value;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(super) struct CheckOutcome {
     pub rows: Vec<BaselineRow>,
@@ -44,13 +46,17 @@ pub(super) fn run_setup_and_baseline(
     request.project = configured_env(project);
     let env = build_child_environment(&runner, request)
         .map_err(|error| CheckError::Internal(error.to_string()))?;
-    run_setup(project, &runner, &run_dir, &env)?;
-
     let origin = GitRepo::new(&project.origin);
     let base_tree = origin
         .resolve_tree(base_sha)
         .map_err(|error| CheckError::Internal(error.to_string()))?;
-    let key = cache_key(project, &base_tree, &env);
+    let setup_key =
+        SetupCacheKey::from_project(project.config.as_ref(), &project.checkout, &base_tree, &env)
+            .map_err(|error| CheckError::Internal(error.to_string()))?;
+    let key = setup_key
+        .digest_with_checks(&checks_value(project)?)
+        .map_err(|error| CheckError::Internal(error.to_string()))?;
+    let setup_key = setup_key.digest();
     let cache_path = project
         .state_root
         .join("approval-cache")
@@ -62,6 +68,23 @@ pub(super) fn run_setup_and_baseline(
             env,
         });
     }
+    let outputs = config_list(project, "setup_outputs")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let setup_enabled =
+        !config_list(project, "setup").unwrap_or_default().is_empty() && !outputs.is_empty();
+    run_cached_setup(
+        SetupCacheRequest {
+            checkout: &project.checkout,
+            cache_root: &project.state_root.join("setup-cache"),
+            key: &setup_key,
+            outputs,
+            enabled: setup_enabled,
+        },
+        || run_setup(project, &runner, &run_dir, &env),
+    )?;
     let rows = run_checks(project, &runner, &run_dir, &env)?;
     write_cache(
         &cache_path,
@@ -95,9 +118,10 @@ fn run_setup(
     runner: &dyn ProcessPort,
     run_dir: &Path,
     env: &BTreeMap<OsString, OsString>,
-) -> Result<(), CheckError> {
+) -> Result<u64, CheckError> {
+    let started = Instant::now();
     let Some(setups) = config_list(project, "setup") else {
-        return Ok(());
+        return Ok(0);
     };
     for (index, setup) in setups.iter().enumerate() {
         let name = field(setup, "name").unwrap_or_else(|| format!("setup-{}", index + 1));
@@ -126,7 +150,7 @@ fn run_setup(
             });
         }
     }
-    Ok(())
+    Ok(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
 }
 
 fn run_checks(
@@ -260,56 +284,12 @@ fn configured_env(project: &ProjectResolution) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn cache_key(
-    project: &ProjectResolution,
-    base_tree: &str,
-    env: &BTreeMap<OsString, OsString>,
-) -> String {
-    let checks = config_value(project, "checks");
-    let setup = config_value(project, "setup");
-    let env = env
-        .iter()
-        .filter_map(|(key, value)| {
-            let key = key.to_string_lossy();
-            if matches!(key.as_ref(), "TMPDIR" | "MISE_STATE_DIR" | "MISE_CACHE_DIR") {
-                return None;
-            }
-            Some((key.into_owned(), value.to_string_lossy().into_owned()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let encoded = serde_json::to_vec(&(base_tree, setup, checks, env)).unwrap_or_default();
-    let digest = Sha256::digest(encoded);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn read_cache(path: &Path, key: &str) -> Option<BaselineCache> {
-    let bytes = fs::read(path).ok()?;
-    let cache: BaselineCache = serde_json::from_slice(&bytes).ok()?;
-    (cache.key == key).then_some(cache)
-}
-
-fn write_cache(path: &Path, cache: &BaselineCache) -> Result<(), CheckError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| CheckError::Internal("approval cache has no parent".to_owned()))?;
-    fs::create_dir_all(parent).map_err(|error| CheckError::Internal(error.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|error| CheckError::Internal(error.to_string()))?;
-    }
-    let bytes =
-        serde_json::to_vec(cache).map_err(|error| CheckError::Internal(error.to_string()))?;
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&temporary, bytes).map_err(|error| CheckError::Internal(error.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-            .map_err(|error| CheckError::Internal(error.to_string()))?;
-    }
-    fs::rename(&temporary, path).map_err(|error| CheckError::Internal(error.to_string()))
+fn checks_value(project: &ProjectResolution) -> Result<serde_json::Value, CheckError> {
+    config_value(project, "checks")
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| CheckError::Internal(error.to_string()))
+        .map(|value| value.unwrap_or_else(|| serde_json::json!([])))
 }
 
 fn config_value<'a>(project: &'a ProjectResolution, field: &str) -> Option<&'a Value> {

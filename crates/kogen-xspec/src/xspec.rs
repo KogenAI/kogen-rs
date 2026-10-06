@@ -1,6 +1,7 @@
 mod approve;
 mod intent;
 mod queue;
+mod setup_cache;
 mod temp;
 
 use kogen_core::queue::QueueScheduler;
@@ -12,6 +13,7 @@ pub struct Adapter {
     state: Value,
     project: TempProject,
     queue: QueueScheduler,
+    setup_cache: setup_cache::Replay,
 }
 
 #[derive(Clone, Copy)]
@@ -19,6 +21,7 @@ enum Slice {
     Intent,
     Approve,
     Queue,
+    SetupCache,
 }
 
 impl Adapter {
@@ -27,15 +30,18 @@ impl Adapter {
             "intent" => Slice::Intent,
             "approve" => Slice::Approve,
             "queue" => Slice::Queue,
+            "setup-cache" => Slice::SetupCache,
             _ => return Err(format!("unknown private slice `{name}`")),
         };
         let project = TempProject::new()?;
+        let setup_cache = setup_cache::Replay::new()?;
         let state = initial_state(slice);
         Ok(Self {
             slice,
             state,
             project,
             queue: QueueScheduler::new(),
+            setup_cache,
         })
     }
 
@@ -59,6 +65,7 @@ impl Adapter {
                         Slice::Intent => intent::apply(self, &event),
                         Slice::Approve => approve::apply(self, &event),
                         Slice::Queue => queue::apply(&mut self.queue, &event),
+                        Slice::SetupCache => self.setup_cache.apply(&event),
                     }
                 }
             }
@@ -67,6 +74,9 @@ impl Adapter {
     }
 
     fn reset(&mut self) -> Result<Value, String> {
+        if matches!(self.slice, Slice::SetupCache) {
+            return self.setup_cache.reset();
+        }
         self.project.reset()?;
         self.state = initial_state(self.slice);
         self.queue = QueueScheduler::new();
@@ -79,6 +89,7 @@ impl Adapter {
             Slice::Approve => approve::observe(self),
             Slice::Queue => serde_json::to_value(self.queue.observe())
                 .expect("queue observations are serializable"),
+            Slice::SetupCache => self.setup_cache.observe(),
         }
     }
 }
@@ -88,6 +99,14 @@ fn initial_state(slice: Slice) -> Value {
         Slice::Intent => kogen_core::approval::replay::intent_initial(),
         Slice::Approve => kogen_core::approval::replay::approve_initial(),
         Slice::Queue => Value::Null,
+        Slice::SetupCache => serde_json::json!({
+            "entryCount": 0,
+            "work": "",
+            "present": false,
+            "reused": false,
+            "setupRuns": 0,
+            "last": "ok",
+        }),
     }
 }
 
