@@ -1,0 +1,215 @@
+//! Per-request ChatGPT credentials, including the injected JWT test adapter.
+
+use std::fs;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::{RunAccount, provider_error};
+
+#[path = "auth/jwt.rs"]
+mod jwt;
+#[path = "auth/oauth.rs"]
+pub(super) mod oauth;
+#[path = "auth/refresh.rs"]
+mod refresh;
+#[path = "auth/store.rs"]
+mod store;
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct Credential {
+    pub client_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub id_token: String,
+    pub expires_at: i64,
+    pub scopes: Vec<String>,
+    pub subject: String,
+    pub email: Option<String>,
+    pub host_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InjectedCredential {
+    pub access_token: String,
+    pub account_id: String,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestCredential {
+    Owned(Credential),
+    Injected(InjectedCredential),
+}
+
+impl RequestCredential {
+    #[must_use]
+    pub fn access_token(&self) -> &str {
+        match self {
+            Self::Owned(credential) => &credential.access_token,
+            Self::Injected(credential) => &credential.access_token,
+        }
+    }
+
+    #[must_use]
+    pub fn account_id(&self) -> Option<String> {
+        match self {
+            Self::Owned(credential) => account_id_from_id_token(&credential.id_token),
+            Self::Injected(credential) => Some(credential.account_id.clone()),
+        }
+    }
+}
+
+/// Load credentials for one request. Injected auth is re-read from disk on
+/// every call; owned credentials refresh under their per-label lock.
+pub fn credential_for_request(
+    home: &Path,
+    account: &RunAccount,
+) -> Result<RequestCredential, super::CoreError> {
+    if account.provider != "chatgpt" {
+        return Err(provider_error(
+            "unsupported_provider",
+            "ChatGPT credentials requested for a non-ChatGPT run",
+        ));
+    }
+    if let Some(path) = std::env::var_os("KOGEN_AUTH_PATH") {
+        return read_injected(Path::new(&path)).map(RequestCredential::Injected);
+    }
+    let credential = store::get(home, &account.label)?.ok_or_else(|| {
+        provider_error(
+            "login",
+            format!(
+                "Selected account {} has no saved login; run kogen provider login chatgpt to sign in",
+                account.label
+            ),
+        )
+    })?;
+    if credential.expires_at <= now_seconds().saturating_add(300) {
+        return refresh::refresh(home, &account.label, None).map(RequestCredential::Owned);
+    }
+    Ok(RequestCredential::Owned(credential))
+}
+
+/// Refresh after an API 401 only when this is still the token the server
+/// rejected. Callers replay the request once with the returned token.
+pub fn refresh_after_401(
+    home: &Path,
+    label: &str,
+    rejected_access_token: &str,
+) -> Result<Credential, super::CoreError> {
+    refresh::refresh(home, label, Some(rejected_access_token))
+}
+
+pub fn read_injected(path: &Path) -> Result<InjectedCredential, super::CoreError> {
+    let bytes =
+        fs::read(path).map_err(|_| provider_error("login", "injected auth is unavailable"))?;
+    let doc: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| provider_error("login", "injected auth is invalid"))?;
+    let token = doc
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| provider_error("login", "injected auth is invalid"))?;
+    let account_id = doc
+        .get("tokens")
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| provider_error("login", "injected auth is invalid"))?;
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| provider_error("login", "injected access token has no expiration"))?;
+    let claims_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| provider_error("login", "injected access token is invalid"))?;
+    let claims: Value = serde_json::from_slice(&claims_bytes)
+        .map_err(|_| provider_error("login", "injected access token is invalid"))?;
+    let expires_at = claims
+        .get("exp")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| provider_error("login", "injected access token has no expiration"))?;
+    if expires_at <= now_seconds() {
+        return Err(provider_error("login", "injected access token has expired"));
+    }
+    Ok(InjectedCredential {
+        access_token: token.to_owned(),
+        account_id: account_id.to_owned(),
+        expires_at,
+    })
+}
+
+pub(crate) fn login_owned(
+    home: &Path,
+    previous_client_id: Option<&str>,
+    progress: impl FnMut(&str),
+) -> Result<(Credential, String, Option<String>, Option<String>), super::CoreError> {
+    let result = oauth::login(home, previous_client_id, progress)?;
+    Ok((
+        result.credential,
+        result.identity.subject,
+        result.identity.email,
+        result.identity.plan_usage,
+    ))
+}
+
+pub(crate) fn revoke_owned(credential: &Credential) -> bool {
+    oauth::revoke(credential)
+}
+
+pub(crate) fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+pub(crate) fn account_id_from_id_token(id_token: &str) -> Option<String> {
+    let claims = unverified_claims(id_token)?;
+    claims
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+pub(crate) fn unverified_claims(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+pub(crate) use store::{delete as delete_credential, get as get_credential, put as put_credential};
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use base64::Engine as _;
+
+    use super::read_injected;
+
+    #[test]
+    fn rejects_expired_injected_auth_without_network_access() {
+        let path = std::env::temp_dir().join(format!(
+            "kogen-expired-auth-{}-{}.json",
+            std::process::id(),
+            super::now_seconds()
+        ));
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"exp\":{}}}", super::now_seconds() - 1));
+        let document = format!(
+            "{{\"tokens\":{{\"access_token\":\"a.{encoded}.s\",\"account_id\":\"acct\"}}}}"
+        );
+        std::fs::write(&path, document).unwrap();
+        let result = read_injected(Path::new(&path));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.unwrap_err().reason, "login");
+    }
+}
