@@ -73,6 +73,25 @@ pub fn dispatch(command: Command) -> CliOutput {
             ExitCode::Provider,
         )
         .into_cli_output(),
+        Command::IntentApprove {
+            slug,
+            hash,
+            by,
+            project,
+        } => match resolve_project(project) {
+            Ok(project) => {
+                kogen_core::approval::approve(&project, &slug, hash.as_deref(), by.as_deref())
+            }
+            Err(error) => error.into_cli_output(),
+        },
+        Command::IntentRemove {
+            slug,
+            force,
+            project,
+        } => match resolve_project(project) {
+            Ok(project) => kogen_core::approval::remove(&project, &slug, force),
+            Err(error) => error.into_cli_output(),
+        },
         _ => CoreError::new(
             ErrorClass::Controller,
             "internal_error",
@@ -252,6 +271,44 @@ fn provider_output(result: Result<String, CoreError>) -> CliOutput {
         Ok(output) => CliOutput::success(output),
         Err(error) => error.into_cli_output(),
     }
+}
+
+fn resolve_project(
+    options: crate::request::ProjectOptions,
+) -> Result<kogen_core::project::ProjectResolution, CoreError> {
+    let options = kogen_core::project::ProjectOptions {
+        cwd: Some(options.project.clone()),
+        project: Some(options.project),
+        origin: options.origin,
+        base: options.base,
+        home: None,
+    };
+    kogen_core::project::ProjectResolution::resolve(&options).map_err(|error| match error {
+        kogen_core::project::ProjectError::ProjectUnavailable(path) => CoreError::new(
+            ErrorClass::Environment,
+            "project_unavailable",
+            path.display().to_string(),
+            ExitCode::Environment,
+        ),
+        kogen_core::project::ProjectError::NotGitWorkTree(path) => CoreError::new(
+            ErrorClass::Environment,
+            "not_a_git_repo",
+            path.display().to_string(),
+            ExitCode::Environment,
+        ),
+        kogen_core::project::ProjectError::InvalidConfig(error) => CoreError::new(
+            ErrorClass::Environment,
+            "project_config_invalid",
+            error.to_string(),
+            ExitCode::Environment,
+        ),
+        kogen_core::project::ProjectError::BaseUnavailable(detail) => CoreError::new(
+            ErrorClass::Environment,
+            "base_unavailable",
+            detail,
+            ExitCode::Environment,
+        ),
+    })
 }
 
 fn version_line() -> String {

@@ -1,3 +1,5 @@
+mod xspec;
+
 use kogen_core::provider::http::retry::RetryReplay;
 use kogen_core::provider::session::replay::SessionReplay;
 use serde::Serialize;
@@ -5,26 +7,30 @@ use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("kogen-xspec: {error}");
-        std::process::exit(1);
+    let mut args = std::env::args().skip(1);
+    let Some(slice) = args.next() else {
+        legacy_fail("expected a slice name");
+    };
+    if args.next().is_some() {
+        if matches!(slice.as_str(), "intent" | "approve") {
+            fail("expected exactly one private slice name");
+        }
+        legacy_fail("expected exactly one slice name");
+    }
+
+    match slice.as_str() {
+        "stream" => run_replay(RetryReplay::default()),
+        "session" => run_replay(SessionReplay::default()),
+        "intent" | "approve" => run_private(&slice),
+        _ => legacy_fail(&format!("unsupported slice {slice:?}")),
     }
 }
 
-fn run() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    let slice = args
-        .next()
-        .ok_or_else(|| "expected a slice name".to_owned())?;
-    if args.next().is_some() {
-        return Err("expected exactly one slice name".to_owned());
-    }
+fn run_replay<S: Transition>(state: S) {
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    match slice.as_str() {
-        "stream" => replay(stdin.lock(), &mut stdout, RetryReplay::default()),
-        "session" => replay(stdin.lock(), &mut stdout, SessionReplay::default()),
-        _ => Err(format!("unsupported slice {slice:?}")),
+    if let Err(error) = replay(stdin.lock(), &mut stdout, state) {
+        legacy_fail(&error);
     }
 }
 
@@ -113,4 +119,43 @@ where
         writer.flush().map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn run_private(slice: &str) {
+    let mut adapter = match xspec::Adapter::new(slice) {
+        Ok(adapter) => adapter,
+        Err(error) => fail(&error),
+    };
+    let stdin = io::stdin();
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => fail(&format!("read protocol line: {error}")),
+        };
+        let request = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => fail(&format!("invalid JSON request: {error}")),
+        };
+        let observation = match adapter.handle(request) {
+            Ok(observation) => observation,
+            Err(error) => fail(&error),
+        };
+        if serde_json::to_writer(&mut stdout, &observation).is_err()
+            || stdout.write_all(b"\n").is_err()
+            || stdout.flush().is_err()
+        {
+            fail("write protocol observation");
+        }
+    }
+}
+
+fn legacy_fail(message: &str) -> ! {
+    eprintln!("kogen-xspec: {message}");
+    std::process::exit(1);
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("kogen-xspec: {message}");
+    std::process::exit(kogen_core::ExitCode::Bug.as_i32());
 }
