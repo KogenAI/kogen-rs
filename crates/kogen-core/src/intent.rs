@@ -2,6 +2,8 @@
 
 mod lint;
 mod parser;
+pub mod shaping;
+mod style;
 
 #[cfg(test)]
 mod tests;

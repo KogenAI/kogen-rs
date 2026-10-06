@@ -15,8 +15,17 @@ pub struct LintIssue {
 }
 
 impl Intent {
-    /// Return the guaranteed structural lint findings. Style policy is owned by package 12.
+    /// Return structural findings and style findings shown on approval cards.
     pub fn lint(&self) -> Vec<LintIssue> {
+        self.lint_with_mode(false)
+    }
+
+    /// Include shaping-only style requirements such as the Notes Approach line.
+    pub fn lint_for_shaping(&self) -> Vec<LintIssue> {
+        self.lint_with_mode(true)
+    }
+
+    fn lint_with_mode(&self, shaping: bool) -> Vec<LintIssue> {
         let mut out = Vec::new();
         if self.brief.trim().is_empty() {
             out.push(issue("missing_brief", None, "write the Brief as prose"));
@@ -86,6 +95,7 @@ impl Intent {
                 "remove TBD, TODO, FIXME, or unresolved question markers",
             ));
         }
+        out.extend(super::style::findings(self, shaping));
         out
     }
 }

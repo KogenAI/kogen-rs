@@ -2,8 +2,8 @@ use kogen_core::ExitCode;
 use kogen_core::error::{CliOutput, CoreError, ErrorClass};
 use kogen_core::provider::chatgpt;
 use kogen_core::provider::grok;
-use std::io::Write as _;
-use std::path::Path;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
 
 use crate::request::Command;
 
@@ -59,6 +59,11 @@ pub fn dispatch(command: Command) -> CliOutput {
             };
             provider_output(grok::use_account(&home, &label, project.as_deref()))
         }
+        Command::IntentShape {
+            slug,
+            request,
+            project,
+        } => shape_output(shape_command(slug, request, project)),
         Command::ProviderLogin { provider }
         | Command::ProviderLogout { provider }
         | Command::ProviderUse { provider, .. } => CoreError::new(
@@ -76,6 +81,142 @@ pub fn dispatch(command: Command) -> CliOutput {
         )
         .into_cli_output(),
     }
+}
+
+fn shape_command(
+    slug: String,
+    request: String,
+    project: crate::request::ProjectOptions,
+) -> Result<kogen_core::intent::shaping::ShapeReport, CoreError> {
+    let Some(home) = home_dir() else {
+        return Err(CoreError::new(
+            ErrorClass::Environment,
+            "home_unavailable",
+            "HOME is not set",
+            ExitCode::Environment,
+        ));
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (request_bytes, request_label) = if request == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes).map_err(|error| {
+            CoreError::new(
+                ErrorClass::Intent,
+                "request_unavailable",
+                format!("stdin: {error}"),
+                ExitCode::Usage,
+            )
+        })?;
+        (bytes, "stdin".to_owned())
+    } else {
+        let path = PathBuf::from(&request);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        let bytes = std::fs::read(&path).map_err(|error| {
+            CoreError::new(
+                ErrorClass::Intent,
+                "request_unavailable",
+                format!("{}: {error}", path.display()),
+                ExitCode::Usage,
+            )
+        })?;
+        (bytes, path.display().to_string())
+    };
+    if request_is_whitespace(&request_bytes) {
+        return Err(CoreError::new(
+            ErrorClass::Intent,
+            "request_unavailable",
+            format!("{request_label}: empty"),
+            ExitCode::Usage,
+        ));
+    }
+    let crate::request::ProjectOptions {
+        project: project_path,
+        origin,
+        base,
+    } = project;
+    kogen_core::intent::shaping::shape(kogen_core::intent::shaping::ShapeOptions {
+        cwd,
+        home,
+        project: Some(project_path),
+        origin,
+        base,
+        slug,
+        request: request_bytes,
+    })
+}
+
+fn shape_output(result: Result<kogen_core::intent::shaping::ShapeReport, CoreError>) -> CliOutput {
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => return error.into_cli_output(),
+    };
+    let mut stdout = format!(
+        "Intent: {}\nAcceptance test: {}\nValidated after {} round(s).\nFeasibility: not checked\n",
+        report.intent_path.display(),
+        report.acceptance_path.display(),
+        report.rounds,
+    );
+    if !report.warnings.is_empty() {
+        stdout.push_str("Warnings\n");
+        for warning in &report.warnings {
+            let ids = if warning.item_ids.is_empty() {
+                "-".to_owned()
+            } else {
+                warning.item_ids.join(", ")
+            };
+            stdout.push_str(&format!(
+                "  - {}: {} — {}\n",
+                warning.code, ids, warning.message
+            ));
+        }
+    }
+    for call in &report.calls {
+        stdout.push_str(&format!(
+            "shape {} {}/{} input={} cached={} output={} reasoning={} wall_ms={}\n",
+            call.role,
+            call.model,
+            call.effort,
+            optional_count(call.usage.input),
+            optional_count(call.usage.cached_input),
+            optional_count(call.usage.output),
+            optional_count(call.usage.reasoning),
+            call.wall_ms,
+        ));
+    }
+    stdout.push_str(&format!(
+        "Transcript: {}\nNext: kogen intent approve {}\n",
+        report.transcript_path.display(),
+        report
+            .intent_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("intent"),
+    ));
+    CliOutput {
+        stdout,
+        stderr: report
+            .progress
+            .into_iter()
+            .map(|line| format!("{line}\n"))
+            .collect(),
+        exit_code: ExitCode::Done,
+    }
+}
+
+fn optional_count(count: Option<u64>) -> String {
+    count.map_or_else(|| "null".to_owned(), |count| count.to_string())
+}
+
+fn request_is_whitespace(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).map_or_else(
+        |_| bytes.iter().all(u8::is_ascii_whitespace),
+        |text| text.chars().all(char::is_whitespace),
+    )
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {

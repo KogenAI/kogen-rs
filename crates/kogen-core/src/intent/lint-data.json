@@ -1,0 +1,297 @@
+{
+ "tiers": {
+  "small": {
+   "brief_paragraphs": 1,
+   "brief_words": 90,
+   "items": 3,
+   "notes_words": 250
+  },
+  "medium": {
+   "brief_paragraphs": 2,
+   "brief_words": 200,
+   "items": 6,
+   "notes_words": 400
+  },
+  "large": {
+   "brief_paragraphs": 3,
+   "brief_words": 330,
+   "items": 10,
+   "notes_words": 600
+  }
+ },
+ "limits": {
+  "title_chars": 72,
+  "item_words": 25,
+  "sentence_words": 30,
+  "notes_code_block_lines": 15,
+  "approach_min_words": 8
+ },
+ "banned_words": [
+  "ensure",
+  "ensures",
+  "ensuring",
+  "robust",
+  "robustly",
+  "seamless",
+  "seamlessly",
+  "leverage",
+  "leverages",
+  "leveraging",
+  "comprehensive",
+  "holistic",
+  "streamline",
+  "utilize",
+  "utilizes",
+  "facilitate",
+  "facilitates",
+  "delve",
+  "crucial",
+  "essential",
+  "various",
+  "properly",
+  "appropriate",
+  "appropriately",
+  "gracefully",
+  "correctly",
+  "etc",
+  "moreover",
+  "furthermore",
+  "additionally",
+  "overall",
+  "basically",
+  "actually",
+  "simply",
+  "really",
+  "very",
+  "meaningful",
+  "bounded",
+  "durable",
+  "authoritative"
+ ],
+ "banned_phrases": [
+  "in order to",
+  "it is important",
+  "it's important",
+  "note that",
+  "a variety of",
+  "in terms of",
+  "as needed",
+  "and/or",
+  "best practice",
+  "best practices",
+  "plays a key role",
+  "not only",
+  "state of the art",
+  "end to end",
+  "end-to-end",
+  "as well as",
+  "make sure",
+  "take care",
+  "where appropriate",
+  "if needed",
+  "if necessary",
+  "at all times",
+  "in a way that",
+  "with respect to",
+  "the ability to"
+ ],
+ "hedge_words": [
+  "should",
+  "may",
+  "might",
+  "could",
+  "ideally",
+  "possibly",
+  "probably",
+  "generally",
+  "typically",
+  "usually"
+ ],
+ "hedge_phrases": [
+  "try to",
+  "where possible",
+  "as much as possible"
+ ],
+ "action_verbs": [
+  "add",
+  "advance",
+  "calculate",
+  "change",
+  "compare",
+  "compute",
+  "count",
+  "derive",
+  "extend",
+  "filter",
+  "handle",
+  "implement",
+  "keep",
+  "limit",
+  "map",
+  "move",
+  "normalize",
+  "parse",
+  "preserve",
+  "record",
+  "replace",
+  "return",
+  "route",
+  "run",
+  "schedule",
+  "shift",
+  "skip",
+  "store",
+  "update",
+  "use",
+  "validate",
+  "wrap"
+ ],
+ "match": "case-insensitive; boundaries (?:^|[^a-z0-9_])<escaped>(?:$|[^a-z0-9_]); inline code replaced by a space first",
+ "rules": [
+  {
+   "rule": "missing_brief",
+   "severity": "error",
+   "message": "write the Brief as prose"
+  },
+  {
+   "rule": "list_in_brief",
+   "severity": "error",
+   "message": "the Brief cannot contain lists",
+   "pattern": "^\\s*(?:[-*+]|\\d+[.)])\\s"
+  },
+  {
+   "rule": "heading_in_brief",
+   "severity": "error",
+   "message": "the Brief cannot contain headings"
+  },
+  {
+   "rule": "code_block_in_brief",
+   "severity": "error",
+   "message": "the Brief cannot contain code blocks"
+  },
+  {
+   "rule": "unknown_size",
+   "severity": "error",
+   "message": "size must be small, medium, or large"
+  },
+  {
+   "rule": "acceptance_count",
+   "severity": "error",
+   "message": "Acceptance needs at least one item"
+  },
+  {
+   "rule": "missing_title",
+   "severity": "error",
+   "message": "title is required"
+  },
+  {
+   "rule": "domain_count",
+   "severity": "error",
+   "message": "declare between one and four domains"
+  },
+  {
+   "rule": "duplicate_id",
+   "severity": "error",
+   "message": "Acceptance ids must be unique"
+  },
+  {
+   "rule": "sequential_ids",
+   "severity": "error",
+   "message": "Acceptance ids must be A1 through An in order"
+  },
+  {
+   "rule": "missing_verify",
+   "severity": "error",
+   "message": "every Acceptance item needs a Verify kind"
+  },
+  {
+   "rule": "unsupported_verify_kind",
+   "severity": "error",
+   "message": "<kind> is not supported in core v1"
+  },
+  {
+   "rule": "invalid_verify",
+   "severity": "error",
+   "message": "unknown Verify word \"<w>\""
+  },
+  {
+   "rule": "no_change_item",
+   "severity": "error",
+   "message": "at least one Acceptance item must be a change item (test)"
+  },
+  {
+   "rule": "open_question",
+   "severity": "error",
+   "message": "remove TBD, TODO, FIXME, or unresolved question markers",
+   "pattern": "\\b(?:TBD|TODO|FIXME)\\b|\\[\\s*NEEDS CLARIFICATION|\\?\\?"
+  },
+  {
+   "rule": "brief_paragraphs",
+   "severity": "style",
+   "message": "<size> Intents allow at most <N> Brief paragraphs"
+  },
+  {
+   "rule": "brief_too_long",
+   "severity": "style",
+   "message": "<size> Intents allow at most <N> Brief words"
+  },
+  {
+   "rule": "too_many_items",
+   "severity": "style",
+   "message": "<size> Intents allow at most <N> Acceptance items"
+  },
+  {
+   "rule": "notes_too_long",
+   "severity": "style",
+   "message": "<size> Intents allow at most <N> Notes words"
+  },
+  {
+   "rule": "title_too_long",
+   "severity": "style",
+   "message": "title must be at most 72 characters"
+  },
+  {
+   "rule": "item_too_long",
+   "severity": "style",
+   "message": "A<n> exceeds 25 words"
+  },
+  {
+   "rule": "hedge",
+   "severity": "style",
+   "message": "A<n> contains a hedge; state an observable result"
+  },
+  {
+   "rule": "banned_phrase",
+   "severity": "style",
+   "message": "<Brief|A<n>> contains banned phrase \"<p>\""
+  },
+  {
+   "rule": "sentence_too_long",
+   "severity": "style",
+   "message": "<Brief|A<n>> has a sentence over 30 words"
+  },
+  {
+   "rule": "long_code_block",
+   "severity": "style",
+   "message": "Notes code blocks must contain at most 15 lines"
+  },
+  {
+   "rule": "malformed_ref",
+   "severity": "style",
+   "adapter": "exunit",
+   "message": "malformed code reference \"<tok>\"; use Mod.fun/arity"
+  },
+  {
+   "rule": "missing_approach",
+   "severity": "style",
+   "shaping_only": true,
+   "message": "Notes must start with Approach: naming the code path (at least 8 words and an action verb)"
+  },
+  {
+   "rule": "undeclared_gate_path",
+   "severity": "error",
+   "shaping_only": true,
+   "message": "Gate-path edit requires `changes_gate: true`; matched path <p>."
+  }
+ ]
+}
