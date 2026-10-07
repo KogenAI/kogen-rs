@@ -25,6 +25,8 @@ pub struct Adapter {
     intent_hash_aliases: BTreeMap<String, String>,
     project: TempProject,
     queue: QueueScheduler,
+    stream: kogen_core::provider::http::retry::RetryReplay,
+    session: SessionReplay,
     setup_cache: setup_cache::Replay,
     status: kogen_core::status::StatusReplay,
     recovery: kogen_core::recovery::RecoveryModel,
@@ -51,6 +53,8 @@ enum Slice {
     Status,
     Recovery,
     Rebase,
+    Stream,
+    Session,
     Orchestration,
     Gate,
 }
@@ -65,6 +69,8 @@ impl Adapter {
             "status" => Slice::Status,
             "recovery" => Slice::Recovery,
             "rebase" => Slice::Rebase,
+            "stream" => Slice::Stream,
+            "session" => Slice::Session,
             "orchestration" => Slice::Orchestration,
             "gate" => Slice::Gate,
             _ => return Err(format!("unknown private slice `{name}`")),
@@ -79,6 +85,8 @@ impl Adapter {
             intent_hash_aliases: BTreeMap::new(),
             project,
             queue: QueueScheduler::new(),
+            stream: kogen_core::provider::http::retry::RetryReplay::default(),
+            session: SessionReplay::default(),
             setup_cache,
             status: kogen_core::status::StatusReplay::new(),
             recovery: kogen_core::recovery::RecoveryModel::new(),
@@ -108,6 +116,16 @@ impl Adapter {
                         Slice::Intent => intent::apply(self, &event),
                         Slice::Approve => approve::apply(self, &event),
                         Slice::Queue => queue::apply(&mut self.queue, &event),
+                        Slice::Stream => {
+                            self.stream
+                                .apply(string(&event, "tag")?, event.get("value"));
+                            self.observation()
+                        }
+                        Slice::Session => {
+                            self.session
+                                .apply(string(&event, "tag")?, event.get("value"))?;
+                            self.observation()
+                        }
                         Slice::SetupCache => self.setup_cache.apply(&event),
                         Slice::Status => status::apply(&mut self.status, &event),
                         Slice::Recovery => recovery::apply(&mut self.recovery, &event),
@@ -130,6 +148,12 @@ impl Adapter {
         if matches!(self.slice, Slice::Intent | Slice::Approve) {
             self.project.reset()?;
         }
+        if matches!(self.slice, Slice::Stream) {
+            self.stream = kogen_core::provider::http::retry::RetryReplay::default();
+        }
+        if matches!(self.slice, Slice::Session) {
+            self.session.reset()?;
+        }
         self.approval_aliases.clear();
         self.intent_hash_aliases.clear();
         self.state = initial_state(self.slice);
@@ -148,6 +172,14 @@ impl Adapter {
             Slice::Approve => approve::observe(self),
             Slice::Queue => Ok(serde_json::to_value(self.queue.observe())
                 .expect("queue observations are serializable")),
+            Slice::Stream => {
+                Ok(serde_json::to_value(&self.stream)
+                    .expect("stream observations are serializable"))
+            }
+            Slice::Session => {
+                Ok(serde_json::to_value(&self.session)
+                    .expect("session observations are serializable"))
+            }
             Slice::SetupCache => Ok(self.setup_cache.observe()),
             Slice::Status => Ok(serde_json::to_value(self.status.observe())
                 .expect("status observations are serializable")),
@@ -181,7 +213,12 @@ fn initial_state(slice: Slice) -> Value {
             "setupRuns": 0,
             "last": "ok",
         }),
-        Slice::Status | Slice::Recovery | Slice::Orchestration | Slice::Gate => Value::Null,
+        Slice::Status
+        | Slice::Recovery
+        | Slice::Stream
+        | Slice::Session
+        | Slice::Orchestration
+        | Slice::Gate => Value::Null,
         Slice::Rebase => json!(kogen_core::git::landing::LandingModel::new().observe()),
     }
 }
