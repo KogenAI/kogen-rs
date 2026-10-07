@@ -1017,19 +1017,16 @@ mod tests {
             .expect("load default options");
         assert!(!defaults.context_packet);
 
-        let project_enabled = BuildOptions::load_with_machine(
-            &project("build:\n  context_packet: true\n"),
-            &None,
-        )
-        .expect("load project option");
+        let project_enabled =
+            BuildOptions::load_with_machine(&project("build:\n  context_packet: true\n"), &None)
+                .expect("load project option");
         assert!(project_enabled.context_packet);
 
         let machine = Some(
             serde_yaml::from_str("context_packet: true\n").expect("parse machine build config"),
         );
-        let machine_enabled =
-            BuildOptions::load_with_machine(&project("build: {}"), &machine)
-                .expect("load machine option");
+        let machine_enabled = BuildOptions::load_with_machine(&project("build: {}"), &machine)
+            .expect("load machine option");
         assert!(machine_enabled.context_packet);
 
         let project_override = BuildOptions::load_with_machine(
