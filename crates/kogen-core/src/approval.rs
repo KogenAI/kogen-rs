@@ -54,8 +54,9 @@ pub fn approve(
     approve_with_effects(project, slug, given_hash, by, &mut NoApprovalEffects)
 }
 
-/// Effect port used to inject a ref race in deterministic adapter replays.
-/// Production callers use [`approve`], which supplies a no-op implementation.
+/// Effect port used to inject source changes and ref races in deterministic
+/// adapter replays. Production callers use [`approve`], which supplies a
+/// no-op implementation.
 pub trait ApprovalEffects {
     fn before_late_read(
         &mut self,
@@ -81,9 +82,10 @@ struct NoApprovalEffects;
 
 impl ApprovalEffects for NoApprovalEffects {}
 
-/// Run the production approval decision with an injected effect at the CAS
-/// boundary. The policy, source reread, retry count, and CAS remain in the
-/// same command path used by [`approve`].
+/// Run the production approval decision with injected effects immediately
+/// before the late source read and at the ref-CAS boundary. The policy, source
+/// reread, retry count, and CAS remain in the same command path used by
+/// [`approve`].
 pub fn approve_with_effects(
     project: &ProjectResolution,
     slug: &str,
@@ -278,14 +280,6 @@ fn approve_inner(
         });
     }
 
-    if project_uses_witness(project) && witness_doc.is_none() {
-        return Err(intent_error(
-            "unproven",
-            "the witness is not proven",
-            ExitCode::Negative,
-        ));
-    }
-
     let ledger = matching_ledger(project, slug, &actual_hash);
     let approval = ApprovalDocument {
         schema: 2,
@@ -352,6 +346,13 @@ fn approve_inner(
                 slug,
                 &late_hash[..8],
                 given_hash.unwrap_or_default(),
+            ));
+        }
+        if project_uses_witness(project) && approval.witness.is_none() {
+            return Err(intent_error(
+                "unproven",
+                "the witness is not proven",
+                ExitCode::Negative,
             ));
         }
         effects

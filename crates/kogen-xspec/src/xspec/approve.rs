@@ -359,3 +359,51 @@ fn bytes_value(value: &Value, field: &str) -> Result<Vec<u8>, String> {
         .map(|bytes| bytes.as_bytes().to_vec())
         .ok_or_else(|| format!("`{field}` must be a UTF-8 string"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::apply;
+    use crate::xspec::Adapter;
+    use serde_json::json;
+
+    #[test]
+    fn late_hash_mismatch_precedes_unproven_witness() {
+        let mut adapter = Adapter::new("approve").expect("approval replay adapter");
+        let observation = apply(
+            &mut adapter,
+            &json!({
+                "tag": "Approve",
+                "value": {
+                    "slug": "alpha",
+                    "given": "abcd1234",
+                    "prefixOk": true,
+                    "stableBeforeCas": false,
+                    "newSha8": "bbbb2222",
+                    "sha": "abcd1234ee",
+                    "sha8": "abcd1234",
+                    "by": "",
+                    "byBad": false,
+                    "ident": "Ann <ann@x.io>",
+                    "parseErr": false,
+                    "lintErr": false,
+                    "lintWarn": false,
+                    "missing": false,
+                    "setup": "ok",
+                    "baseTree": "tree-b0",
+                    "cacheKey": "k1",
+                    "baseline": "green",
+                    "acceptance": "green",
+                    "witnessMode": true,
+                    "feas": "UNPROVEN",
+                    "commit": "c1",
+                    "baseSha": "b0"
+                }
+            }),
+        )
+        .expect("approve transition");
+
+        assert_eq!(observation["last"], "intent/hash_mismatch");
+        assert_eq!(observation["sha8"], "bbbb2222");
+        assert_eq!(observation["ran"], true);
+    }
+}
