@@ -244,6 +244,17 @@ fn read_bounded<R: Read>(
 
 impl ProcessPort for ProcessSupervisor {
     fn run(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
+        let original = request.clone();
+        let result = self.run_request(request);
+        if result.is_err() {
+            super::diagnostics::record_process(&original, serde_json::Value::Null, &result)?;
+        }
+        result
+    }
+}
+
+impl ProcessSupervisor {
+    fn run_request(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
         validate(&request)?;
         #[cfg(unix)]
         {

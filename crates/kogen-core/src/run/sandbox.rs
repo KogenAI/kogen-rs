@@ -196,7 +196,51 @@ impl<'a> SandboxedProcessPort<'a> {
 
 impl ProcessPort for SandboxedProcessPort<'_> {
     fn run(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
+        let original = request.clone();
+        let mut summary = serde_json::json!({
+            "enabled": self.policy.enabled,
+            "already_sandboxed": self.policy.already_sandboxed,
+            "forced_unavailable": self.policy.forced_unavailable,
+            "verify_integrity": self.policy.verify_integrity,
+            "writable_paths": self.policy.writable_paths,
+            "write_denied_paths": self.policy.write_denied_paths,
+            "protected_paths": self.policy.protected_paths,
+        });
+        let result = self.run_observed(request, &mut summary);
+        super::diagnostics::record_process(&original, summary, &result)?;
+        result
+    }
+}
+
+impl SandboxedProcessPort<'_> {
+    fn run_observed(
+        &self,
+        request: ProcessRequest,
+        summary: &mut serde_json::Value,
+    ) -> Result<ProcessResult, ProcessError> {
         let prepared = platform::prepare(request, &self.policy)?;
+        summary["status"] = serde_json::json!(prepared.observation.status.as_str());
+        summary["wrapper"] = serde_json::json!(prepared.request.program.to_string_lossy());
+        // Only wrapper policy arguments are printable. Target argv may contain
+        // arbitrary project content; retain its shape, never its values.
+        let policy_args = if prepared.request.program == OsStr::new("/usr/bin/sandbox-exec") {
+            prepared.request.args.iter().take(2).collect::<Vec<_>>()
+        } else if Path::new(&prepared.request.program).file_name() == Some(OsStr::new("bwrap")) {
+            prepared
+                .request
+                .args
+                .iter()
+                .take_while(|arg| *arg != OsStr::new("--"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        summary["policy_argv"] = serde_json::json!(
+            policy_args
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+        );
         let sandbox_exec_wrapper = prepared.request.program == OsStr::new("/usr/bin/sandbox-exec");
         let before = if prepared.observation.status != SandboxStatus::Confined
             && self.policy.verify_integrity

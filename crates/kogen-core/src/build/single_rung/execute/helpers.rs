@@ -206,6 +206,19 @@ pub(super) fn probe_sandbox(
     let result = runner
         .run(request)
         .map_err(|error| environment_error("sandbox_probe_failed", error.to_string()))?;
+    if result.exit_status != Some(0) || result.timed_out || result.unavailable {
+        return Err(environment_error(
+            "sandbox_probe_failed",
+            format!(
+                "exit_status={:?}, timed_out={}, unavailable={}, log={}, output_tail={}",
+                result.exit_status,
+                result.timed_out,
+                result.unavailable,
+                result.log_path.display(),
+                String::from_utf8_lossy(&result.output_tail)
+            ),
+        ));
+    }
     result.sandbox.ok_or_else(|| {
         environment_error(
             "sandbox_probe_failed",
@@ -230,12 +243,15 @@ pub(super) fn stop_run(
 ) -> Result<(), CoreError> {
     snapshot.status = "stopped".to_owned();
     let reason = format!("{}/{}", error.class.as_str(), error.reason);
+    let detail = crate::run::failure_detail(store.directory(), &reason, &error.detail)
+        .map_err(|error| controller_error("runner_diagnostic_failed", error.to_string()))?;
     record(
         store,
         snapshot,
         RunEvent::new("finished", now_ms())
             .with("status", json!("stopped"))
-            .with("reason", json!(reason)),
+            .with("reason", json!(reason))
+            .with("detail", json!(detail)),
     )
 }
 
@@ -688,6 +704,65 @@ mod tests {
             timeout: std::time::Duration::from_secs(3),
             excused: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_probe_stops_and_finished_detail_preserves_runner_diagnostics() {
+        use crate::run::{
+            ProcessError, ProcessPort, ProcessRequest, ProcessResult, SandboxPolicy,
+            SandboxedProcessPort,
+        };
+        struct FailedProbe;
+        impl ProcessPort for FailedProbe {
+            fn run(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
+                let log_path = request.run_dir.join("logs/probe.log");
+                fs::write(&log_path, "bwrap: candidate mount denied\n").unwrap();
+                Ok(ProcessResult {
+                    exit_status: Some(42),
+                    timed_out: false,
+                    unavailable: false,
+                    output_tail: b"bwrap: candidate mount denied\n".to_vec(),
+                    log_path,
+                    duration_ms: 1,
+                    sandbox: None,
+                })
+            }
+        }
+        let root = test_dir();
+        let store = RunStore::new(&root);
+        let mut snapshot = RunSnapshot {
+            schema: 2,
+            run_id: "a".repeat(32),
+            slug: "greet".to_owned(),
+            approval_sha256: String::new(),
+            approval_commit: String::new(),
+            target_branch: "main".to_owned(),
+            status: "running".to_owned(),
+            landing: None,
+            owner_pid: 1,
+            owner_started_ms: 1,
+            started_ms: 1,
+            fields: Default::default(),
+        };
+        store.create(&snapshot).unwrap();
+        crate::run::prepare_private_run_dir(&root).unwrap();
+        let runner =
+            SandboxedProcessPort::new(&FailedProbe, SandboxPolicy::new(false, &root, &root), None);
+        let error = probe_sandbox(&runner, &root, &root, &Default::default()).unwrap_err();
+        assert_eq!(error.reason, "sandbox_probe_failed");
+        stop_run(&store, &mut snapshot, &error).unwrap();
+        let events = store.read_events().unwrap();
+        let finished = serde_json::to_value(events.last().unwrap()).unwrap();
+        assert_eq!(finished["event"], "finished");
+        assert_eq!(finished["reason"], "environment/sandbox_probe_failed");
+        let detail = finished["detail"].as_str().unwrap();
+        assert!(detail.contains("candidate mount denied"));
+        assert!(detail.contains("\"exit_status\":42"));
+        assert!(detail.contains("probe_output"));
+        assert!(detail.contains("policy_argv"));
+        assert!(detail.contains("runner failure log:"));
+        cleanup_path(&root);
     }
 
     #[cfg(unix)]

@@ -33,6 +33,54 @@ impl SandboxIntegrityPort for ChangingIntegrity {
 
 struct StableIntegrity;
 
+#[test]
+fn pre_spawn_failure_and_probe_output_are_logged_with_policy_without_argv_secrets() {
+    let root = test_dir("runner-diagnostics");
+    let policy = SandboxPolicy::new(false, &root, &root);
+    let sandboxed = SandboxedProcessPort::new(&ProcessSupervisor, policy, None);
+    let mut invalid = ProcessRequest::new("/usr/bin/true", &root, &root);
+    invalid.log_name = "acceptance".to_owned();
+    invalid.args.push("sensitive-content".repeat(300).into());
+    assert!(matches!(
+        sandboxed.run(invalid),
+        Err(ProcessError::ArgumentTooLong { .. })
+    ));
+
+    let mut probe = ProcessRequest::new("/bin/sh", &root, &root);
+    probe.log_name = "sandbox-probe".to_owned();
+    probe.args = vec!["-c".into(), "echo probe-denied >&2; exit 23".into()];
+    let result = sandboxed.run(probe).unwrap();
+    assert_eq!(result.exit_status, Some(23));
+    #[cfg(unix)]
+    {
+        fs::write(
+            root.join("private-credentials"),
+            "{\"secret\":\"must-not-be-read\"}",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("private-credentials"),
+            root.join("logs/runner-diagnostic-injected.json"),
+        )
+        .unwrap();
+    }
+    let detail = super::super::diagnostics::failure_detail(
+        &root,
+        "environment/sandbox_probe_failed",
+        "probe failed",
+    )
+    .unwrap();
+    assert!(detail.contains("argv_summary"));
+    assert!(detail.contains("write_denied_paths"));
+    assert!(detail.contains("probe-denied"));
+    assert!(detail.contains("\"exit_status\":23"));
+    assert!(detail.contains("argv element 1"));
+    assert!(!detail.contains("sensitive-content"));
+    assert!(!detail.contains("echo probe-denied"));
+    assert!(!detail.contains("must-not-be-read"));
+    let _ = fs::remove_dir_all(root);
+}
+
 impl SandboxIntegrityPort for StableIntegrity {
     fn snapshot(&self) -> Result<String, String> {
         Ok("same".to_owned())

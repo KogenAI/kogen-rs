@@ -547,9 +547,23 @@ pub(super) fn gate_request(
     run_dir: &Path,
     base_workspace: &Path,
     candidate_workspace: &Path,
-    environment: ChildEnvironment,
+    mut environment: ChildEnvironment,
     protection: ProtectedWorkspace,
 ) -> Result<GateRequest, CoreError> {
+    // Parallel rungs have fresh gate directories. Prepare them before adapters
+    // write private assets, and before Linux selects the existing bind paths.
+    prepare_gate_dir(run_dir)?;
+    // The builder environment may belong to the parent run. Keep gate runtime
+    // writes inside this gate's sandbox binds; explicit project env still wins.
+    for (name, directory) in [
+        ("TMPDIR", "tmp"),
+        ("MISE_STATE_DIR", "mise-state"),
+        ("MISE_CACHE_DIR", "mise-cache"),
+    ] {
+        if !options.environment.contains_key(name) {
+            environment.insert(name.into(), run_dir.join(directory).into_os_string());
+        }
+    }
     let acceptance_relative = candidate_path(options, &approved.slug);
     let mut command = options.acceptance_run.clone();
     if options.adapter == "exunit" {
@@ -605,6 +619,11 @@ pub(super) fn gate_request(
     })
 }
 
+pub(super) fn prepare_gate_dir(run_dir: &Path) -> Result<(), CoreError> {
+    crate::run::prepare_private_run_dir(run_dir)
+        .map_err(|error| environment_error("acceptance_runner_failed", error))
+}
+
 fn safe_log_name(value: &str) -> String {
     value
         .chars()
@@ -646,6 +665,132 @@ mod tests {
     use crate::gate::{CheckResult, CheckStatus, FixResult};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn exunit_parallel_candidate_gate_prepares_fresh_rung_dirs_after_restore_and_setup_reuse() {
+        use super::*;
+        use crate::gate::{ProtectedEntry, ProtectedWorkspace};
+        use crate::intent::{Intent, intent_sha256};
+        use std::fs;
+
+        struct AcceptanceRunner;
+        impl ProcessPort for AcceptanceRunner {
+            fn run(
+                &self,
+                request: ProcessRequest,
+            ) -> Result<crate::run::ProcessResult, ProcessError> {
+                assert_eq!(request.log_name, "acceptance");
+                assert!(request.cwd.ends_with("candidate-R2"));
+                assert_eq!(
+                    fs::read(request.cwd.join("test/acceptance/greet_test.exs")).unwrap(),
+                    b"approved test\n"
+                );
+                assert_eq!(
+                    fs::read(request.run_dir.join("ledger_formatter.ex")).unwrap(),
+                    crate::gate::adapters::exunit::formatter_source().as_bytes()
+                );
+                fs::write(
+                    &request.env[std::ffi::OsStr::new("KOGEN_LEDGER_REPORT")],
+                    "{\"tag\":\"greet/A1\",\"test\":\"invite\",\"status\":\"passed\"}\n",
+                )
+                .unwrap();
+                Ok(crate::run::ProcessResult {
+                    exit_status: Some(0),
+                    timed_out: false,
+                    unavailable: false,
+                    output_tail: Vec::new(),
+                    log_path: request.run_dir.join("logs/acceptance.log"),
+                    duration_ms: 1,
+                    sandbox: None,
+                })
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "kogen-parallel-exunit-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let base = root.join("base");
+        let candidate = root.join("candidate-R2");
+        for path in [&base, &candidate] {
+            fs::create_dir_all(path).unwrap();
+            assert!(
+                kogen_test_support::git_command()
+                    .args(["init", "--quiet"])
+                    .current_dir(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            // Cached setup outputs have already been copied to both clones.
+            for output in ["deps", "_build"] {
+                fs::create_dir_all(path.join(output)).unwrap();
+                fs::write(path.join(output).join("cached"), "reused setup").unwrap();
+            }
+        }
+        let project = ProjectResolution {
+            checkout: root.join("checkout"),
+            origin: root.join("origin"),
+            base: "main".to_owned(),
+            state_root: root.clone(),
+            config: None,
+        };
+        let mut options = BuildOptions::load_with_machine(&project, &None).unwrap();
+        options.setup_outputs = vec!["deps".to_owned(), "_build".to_owned()];
+        let intent_bytes = b"---\ntitle: Invite member\nsize: hard\ndomains: [app]\n---\nInvite a member.\n\n## Acceptance\n- A1: invitation works\n\n## Verify\n- A1: test\n".to_vec();
+        let approved = ApprovedBuild {
+            slug: "greet".to_owned(),
+            commit: String::new(),
+            approval_sha256: String::new(),
+            target_branch: "main".to_owned(),
+            base_sha: String::new(),
+            intent: Intent::parse("greet", &intent_bytes).unwrap(),
+            intent_bytes,
+            acceptance_path: ".kogen/acceptance/greet_test.exs".to_owned(),
+            acceptance_bytes: b"approved test\n".to_vec(),
+            approval: serde_json::json!({"check_baseline": []}),
+            approval_time: 0,
+        };
+        let relative = "test/acceptance/greet_test.exs";
+        fs::create_dir_all(candidate.join("test/acceptance")).unwrap();
+        fs::write(candidate.join(relative), "builder changed protected test").unwrap();
+        let protection = ProtectedWorkspace::new(
+            BTreeMap::from([(
+                relative.to_owned(),
+                ProtectedEntry {
+                    sha256: intent_sha256(&approved.acceptance_bytes),
+                    bytes: Some(approved.acceptance_bytes.clone()),
+                },
+            )]),
+            vec![approved.acceptance_path.clone()],
+        )
+        .unwrap();
+        let restored = protection.restore_after_batch(&candidate).unwrap();
+        assert_eq!(restored, vec![relative.to_owned()]);
+        let run_dir = root.join("run/gate-R2");
+        assert!(!run_dir.exists());
+        let request = gate_request(
+            &project,
+            &approved,
+            &options,
+            &run_dir,
+            &base,
+            &candidate,
+            ChildEnvironment::new(),
+            protection,
+        )
+        .unwrap();
+        assert!(run_dir.join("logs").is_dir());
+        assert!(run_dir.join("reports").is_dir());
+        assert_eq!(
+            request.environment[std::ffi::OsStr::new("TMPDIR")],
+            run_dir.join("tmp")
+        );
+        let report = crate::gate::run_gate(&AcceptanceRunner, &request).unwrap();
+        assert!(report.acceptance.item_pass["A1"]);
+        assert!(report.is_landable());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn gate_feedback_details_cover_mutation_timeout_unavailable_fixes_and_raw_tail() {
