@@ -85,10 +85,23 @@ pub fn credential_for_request(
     home: &Path,
     account: &RunAccount,
 ) -> Result<RequestCredential, super::CoreError> {
+    let injected_path = std::env::var_os("KOGEN_AUTH_PATH").map(std::path::PathBuf::from);
+    credential_for_request_with_injected_path(home, account, injected_path.as_deref())
+}
+
+/// Load credentials through Kogen's normal request-authentication path, with
+/// an optional injected ChatGPT auth file supplied explicitly by the caller.
+/// When `injected_path` is `None`, this function selects the owned login and
+/// does not consult `KOGEN_AUTH_PATH`.
+pub fn credential_for_request_with_injected_path(
+    home: &Path,
+    account: &RunAccount,
+    injected_path: Option<&Path>,
+) -> Result<RequestCredential, super::CoreError> {
     match account.provider.as_str() {
         "chatgpt" => {
-            if let Some(path) = std::env::var_os("KOGEN_AUTH_PATH") {
-                return read_injected(Path::new(&path)).map(RequestCredential::Injected);
+            if let Some(path) = injected_path {
+                return read_injected(path).map(RequestCredential::Injected);
             }
             let credential = store::get(home, &account.label)?.ok_or_else(|| {
                 provider_error(
@@ -271,7 +284,8 @@ mod tests {
 
     use base64::Engine as _;
 
-    use super::read_injected;
+    use super::{RequestCredential, credential_for_request_with_injected_path, read_injected};
+    use crate::provider::RunAccount;
 
     #[test]
     fn rejects_expired_injected_auth_without_network_access() {
@@ -289,5 +303,34 @@ mod tests {
         let result = read_injected(Path::new(&path));
         std::fs::remove_file(&path).unwrap();
         assert_eq!(result.unwrap_err().reason, "login");
+    }
+
+    #[test]
+    fn explicit_injected_path_uses_kogens_request_authentication_path() {
+        let path = std::env::temp_dir().join(format!(
+            "kogen-explicit-auth-{}-{}.json",
+            std::process::id(),
+            super::now_seconds()
+        ));
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"exp\":{}}}", super::now_seconds() + 3600));
+        let document = format!(
+            "{{\"tokens\":{{\"access_token\":\"a.{encoded}.s\",\"account_id\":\"acct\"}}}}"
+        );
+        std::fs::write(&path, document).unwrap();
+        let account = RunAccount {
+            provider: "chatgpt".to_owned(),
+            label: "default".to_owned(),
+            credential_source: "injected",
+        };
+
+        let result = credential_for_request_with_injected_path(
+            Path::new("/unused-home"),
+            &account,
+            Some(&path),
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(matches!(result, Ok(RequestCredential::Injected(_))));
     }
 }

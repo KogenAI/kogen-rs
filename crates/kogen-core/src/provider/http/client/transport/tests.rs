@@ -5,6 +5,7 @@ use crate::provider::{ProviderErrorKind, ProviderFailure};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::{Duration, Instant};
 use url::Url;
 
 #[test]
@@ -99,6 +100,57 @@ fn responses_transport_captures_turn_state_from_http_response_headers() {
         Some("sticky-route-123")
     );
     server.join().unwrap();
+}
+
+#[test]
+fn single_attempt_transport_does_not_follow_redirects() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let redirect_location = format!("{endpoint}/redirected");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect_location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        drop(stream);
+
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut redirected, _)) => {
+                    read_request(&mut redirected);
+                    write!(
+                        redirected,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    return true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("could not inspect redirected request: {error}"),
+            }
+        }
+        false
+    });
+
+    let request = WireRequest {
+        endpoint: Url::parse(&endpoint).unwrap(),
+        mode: ResponseMode::Owned,
+        headers: Vec::new(),
+        body: br#"{"model":"gpt-6-luna"}"#.to_vec(),
+    };
+    let port = ReqwestPort::new_without_redirects().unwrap();
+    let attempt = port.execute(&request, RequestDeadlines::from_environment());
+
+    assert_eq!(attempt.status_code, Some(307));
+    assert!(attempt.response.is_err());
+    assert!(!server.join().unwrap(), "transport followed the redirect");
 }
 
 fn read_request(stream: &mut TcpStream) {

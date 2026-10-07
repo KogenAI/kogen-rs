@@ -16,13 +16,13 @@ fn chatty_child_times_out_and_keeps_bounded_tail() {
         "-c".into(),
         "while :; do printf '0123456789abcdef'; done".into(),
     ];
-    request.timeout = Duration::from_millis(250);
+    request.timeout = Duration::from_secs(1);
     request.log_name = "chatty".to_owned();
 
     let started = Instant::now();
     let result = ProcessSupervisor.run(request).expect("process result");
     assert!(result.timed_out);
-    assert!(started.elapsed() < Duration::from_millis(1250));
+    assert!(started.elapsed() < Duration::from_secs(2));
     assert!(result.output_tail.len() <= OUTPUT_TAIL_BYTES);
     assert!(fs::metadata(&result.log_path).expect("log exists").len() > OUTPUT_TAIL_BYTES as u64);
     assert_eq!(

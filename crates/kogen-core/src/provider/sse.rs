@@ -20,6 +20,8 @@ pub struct SseAssembler {
     pending_cr: bool,
     collected_items: Vec<Value>,
     completed: Option<Value>,
+    raw_usage: Option<Value>,
+    response_model: Option<String>,
     failure: Option<ProviderFailure>,
     malformed: bool,
     finished: bool,
@@ -93,6 +95,19 @@ impl SseAssembler {
         &self.collected_items
     }
 
+    /// The provider's unnormalized usage object, including when assembly later
+    /// fails after the usage event arrived.
+    #[must_use]
+    pub fn raw_usage(&self) -> Option<&Value> {
+        self.raw_usage.as_ref()
+    }
+
+    /// Model name reported by the completed response, when present.
+    #[must_use]
+    pub fn response_model(&self) -> Option<&str> {
+        self.response_model.as_deref()
+    }
+
     fn emit_line(&mut self) {
         if self.line.is_empty() {
             self.emit_frame();
@@ -142,6 +157,7 @@ impl SseAssembler {
         if object.get("error").is_some_and(|error| !error.is_null())
             || matches!(kind, "error" | "response.failed" | "response.incomplete")
         {
+            self.observe_response_metadata(object.get("response"));
             let usage = response_usage(object.get("response"));
             let failure = event_failure(kind, &event, usage);
             if self.failure.is_none() {
@@ -161,12 +177,25 @@ impl SseAssembler {
                 if self.completed.is_some() {
                     self.malformed = true;
                 } else if let Some(response) = object.get("response") {
+                    self.observe_response_metadata(Some(response));
                     self.completed = Some(response.clone());
                 } else {
                     self.malformed = true;
                 }
             }
             _ => {}
+        }
+    }
+
+    fn observe_response_metadata(&mut self, response: Option<&Value>) {
+        let Some(response) = response else {
+            return;
+        };
+        if let Some(usage) = response.get("usage") {
+            self.raw_usage = Some(usage.clone());
+        }
+        if let Some(model) = response.get("model").and_then(Value::as_str) {
+            self.response_model = Some(model.to_owned());
         }
     }
 }

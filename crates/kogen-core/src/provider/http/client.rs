@@ -50,8 +50,16 @@ fn time_scale() -> f64 {
 pub struct HttpAttempt {
     pub response: Result<ModelResponse, ProviderFailure>,
     pub received_items: Vec<serde_json::Value>,
+    /// Milliseconds from dispatch until the first nonempty response chunk.
+    pub first_byte_ms: Option<u64>,
     pub elapsed_ms: u64,
     pub body_bytes_received: u64,
+    /// HTTP status, even when the response stream later fails.
+    pub status_code: Option<u16>,
+    /// Provider usage before normalization, retained on partial/error streams.
+    pub raw_usage: Option<serde_json::Value>,
+    /// Provider-reported model, when the response stream supplied one.
+    pub response_model: Option<String>,
     pub sticky_routing_token: Option<String>,
 }
 

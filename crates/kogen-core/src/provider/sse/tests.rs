@@ -60,6 +60,7 @@ fn completed_output_overrides_arriving_items_and_maps_usage() {
             "type":"response.completed",
             "response":{
                 "id":"r",
+                "model":"gpt-6-luna",
                 "status":"completed",
                 "output":[
                     {"type":"message","content":[{"type":"output_text","text":"final "},{"type":"output_text","text":"text"}]},
@@ -84,6 +85,8 @@ fn completed_output_overrides_arriving_items_and_maps_usage() {
     assert_eq!(response.usage.cache_write, Some(4));
     assert_eq!(response.usage.output, Some(20));
     assert_eq!(response.usage.reasoning, Some(8));
+    assert_eq!(parser.response_model(), Some("gpt-6-luna"));
+    assert_eq!(parser.raw_usage().unwrap()["input_tokens"], 100);
 }
 
 #[test]

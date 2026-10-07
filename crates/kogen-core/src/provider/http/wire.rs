@@ -26,6 +26,10 @@ pub enum ApiMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponseMode {
     Owned,
+    /// Owned ChatGPT authentication and body with the Codex backend's
+    /// compatibility headers. This is used by the private cache replay tool;
+    /// product callers should continue to use `from_auth`.
+    OwnedBackend,
     Injected,
     Lite,
     Grok,
@@ -242,7 +246,11 @@ pub fn build_wire_request(
         ));
     }
     let account_id = auth.account_id();
-    if config.mode == ResponseMode::Injected && account_id.is_none() {
+    if matches!(
+        config.mode,
+        ResponseMode::Injected | ResponseMode::OwnedBackend
+    ) && account_id.is_none()
+    {
         return Err(ProviderFailure::new(
             ProviderErrorKind::Login,
             "Codex login is missing, invalid, or expired.",
@@ -305,12 +313,15 @@ pub fn build_wire_request(
         (
             "user-agent".to_owned(),
             match config.mode {
-                ResponseMode::Owned => "kogen/0.1".to_owned(),
+                ResponseMode::Owned | ResponseMode::OwnedBackend => "kogen/0.1".to_owned(),
                 _ => format!("kogen/{}", config.user_agent_version),
             },
         ),
     ];
-    if matches!(config.mode, ResponseMode::Injected | ResponseMode::Lite) {
+    if matches!(
+        config.mode,
+        ResponseMode::Injected | ResponseMode::OwnedBackend | ResponseMode::Lite
+    ) {
         headers.push((
             "chatgpt-account-id".to_owned(),
             account_id.unwrap_or_default(),
@@ -320,7 +331,10 @@ pub fn build_wire_request(
             "responses=experimental".to_owned(),
         ));
     }
-    if matches!(config.mode, ResponseMode::Injected | ResponseMode::Lite) {
+    if matches!(
+        config.mode,
+        ResponseMode::Injected | ResponseMode::OwnedBackend | ResponseMode::Lite
+    ) {
         headers.push(("originator".to_owned(), "kogen".to_owned()));
     }
     headers.push(("x-client-request-id".to_owned(), request.thread_id.clone()));
