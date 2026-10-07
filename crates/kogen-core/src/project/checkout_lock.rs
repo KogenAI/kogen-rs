@@ -10,21 +10,21 @@ use std::time::{Duration, Instant};
 const WAIT_LIMIT: Duration = Duration::from_secs(120);
 const STALE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
-pub(super) struct CheckoutLock {
+pub(crate) struct CheckoutLock {
     path: PathBuf,
     owner: String,
 }
 
 impl CheckoutLock {
-    pub(super) fn acquire(home: &Path, checkout: &Path) -> Result<Self, CoreError> {
+    pub(crate) fn acquire(state_root: &Path, checkout: &Path) -> Result<Self, CoreError> {
         let checkout = fs::canonicalize(checkout).map_err(lock_error)?;
         let digest = format!(
             "{:x}",
             Sha256::digest(checkout.as_os_str().as_encoded_bytes())
         );
-        let directory = home.join(".kogen/locks");
+        let directory = state_root.join("locks");
         fs::create_dir_all(&directory).map_err(lock_error)?;
-        let path = directory.join(format!("shape-{digest}"));
+        let path = directory.join(format!("checkout-{digest}"));
         let owner = format!("pid-{}", std::process::id());
         let started = Instant::now();
         let mut last_stale_check = Instant::now();
@@ -38,7 +38,7 @@ impl CheckoutLock {
                         last_stale_check = Instant::now();
                     }
                     if started.elapsed() >= WAIT_LIMIT {
-                        return Err(lock_error("another shape command holds the project lock"));
+                        return Err(lock_error("another command holds the project lock"));
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -106,7 +106,7 @@ fn remove_stale_lock(path: &Path) {
 fn lock_error(error: impl std::fmt::Display) -> CoreError {
     CoreError::new(
         ErrorClass::Environment,
-        "shape_workspace_lock_failed",
+        "workspace_lock_failed",
         error.to_string(),
         ExitCode::Environment,
     )

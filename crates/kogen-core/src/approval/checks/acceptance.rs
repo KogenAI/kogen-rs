@@ -2,6 +2,7 @@ use super::super::support::{check_error_line, environment_error, remove_empty_pa
 use super::*;
 use crate::ExitCode;
 use crate::error::CoreError;
+use crate::project::CheckoutLock;
 use std::path::Path;
 
 pub(crate) fn stage_and_check(
@@ -11,6 +12,14 @@ pub(crate) fn stage_and_check(
     bytes: &[u8],
     checks: &CheckOutcome,
 ) -> Result<(), CoreError> {
+    let _lock = CheckoutLock::acquire(&project.state_root, &project.checkout)?;
+    if std::fs::symlink_metadata(candidate).is_ok() {
+        return Err(environment_error(
+            "acceptance_check_path_conflict",
+            relative,
+            ExitCode::Environment,
+        ));
+    }
     let parent = candidate.parent().ok_or_else(|| {
         environment_error(
             "acceptance_check_path_conflict",

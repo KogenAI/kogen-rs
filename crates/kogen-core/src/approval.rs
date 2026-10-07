@@ -15,7 +15,7 @@ use crate::ExitCode;
 use crate::error::{CliOutput, CoreError};
 use crate::git::GitRepo;
 use crate::intent::{Intent, approval_sha256, intent_sha256};
-use crate::project::{ProjectResolution, valid_slug};
+use crate::project::{CheckoutLock, ProjectResolution, valid_slug};
 use checks::{check_error, run_setup_and_baseline, stage_and_check};
 use manifest::{baseline_warning, protected_manifest, witness};
 use model::ApprovalDocument;
@@ -177,12 +177,15 @@ fn approve_inner(
 
     let candidate_relative = acceptance_candidate_path(project, slug);
     let candidate = project.checkout.join(&candidate_relative);
-    if fs::symlink_metadata(&candidate).is_ok() {
-        return Err(environment_error(
-            "acceptance_check_path_conflict",
-            candidate_relative,
-            ExitCode::Environment,
-        ));
+    {
+        let _lock = CheckoutLock::acquire(&project.state_root, &project.checkout)?;
+        if fs::symlink_metadata(&candidate).is_ok() {
+            return Err(environment_error(
+                "acceptance_check_path_conflict",
+                candidate_relative,
+                ExitCode::Environment,
+            ));
+        }
     }
 
     let check_outcome =

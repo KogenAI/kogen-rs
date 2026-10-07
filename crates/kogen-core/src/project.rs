@@ -1,7 +1,10 @@
 //! Project resolution, strict YAML configuration, and state-root identity.
 
+mod checkout_lock;
 mod schema;
 pub mod yaml;
+
+pub(crate) use checkout_lock::CheckoutLock;
 
 #[cfg(test)]
 mod tests;
