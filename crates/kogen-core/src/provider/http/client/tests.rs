@@ -59,7 +59,17 @@ fn attempt(response: Result<ModelResponse, ProviderFailure>, items: Vec<Value>) 
         received_items: items,
         elapsed_ms: 7,
         body_bytes_received: 32,
+        sticky_routing_token: None,
     }
+}
+
+fn attempt_with_routing_token(
+    response: Result<ModelResponse, ProviderFailure>,
+    token: &str,
+) -> HttpAttempt {
+    let mut attempt = attempt(response, Vec::new());
+    attempt.sticky_routing_token = Some(token.to_owned());
+    attempt
 }
 
 fn success(text: &str) -> ModelResponse {
@@ -186,6 +196,60 @@ fn retry_reuses_identical_request_and_preserves_null_usage() {
     );
     assert!(clock.now_ms() >= 1000);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sticky_routing_token_is_replayed_only_within_its_conversation() {
+    let (root_a, mut request_a, mut auth_a, config) = setup("gpt-6-luna", "medium");
+    let (root_b, mut request_b, mut auth_b, config_b) = setup("gpt-6-luna", "medium");
+    let http = ScriptedHttp::new([
+        attempt_with_routing_token(Ok(success("first A")), "route-A"),
+        attempt(Ok(success("second A")), Vec::new()),
+        attempt(Ok(success("first B")), Vec::new()),
+    ]);
+    let clock = FakeClock::default();
+    let mut policy_a = RetryReplay::default();
+    go(
+        &mut request_a,
+        &mut auth_a,
+        &config,
+        &mut policy_a,
+        &options(false),
+        &http,
+        &clock,
+    )
+    .unwrap();
+    let mut policy_a_next = RetryReplay::default();
+    go(
+        &mut request_a,
+        &mut auth_a,
+        &config,
+        &mut policy_a_next,
+        &options(false),
+        &http,
+        &clock,
+    )
+    .unwrap();
+    let mut policy_b = RetryReplay::default();
+    go(
+        &mut request_b,
+        &mut auth_b,
+        &config_b,
+        &mut policy_b,
+        &options(false),
+        &http,
+        &clock,
+    )
+    .unwrap();
+
+    let requests = http.requests();
+    assert_eq!(requests[0].header("x-codex-turn-state"), None);
+    assert_eq!(requests[1].header("x-codex-turn-state"), Some("route-A"));
+    assert_eq!(requests[2].header("x-codex-turn-state"), None);
+    assert_eq!(request_a.sticky_routing_token.as_deref(), Some("route-A"));
+    assert_eq!(request_b.sticky_routing_token, None);
+    std::fs::remove_dir_all(root_a).unwrap();
+    std::fs::remove_dir_all(root_b).unwrap();
 }
 
 #[test]

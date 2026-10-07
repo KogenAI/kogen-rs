@@ -86,6 +86,15 @@ async fn execute_async(
         Ok(Err(_)) => return failed_attempt(transport_failure(request.mode), start, Vec::new(), 0),
         Err(_) => return failed_attempt(timeout_failure(request.mode), start, Vec::new(), 0),
     };
+    let sticky_routing_token = if request.mode == ResponseMode::Grok {
+        None
+    } else {
+        response
+            .headers()
+            .get("x-codex-turn-state")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
@@ -119,11 +128,12 @@ async fn execute_async(
                         ),
                     )
                 };
-                return failed_attempt(
+                return failed_attempt_with_routing_token(
                     failure,
                     start,
                     parser.collected_items().to_vec(),
                     body_bytes,
+                    sticky_routing_token.clone(),
                 );
             }
             Ok(Some(Err(error))) => {
@@ -140,11 +150,12 @@ async fn execute_async(
                 } else {
                     transport_failure(request.mode)
                 };
-                return failed_attempt(
+                return failed_attempt_with_routing_token(
                     failure,
                     start,
                     parser.collected_items().to_vec(),
                     body_bytes,
+                    sticky_routing_token.clone(),
                 );
             }
             Ok(None) => break,
@@ -167,11 +178,12 @@ async fn execute_async(
                                 request.mode,
                             )
                         };
-                        return failed_attempt(
+                        return failed_attempt_with_routing_token(
                             failure,
                             start,
                             parser.collected_items().to_vec(),
                             body_bytes,
+                            sticky_routing_token.clone(),
                         );
                     }
                 } else {
@@ -190,7 +202,13 @@ async fn execute_async(
         } else {
             classify_http_error(status, &error_body, retry_after, request.mode)
         };
-        return failed_attempt(failure, start, Vec::new(), body_bytes);
+        return failed_attempt_with_routing_token(
+            failure,
+            start,
+            Vec::new(),
+            body_bytes,
+            sticky_routing_token,
+        );
     }
     match parser.finish() {
         Ok(response) => HttpAttempt {
@@ -198,12 +216,14 @@ async fn execute_async(
             response: Ok(response),
             elapsed_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
             body_bytes_received: body_bytes,
+            sticky_routing_token,
         },
-        Err(failure) => failed_attempt(
+        Err(failure) => failed_attempt_with_routing_token(
             normalize_failure(failure, request.mode),
             start,
             parser.collected_items().to_vec(),
             body_bytes,
+            sticky_routing_token,
         ),
     }
 }
@@ -219,7 +239,20 @@ fn failed_attempt(
         received_items,
         elapsed_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
         body_bytes_received: body_bytes,
+        sticky_routing_token: None,
     }
+}
+
+fn failed_attempt_with_routing_token(
+    failure: ProviderFailure,
+    start: TokioInstant,
+    received_items: Vec<serde_json::Value>,
+    body_bytes: u64,
+    sticky_routing_token: Option<String>,
+) -> HttpAttempt {
+    let mut attempt = failed_attempt(failure, start, received_items, body_bytes);
+    attempt.sticky_routing_token = sticky_routing_token;
+    attempt
 }
 
 fn classify_http_error(

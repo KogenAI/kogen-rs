@@ -103,6 +103,8 @@ pub struct RequestContext {
     pub cache_key: String,
     pub thread_id: String,
     pub lite_session_id: String,
+    /// Server-provided sticky routing state, scoped to this conversation.
+    pub sticky_routing_token: Option<String>,
 }
 
 impl RequestContext {
@@ -128,6 +130,7 @@ impl RequestContext {
             cache_key: derive_cache_key(&binding.run_dir)?,
             thread_id: derive_thread_id(binding)?,
             lite_session_id: derive_lite_session_id(&binding.run_dir)?,
+            sticky_routing_token: None,
         })
     }
 }
@@ -142,21 +145,13 @@ pub struct WireRequest {
 
 impl fmt::Debug for WireRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let headers: Vec<_> = self
-            .headers
-            .iter()
-            .map(|(name, value)| {
-                if name == "authorization" {
-                    (name.as_str(), "Bearer [REDACTED]")
-                } else {
-                    (name.as_str(), value.as_str())
-                }
-            })
-            .collect();
+        let headers: Vec<_> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
         formatter
             .debug_struct("WireRequest")
-            .field("endpoint", &self.endpoint)
-            .field("headers", &headers)
+            .field("endpoint_host", &self.endpoint.host_str())
+            .field("endpoint_port", &self.endpoint.port())
+            .field("endpoint_path", &self.endpoint.path())
+            .field("header_names", &headers)
             .field("body_bytes", &self.body.len())
             .finish()
     }
@@ -324,10 +319,20 @@ pub fn build_wire_request(
             "openai-beta".to_owned(),
             "responses=experimental".to_owned(),
         ));
-        headers.push(("originator".to_owned(), "kogen".to_owned()));
     }
+    headers.push(("originator".to_owned(), "kogen".to_owned()));
+    headers.push(("x-client-request-id".to_owned(), request.thread_id.clone()));
     headers.push(("session-id".to_owned(), request.cache_key.clone()));
     headers.push(("thread-id".to_owned(), request.thread_id.clone()));
+    let window_id = codex_window_id(request);
+    headers.push(("x-codex-window-id".to_owned(), window_id.clone()));
+    headers.push((
+        "x-codex-turn-metadata".to_owned(),
+        codex_turn_metadata(request),
+    ));
+    if let Some(token) = &request.sticky_routing_token {
+        headers.push(("x-codex-turn-state".to_owned(), token.clone()));
+    }
     if config.mode == ResponseMode::Lite {
         headers.push((
             "x-openai-internal-codex-responses-lite".to_owned(),
@@ -341,6 +346,20 @@ pub fn build_wire_request(
         headers,
         body,
     })
+}
+
+pub(super) fn codex_window_id(request: &RequestContext) -> String {
+    format!("{}:0", request.thread_id)
+}
+
+pub(super) fn codex_turn_metadata(request: &RequestContext) -> String {
+    serde_json::json!({
+        "session_id": request.cache_key,
+        "thread_id": request.thread_id,
+        "window_id": codex_window_id(request),
+        "request_kind": "turn",
+    })
+    .to_string()
 }
 
 fn request_id() -> String {

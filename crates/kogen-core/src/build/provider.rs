@@ -37,6 +37,7 @@ pub(super) struct BuildProvider<'a> {
 struct BuilderSession {
     context: RequestContext,
     turns: u32,
+    previous_input_items: usize,
     empty_finish_count: u8,
     protected_restores: u8,
     budget_note_added: bool,
@@ -170,6 +171,7 @@ impl<'a> BuildProvider<'a> {
             super::provider_journal::RequestIdentity {
                 cache_key: &context.cache_key,
                 thread_id: &context.thread_id,
+                previous_input_items: 0,
             },
         )?;
         append_transcript(
@@ -223,6 +225,7 @@ impl<'a> BuildProvider<'a> {
             super::provider_journal::RequestIdentity {
                 cache_key: &context.cache_key,
                 thread_id: &context.thread_id,
+                previous_input_items: 0,
             },
         )?;
         append_transcript(
@@ -364,6 +367,7 @@ impl<'a> BuildProvider<'a> {
             BuilderSession {
                 context,
                 turns: 0,
+                previous_input_items: 0,
                 empty_finish_count: 0,
                 protected_restores: 0,
                 budget_note_added: false,
@@ -522,8 +526,15 @@ impl<'a> BuildProvider<'a> {
                 super::provider_journal::RequestIdentity {
                     cache_key: &session.context.cache_key,
                     thread_id: &session.context.thread_id,
+                    previous_input_items: session.previous_input_items,
                 },
             )?;
+            session.previous_input_items = call
+                .attempts
+                .last()
+                .and_then(|wire| serde_json::from_slice::<Value>(&wire.body).ok())
+                .and_then(|body| body.get("input").and_then(Value::as_array).map(Vec::len))
+                .unwrap_or(session.context.input.len());
             append_transcript(
                 self.store,
                 json!({

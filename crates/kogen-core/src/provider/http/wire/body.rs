@@ -1,7 +1,8 @@
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
-use super::{RequestContext, ResponseMode};
+use super::{RequestContext, ResponseMode, codex_turn_metadata, codex_window_id};
 
 pub(super) fn encode(
     request: &RequestContext,
@@ -68,6 +69,18 @@ fn stable_id(key: &str, label: &str) -> String {
     format!("{:x}", Sha256::digest(format!("{key}\0{label}").as_bytes()))
 }
 
+fn client_metadata(request: &RequestContext) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("session_id".to_owned(), request.cache_key.clone()),
+        ("thread_id".to_owned(), request.thread_id.clone()),
+        ("x-codex-window-id".to_owned(), codex_window_id(request)),
+        (
+            "x-codex-turn-metadata".to_owned(),
+            codex_turn_metadata(request),
+        ),
+    ])
+}
+
 struct WireBody<'a> {
     request: &'a RequestContext,
     mode: ResponseMode,
@@ -121,6 +134,7 @@ impl Serialize for WireBody<'_> {
         let include = injected || self.mode == ResponseMode::Grok;
         let include_cache_key = !self.request.cache_key.is_empty();
         let include_text = self.request.model == "gpt-6-luna";
+        let include_client_metadata = self.mode != ResponseMode::Grok;
         let include_cap =
             self.request.development_request && self.request.generation_tokens.is_some();
         let include_controls = self.mode != ResponseMode::Grok;
@@ -130,6 +144,7 @@ impl Serialize for WireBody<'_> {
             + usize::from(include)
             + usize::from(include_cache_key)
             + usize::from(include_text)
+            + usize::from(include_client_metadata)
             + usize::from(include_cap);
         let mut map = serializer.serialize_map(Some(count))?;
         map.serialize_entry("model", &self.request.model)?;
@@ -155,6 +170,9 @@ impl Serialize for WireBody<'_> {
         }
         if include_text {
             map.serialize_entry("text", &json!({"verbosity":"low"}))?;
+        }
+        if include_client_metadata {
+            map.serialize_entry("client_metadata", &client_metadata(self.request))?;
         }
         if include_cap {
             map.serialize_entry("max_output_tokens", &self.request.generation_tokens)?;

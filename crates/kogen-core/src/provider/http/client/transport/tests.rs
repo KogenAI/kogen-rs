@@ -1,6 +1,11 @@
-use super::{classify_grok_http_error, normalize_failure, size_limit_failure};
-use crate::provider::http::wire::ResponseMode;
+use super::{ReqwestPort, classify_grok_http_error, normalize_failure, size_limit_failure};
+use crate::provider::http::client::{HttpPort, RequestDeadlines};
+use crate::provider::http::wire::{ResponseMode, WireRequest};
 use crate::provider::{ProviderErrorKind, ProviderFailure};
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use url::Url;
 
 #[test]
 fn grok_http_failures_follow_the_provider_contract() {
@@ -65,4 +70,51 @@ fn grok_http_failures_follow_the_provider_contract() {
         malformed.message,
         "Grok returned a malformed response stream."
     );
+}
+
+#[test]
+fn responses_transport_captures_turn_state_from_http_response_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 2\r\nX-Codex-Turn-State: sticky-route-123\r\nConnection: close\r\n\r\n{{}}"
+        )
+        .unwrap();
+    });
+    let request = WireRequest {
+        endpoint: Url::parse(&endpoint).unwrap(),
+        mode: ResponseMode::Injected,
+        headers: Vec::new(),
+        body: br#"{"model":"gpt-6-luna"}"#.to_vec(),
+    };
+    let port = ReqwestPort::new().unwrap();
+    let attempt = port.execute(&request, RequestDeadlines::from_environment());
+    assert!(attempt.response.is_err());
+    assert_eq!(
+        attempt.sticky_routing_token.as_deref(),
+        Some("sticky-route-123")
+    );
+    server.join().unwrap();
+}
+
+fn read_request(stream: &mut TcpStream) {
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).unwrap();
+        headers.push(byte[0]);
+    }
+    let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+    let body_bytes = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length: "))
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let mut body = vec![0; body_bytes];
+    stream.read_exact(&mut body).unwrap();
 }

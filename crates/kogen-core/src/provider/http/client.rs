@@ -52,6 +52,7 @@ pub struct HttpAttempt {
     pub received_items: Vec<serde_json::Value>,
     pub elapsed_ms: u64,
     pub body_bytes_received: u64,
+    pub sticky_routing_token: Option<String>,
 }
 
 pub trait HttpPort: Send + Sync {
@@ -172,6 +173,13 @@ pub fn respond(
         attempts.push(wire.clone());
         let request_start = clock.now_ms();
         let attempt = http.execute(&wire, RequestDeadlines::from_environment());
+        if wire.mode != super::wire::ResponseMode::Grok && request.sticky_routing_token.is_none() {
+            request.sticky_routing_token = attempt
+                .sticky_routing_token
+                .as_ref()
+                .filter(|token| !token.is_empty())
+                .cloned();
+        }
         let elapsed = attempt
             .elapsed_ms
             .max(clock.now_ms().saturating_sub(request_start));
