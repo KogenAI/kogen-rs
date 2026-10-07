@@ -487,7 +487,9 @@ fn open_regular(
         parent,
         name,
         flags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(mode),
+        // RawMode is u16 on macOS and u32 on Linux; `into` is a no-op on macOS.
+        #[allow(clippy::useless_conversion)]
+        Mode::from_raw_mode(mode.into()),
     )
     .map(File::from)
     .map_err(io::Error::from)?;
