@@ -10,6 +10,7 @@ pub(super) fn preserve(
     directory: &Path,
     base: &str,
     tree: &str,
+    protected: &Value,
 ) -> Result<Value, CoreError> {
     let name = workspace
         .file_name()
@@ -37,6 +38,7 @@ pub(super) fn preserve(
         .output(&["diff", "--name-only", "--no-renames", "-z", base, tree])
         .map_err(|error| recovery_error("archive_manifest_failed", error))?;
     let mut files = serde_json::Map::new();
+    let mut reviewed_files = serde_json::Map::new();
     for path in paths
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
@@ -63,7 +65,17 @@ pub(super) fn preserve(
         if value.get("mode").and_then(Value::as_str) == Some("100644") {
             value.as_object_mut().expect("file entry").remove("mode");
         }
-        files.insert(path.to_owned(), value);
+        let reviewed = captured.entries.get(Path::new(path)).is_some_and(|entry| {
+            protected
+                .get(path)
+                .and_then(Value::as_str)
+                .is_some_and(|hash| hash == format!("{:x}", Sha256::digest(&entry.bytes)))
+        });
+        if reviewed {
+            reviewed_files.insert(path.to_owned(), value);
+        } else {
+            files.insert(path.to_owned(), value);
+        }
     }
     if destination.exists() && manifest_path.exists() {
         let bytes =
@@ -76,6 +88,7 @@ pub(super) fn preserve(
         if saved["tree"] == tree
             && saved["base"] == base
             && saved["files"] == Value::Object(files.clone())
+            && saved["reviewed_files"] == Value::Object(reviewed_files.clone())
             && saved["sha256"] == format!("{:x}", Sha256::digest(&bytes))
         {
             return Ok(
@@ -112,7 +125,7 @@ pub(super) fn preserve(
             ));
         }
         let hash = format!("{:x}", Sha256::digest(&output.stdout));
-        let manifest = json!({"schema":1,"base":base,"tree":tree,"sha256":hash,"files":files});
+        let manifest = json!({"schema":1,"base":base,"tree":tree,"sha256":hash,"files":files,"reviewed_files":reviewed_files});
         publish(&destination, &output.stdout)?;
         publish(
             &manifest_path,

@@ -163,17 +163,34 @@ fn preserve(
             json!({"workspace":workspace,"base":base,"tree":tree,"ref":reference,"archive":null,"verification":"unverified"})
         }
         Err(ref_error) => {
-            let archive = archive::preserve(&repo, workspace, store.directory(), &base, &tree)
-                .map_err(|archive_error| {
-                    recovery_error(
-                        "recovery_preservation_failed",
-                        format!(
-                            "{}; archive: {}",
-                            render_recovery_error(&ref_error),
-                            render_recovery_error(&archive_error)
-                        ),
-                    )
-                })?;
+            let protected = origin
+                .blob_at(
+                    &snapshot.approval_commit,
+                    &format!(".kogen/intents/{}/approval.json", snapshot.slug),
+                )
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|approval| approval.get("protected_manifest").cloned())
+                .unwrap_or(Value::Null);
+            let archive = archive::preserve(
+                &repo,
+                workspace,
+                store.directory(),
+                &base,
+                &tree,
+                &protected,
+            )
+            .map_err(|archive_error| {
+                recovery_error(
+                    "recovery_preservation_failed",
+                    format!(
+                        "{}; archive: {}",
+                        render_recovery_error(&ref_error),
+                        render_recovery_error(&archive_error)
+                    ),
+                )
+            })?;
             json!({"workspace":workspace,"base":base,"tree":null,"ref":null,"archive":archive,"verification":"unverified"})
         }
     };
