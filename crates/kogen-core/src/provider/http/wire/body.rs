@@ -26,7 +26,8 @@ fn input_items(request: &RequestContext, mode: ResponseMode) -> Vec<Value> {
         items.extend(request.input.iter().cloned());
         return items;
     }
-    if mode == ResponseMode::Owned && !request.tools.is_empty() {
+    if matches!(mode, ResponseMode::Owned | ResponseMode::OwnedBackend) && !request.tools.is_empty()
+    {
         let mut items = vec![json!({
             "type":"additional_tools",
             "role":"developer",

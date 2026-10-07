@@ -4,6 +4,7 @@ members = [
     "crates/kogen-cli",
     "crates/kogen-test-support",
     "crates/kogen-xspec",
+    "crates/kogen-cache-replay",
 ]
 resolver = "3"
 

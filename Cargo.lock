@@ -610,6 +610,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kogen-cache-replay"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "kogen-core",
+ "rand 0.8.8",
+ "rand_chacha",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
 name = "kogen-core"
 version = "0.1.0"
 dependencies = [
