@@ -1,6 +1,6 @@
 mod approve;
-mod gate;
 mod digest;
+mod gate;
 mod intent;
 mod orchestration;
 mod queue;
