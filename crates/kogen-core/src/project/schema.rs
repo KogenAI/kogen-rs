@@ -87,6 +87,31 @@ pub(super) fn validate(raw: Value) -> Result<ValidatedConfig, Vec<String>> {
     }
     if let Some(value) = get(root, "build") {
         build::validate(value, &mut issues);
+        let provider = std::env::var("KOGEN_BENCH_PROVIDER")
+            .ok()
+            .or_else(|| {
+                get(root, "account")
+                    .and_then(Value::as_str)
+                    .and_then(|account| {
+                        account
+                            .split_once(':')
+                            .map(|(provider, _)| provider.to_owned())
+                    })
+            })
+            .unwrap_or_else(|| "chatgpt".to_owned());
+        if let Some(roles) = value.get("roles").and_then(Value::as_mapping) {
+            for (role, settings) in roles {
+                if let Some(model) = settings.get("model").and_then(Value::as_str)
+                    && ((provider == "grok" && !model.starts_with("grok-"))
+                        || (provider == "chatgpt" && model.starts_with("grok-")))
+                {
+                    issues.push(format!(
+                        "build.roles.{} model does not belong to selected provider {provider}",
+                        role.as_str().unwrap_or("?")
+                    ));
+                }
+            }
+        }
     }
     if issues.is_empty() {
         let name = get(root, "name")

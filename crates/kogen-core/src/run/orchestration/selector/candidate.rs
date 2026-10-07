@@ -56,13 +56,11 @@ impl Candidate {
     }
 
     #[must_use]
-    pub fn landable(&self, policy: GatePolicy, has_passing_change: bool) -> bool {
+    pub fn landable(&self, _policy: GatePolicy, has_passing_change: bool) -> bool {
         has_passing_change
             && match self.verdict {
                 VerificationVerdict::Green => true,
-                VerificationVerdict::GreenWithAdvisoryTests => {
-                    policy == GatePolicy::GreenOrAdvisory
-                }
+                VerificationVerdict::GreenWithAdvisoryTests => false,
                 VerificationVerdict::Unverified | VerificationVerdict::None => false,
             }
     }

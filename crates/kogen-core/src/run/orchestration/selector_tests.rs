@@ -80,7 +80,7 @@ fn pure_verdict_requires_a_passing_undemoted_change_item() {
         demoted: true,
     }];
     let score = score_verification(GatePolicy::GreenOrAdvisory, &checks, &only_demoted_change);
-    assert_eq!(score.verdict, VerificationVerdict::GreenWithAdvisoryTests);
+    assert_eq!(score.verdict, VerificationVerdict::Unverified);
     assert!(!score.landable);
 
     let mut items = only_demoted_change.to_vec();
@@ -91,7 +91,7 @@ fn pure_verdict_requires_a_passing_undemoted_change_item() {
         demoted: false,
     });
     let score = score_verification(GatePolicy::GreenOrAdvisory, &checks, &items);
-    assert!(score.landable);
+    assert!(!score.landable);
     assert_eq!(score.passing_undemoted_items, 1);
 }
 
@@ -119,7 +119,7 @@ fn advisory_demotions_land_only_under_the_default_policy() {
         },
         &green,
     );
-    assert!(candidate.landable(GatePolicy::GreenOrAdvisory, true));
+    assert!(!candidate.landable(GatePolicy::GreenOrAdvisory, true));
     assert!(!candidate.landable(GatePolicy::Green, true));
     assert!(!candidate.landable(GatePolicy::GreenOrAdvisory, false));
 }

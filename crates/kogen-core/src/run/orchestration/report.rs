@@ -39,7 +39,7 @@ impl BuildReport {
         Self {
             slug: slug.into(),
             build_id: build_id.into(),
-            land_policy: "green-or-advisory".to_owned(),
+            land_policy: "green".to_owned(),
             ..Self::default()
         }
     }

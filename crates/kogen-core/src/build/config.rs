@@ -72,7 +72,7 @@ impl BuildOptions {
             .unwrap_or(false);
         let land_policy = mapping_value(mapping_value(raw, "build"), "land")
             .and_then(Value::as_str)
-            .unwrap_or("green-or-advisory")
+            .unwrap_or("green")
             .to_owned();
         let fallback_on = bool_value(project, machine, "model_fallback").unwrap_or(true);
         let wall_ms = integer_value(project, machine, "budget_ms")

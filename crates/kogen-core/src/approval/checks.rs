@@ -30,6 +30,28 @@ pub(super) fn run_setup_and_baseline(
     base_sha: &str,
     run_dir: PathBuf,
 ) -> Result<CheckOutcome, CheckError> {
+    // Never label a dirty or stale checkout as the resolved base.
+    let checkout_repo = GitRepo::new(&project.checkout);
+    let exact = checkout_repo.resolve_commit("HEAD").ok().as_deref() == Some(base_sha)
+        && checkout_repo
+            .text(&["status", "--porcelain=v1", "--untracked-files=no"])
+            .is_ok_and(|status| status.is_empty());
+    if !exact {
+        let workspace = run_dir.join("baseline-base");
+        let repository = crate::git::landing::LandingRepository::clone_fresh(
+            &project.origin,
+            &workspace,
+            base_sha,
+        )
+        .map_err(|error| CheckError::Internal(error.to_string()))?;
+        let mut checked = project.clone();
+        checked.checkout = workspace.clone();
+        let result = run_setup_and_baseline(&checked, base_sha, run_dir);
+        drop(repository);
+        crate::git::forget_workspace(&workspace);
+        let _ = fs::remove_dir_all(workspace);
+        return result;
+    }
     let runner = ProcessSupervisor;
     fs::create_dir_all(&run_dir).map_err(|error| CheckError::Internal(error.to_string()))?;
     #[cfg(unix)]
@@ -54,9 +76,16 @@ pub(super) fn run_setup_and_baseline(
     let setup_key =
         SetupCacheKey::from_project(project.config.as_ref(), &project.checkout, &base_tree, &env)
             .map_err(|error| CheckError::Internal(error.to_string()))?;
-    let key = setup_key
+    use sha2::{Digest, Sha256};
+    let context = setup_key
         .digest_with_checks(&checks_value(project)?)
         .map_err(|error| CheckError::Internal(error.to_string()))?;
+    let material = serde_json::json!({"v":3,"base_tree":base_tree,"context":context,
+        "adapter":config_value(project, "acceptance"),"adapter_version":"kogen-baseline-v3"});
+    let key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&material).expect("baseline identity"))
+    );
     let setup_key = setup_key.digest();
     let cache_path = project
         .state_root
