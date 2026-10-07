@@ -77,6 +77,7 @@ fn drain(project: &ProjectResolution) -> Result<CliOutput, CoreError> {
         }
         let slug = observation.current.clone();
         let Some(approval) = approvals.get(&slug) else {
+            emit_line(&format!("building {slug}\n"));
             emit_line(&format!(
                 "stopped {slug}: controller/approval_invalid; it stays queued\n"
             ));

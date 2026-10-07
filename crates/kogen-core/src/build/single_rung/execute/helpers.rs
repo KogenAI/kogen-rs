@@ -389,51 +389,7 @@ pub(super) fn acceptance_only_red(report: &crate::gate::GateReport) -> bool {
         && report.acceptance.item_pass.values().any(|passed| !passed)
 }
 
-pub(super) fn gate_feedback(report: &crate::gate::GateReport) -> String {
-    let mut details = Vec::new();
-    for (fix, message) in report
-        .fix_results
-        .iter()
-        .filter(|fix| !fix.passed())
-        .zip(failed_fix_feedback(&report.fix_results))
-    {
-        details.push(message);
-        details.push(format!("raw log: {}", fix.log_path.display()));
-    }
-    let mut total_findings = 0;
-    let mut tool_findings = std::collections::BTreeMap::new();
-    let mut omitted_findings = std::collections::BTreeMap::new();
-    for check in report.checks.iter().filter(|check| check.blocks_gate()) {
-        let base = report
-            .base_checks
-            .iter()
-            .find(|base| base.name == check.name);
-        details.extend(check_feedback(
-            check,
-            base,
-            &mut total_findings,
-            &mut tool_findings,
-            &mut omitted_findings,
-        ));
-    }
-    for (tool, count) in omitted_findings {
-        details.push(format!("… {count} more {tool} findings"));
-    }
-    let acceptance = report
-        .acceptance
-        .item_pass
-        .iter()
-        .filter_map(|(id, passed)| (!passed).then_some(format!("acceptance {id}: failed")))
-        .collect::<Vec<_>>();
-    details.extend(acceptance);
-    let details = details.join("\n");
-    if details.is_empty() {
-        "The gate did not produce a landable candidate. Inspect the current tree and fix the failing checks.".to_owned()
-    } else {
-        details
-    }
-}
-
+#[cfg(test)]
 fn check_feedback(
     check: &crate::gate::CheckResult,
     base: Option<&crate::gate::CheckResult>,
@@ -514,6 +470,7 @@ fn check_feedback(
     details
 }
 
+#[cfg(test)]
 fn log_tail(path: &Path) -> Vec<String> {
     let Ok(bytes) = fs::read(path) else {
         return Vec::new();
@@ -528,6 +485,7 @@ fn log_tail(path: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn failed_fix_feedback(fixes: &[crate::gate::FixResult]) -> Vec<String> {
     fixes
         .iter()

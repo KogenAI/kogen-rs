@@ -5,6 +5,7 @@ use super::super::support;
 use super::super::{controller_error, environment_error};
 use super::{BuildOutcome, BuildStatus};
 mod helpers;
+mod parallel;
 mod start;
 use crate::error::CoreError;
 use crate::git::landing::LandingRepository;
@@ -14,7 +15,7 @@ use crate::run::{RunEvent, RunSnapshot, RunStore};
 use helpers::*;
 use serde_json::{Value, json};
 pub(super) use start::run;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -23,6 +24,7 @@ struct CandidateSnapshot {
     rung: String,
     rung_number: u8,
     commit: String,
+    tree: String,
     verdict: String,
     reason: String,
     pass_count: usize,
@@ -37,7 +39,7 @@ impl CandidateSnapshot {
         rung: &str,
         rung_number: u8,
         commit: String,
-        _tree: String,
+        tree: String,
         verdict: &str,
         reason: &str,
         report: &crate::gate::GateReport,
@@ -48,6 +50,7 @@ impl CandidateSnapshot {
             rung: rung.to_owned(),
             rung_number,
             commit,
+            tree,
             verdict: verdict.to_owned(),
             reason: reason.to_owned(),
             pass_count: report
@@ -493,7 +496,40 @@ fn run_rung(
         let plan_files = tracked_paths(project, base_sha)?;
         provider.plan(snapshot, run_dir, &plan_files)?
     };
-    let (_, plan_text) = plan.split_once('\0').unwrap_or(("easy", plan.as_str()));
+    let (difficulty, plan_text) = plan.split_once('\0').unwrap_or(("easy", plan.as_str()));
+    let hard_parallel = difficulty == "hard"
+        && crate::run::orchestration::BuildRecipe::parse(&options.recipe)
+            .ok()
+            .is_some_and(|recipe| {
+                recipe.kind == crate::run::orchestration::RecipeKind::Ladder
+                    && matches!(
+                        recipe.entry_schedule(
+                            crate::run::orchestration::Difficulty::Hard,
+                            false,
+                            options.max_rungs,
+                        ),
+                        crate::run::orchestration::RungSchedule::Parallel(_)
+                    )
+            });
+    if hard_parallel {
+        return parallel::run(
+            project,
+            approved,
+            options,
+            base_sha,
+            run_dir,
+            candidate,
+            base,
+            store,
+            snapshot,
+            provider,
+            plan_text,
+            build_started,
+            &integrity,
+            &supervisor,
+            &sandbox_warning,
+        );
+    }
     provider.record_event(
         snapshot,
         &RunEvent::new("rung_started", now_ms())
@@ -624,7 +660,7 @@ fn run_rung(
         }
         previous_red_count = Some(count);
         let before = candidate_working_diff(candidate.workspace(), base_sha)?;
-        let feedback = gate_feedback(&report);
+        let feedback = support::gate_feedback(approved, &report, run_dir);
         provider.record_event(
             snapshot,
             &RunEvent::new("repair", now_ms())
@@ -837,7 +873,7 @@ fn run_rung(
             "R1 {}: {}; {}",
             options.builder_model,
             rung_reason,
-            gate_feedback(&report)
+            support::gate_feedback(approved, &report, run_dir)
                 .lines()
                 .take(4)
                 .map(|line| line.chars().take(180).collect::<String>())
@@ -922,7 +958,7 @@ fn run_rung(
                 model,
                 effort,
                 "",
-                Some(&gate_feedback(&report)),
+                Some(&support::gate_feedback(approved, &report, run_dir)),
                 &baseline_tree,
                 &excluded_paths,
                 &r2_runner,
@@ -1119,7 +1155,7 @@ fn run_rung(
             let r2_summary = format!(
                 "R2 {model}/{effort}: {}; {}",
                 rung_reason,
-                gate_feedback(&report)
+                support::gate_feedback(approved, &report, run_dir)
                     .lines()
                     .take(4)
                     .map(|line| line.chars().take(180).collect::<String>())
@@ -1210,7 +1246,7 @@ fn run_rung(
                     model,
                     effort,
                     "",
-                    Some(&gate_feedback(&report)),
+                    Some(&support::gate_feedback(approved, &report, run_dir)),
                     &baseline_tree,
                     &excluded_paths,
                     &r3_runner,
@@ -1522,7 +1558,7 @@ pub(super) fn run_witness_build(
     run_dir: &Path,
     store: &RunStore,
     snapshot: &mut RunSnapshot,
-) -> Result<bool, CoreError> {
+) -> Result<super::super::WitnessBuildResult, CoreError> {
     let witness_ref = format!("refs/kogen/witness/{}", approved.slug);
     let _ = crate::git::GitRepo::new(&project.origin).output(&["update-ref", "-d", &witness_ref]);
     let candidate_path = project
@@ -1694,10 +1730,62 @@ pub(super) fn run_witness_build(
             .with("count", json!(usize::from(!green))),
     )?;
     if !green {
+        let failed_ids = report
+            .acceptance
+            .item_pass
+            .iter()
+            .filter_map(|(id, passed)| (!passed).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        let mut warnings = Vec::new();
+        if !failed_ids.is_empty() {
+            let diff = candidate_diff(candidate.workspace(), base_sha, &tree)?;
+            let request = crate::run::orchestration::BuildAuditRequest {
+                ids: failed_ids.clone(),
+                request: approved.intent.request.clone().unwrap_or_default(),
+                test_source: String::from_utf8_lossy(&approved.acceptance_bytes).into_owned(),
+                failure_output: String::from_utf8_lossy(&report.acceptance.process.output_tail)
+                    .into_owned(),
+                candidate_diff: String::from_utf8_lossy(&diff).into_owned(),
+            };
+            let reply = provider.witness_audit(snapshot, run_dir, "R1", &request)?;
+            let judgments = decode_witness_audit(&reply, &failed_ids);
+            provider.record_event(
+                snapshot,
+                &RunEvent::new("audit", now_ms())
+                    .with("rung", json!("R1"))
+                    .with(
+                        "items",
+                        json!(
+                            judgments
+                                .iter()
+                                .map(|item| json!({
+                                    "id": item.id,
+                                    "verdict": item.verdict,
+                                    "citation": item.citation,
+                                    "reason": item.reason,
+                                }))
+                                .collect::<Vec<_>>()
+                        ),
+                    ),
+            )?;
+            warnings.extend(
+                judgments
+                    .iter()
+                    .filter(|item| item.verdict == "UNDECIDED")
+                    .map(|item| crate::intent::shaping::ShapeWarning {
+                        code: "feasibility_concern".to_owned(),
+                        item_ids: vec![item.id.clone()],
+                        message: item.reason.clone(),
+                    }),
+            );
+        }
         drop(provider);
         cleanup_path(base.workspace());
         cleanup_path(candidate.workspace());
-        return Ok(false);
+        return Ok(super::super::WitnessBuildResult {
+            proven: false,
+            warnings,
+        });
     }
     let setup_outputs = options
         .setup_outputs
@@ -1732,7 +1820,95 @@ pub(super) fn run_witness_build(
     drop(provider);
     cleanup_path(base.workspace());
     cleanup_path(candidate.workspace());
-    Ok(true)
+    Ok(super::super::WitnessBuildResult {
+        proven: true,
+        warnings: Vec::new(),
+    })
+}
+
+struct WitnessAuditJudgment {
+    id: String,
+    verdict: String,
+    citation: String,
+    reason: String,
+}
+
+fn decode_witness_audit(reply: &str, failed_ids: &[String]) -> Vec<WitnessAuditJudgment> {
+    let parsed = serde_json::from_str::<Value>(reply).ok();
+    let mut rows = BTreeMap::new();
+    let mut duplicates = BTreeSet::new();
+    if let Some(items) = parsed
+        .as_ref()
+        .and_then(|value| value.get("items"))
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !failed_ids.iter().any(|expected| expected == id) {
+                continue;
+            }
+            let verdict = item.get("verdict").and_then(Value::as_str);
+            let citation = item.get("citation").and_then(Value::as_str);
+            let reason = item.get("reason").and_then(Value::as_str);
+            let Some(verdict @ ("TEST-WRONG" | "WITNESS-WRONG" | "UNDECIDED")) = verdict else {
+                continue;
+            };
+            let (Some(citation), Some(reason)) = (citation, reason) else {
+                continue;
+            };
+            if rows
+                .insert(
+                    id.to_owned(),
+                    (verdict.to_owned(), citation.to_owned(), reason.to_owned()),
+                )
+                .is_some()
+            {
+                rows.remove(id);
+                duplicates.insert(id.to_owned());
+            }
+        }
+    }
+    failed_ids
+        .iter()
+        .map(|id| {
+            let judgment = (!duplicates.contains(id)).then(|| rows.get(id)).flatten();
+            let (verdict, citation, reason) = judgment.map_or_else(
+                || {
+                    (
+                        "UNDECIDED".to_owned(),
+                        String::new(),
+                        "The auditor did not provide a usable adjudication.".to_owned(),
+                    )
+                },
+                |(verdict, citation, reason)| (verdict.clone(), citation.clone(), reason.clone()),
+            );
+            WitnessAuditJudgment {
+                id: id.clone(),
+                verdict,
+                citation,
+                reason,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod witness_audit_tests {
+    use super::decode_witness_audit;
+
+    #[test]
+    fn red_witness_preserves_an_undecided_judgment() {
+        let failed = vec!["A1".to_owned()];
+        let judgments = decode_witness_audit(
+            r#"{"items":[{"id":"A1","verdict":"UNDECIDED","citation":"","reason":"Insufficient evidence."}]}"#,
+            &failed,
+        );
+        assert_eq!(judgments.len(), 1);
+        assert_eq!(judgments[0].verdict, "UNDECIDED");
+        assert_eq!(judgments[0].reason, "Insufficient evidence.");
+    }
 }
 
 struct WitnessCandidate {
@@ -1993,6 +2169,7 @@ mod ladder_tests {
             rung: rung.to_owned(),
             rung_number,
             commit: format!("commit-{rung}"),
+            tree: format!("tree-{rung}"),
             verdict: "unverified".to_owned(),
             reason: "verification_red".to_owned(),
             pass_count,

@@ -169,6 +169,16 @@ fn verified_tree_lands_once_with_durable_record_and_disabled_workspace_hooks_and
     );
     let events = fixture.store.read_events().unwrap();
     assert_eq!(events[0].event, "landing_prepared");
+    assert_eq!(
+        serde_json::to_value(&events[0]).unwrap()["landing"],
+        serde_json::json!({
+            "approval_commit": fixture.base,
+            "run_id": RUN_ID,
+            "expected_parent": fixture.base,
+            "final_tree": tree,
+            "candidate_commit": commit,
+        })
+    );
     assert!(
         events
             .iter()

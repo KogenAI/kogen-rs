@@ -3,7 +3,7 @@ use super::{
     SystemClock, respond,
 };
 use crate::provider::ModelResponse;
-use crate::provider::auth::{InjectedCredential, RequestCredential};
+use crate::provider::auth::{Credential, InjectedCredential, RequestCredential};
 use crate::provider::http::retry::RetryReplay;
 use crate::provider::http::wire::{RequestContext, ResponseMode, WireConfig, WireRequest};
 use crate::provider::session::ConversationBinding;
@@ -366,7 +366,19 @@ fn partial_stream_continuation_appends_received_items_and_returns_combined_text(
 
 #[test]
 fn usage_limit_uses_the_fixed_build_pause_outside_the_build_budget() {
-    let (root, mut request, mut auth, config) = setup("gpt-6-luna", "max");
+    let (root, mut request, _injected_auth, mut config) = setup("gpt-6-luna", "max");
+    config.mode = ResponseMode::Owned;
+    let mut auth = RequestCredential::Owned(Credential {
+        client_id: "client".to_owned(),
+        access_token: "fake-token".to_owned(),
+        refresh_token: "refresh-token".to_owned(),
+        id_token: String::new(),
+        expires_at: i64::MAX,
+        scopes: Vec::new(),
+        subject: "subject".to_owned(),
+        email: None,
+        host_id: "host".to_owned(),
+    });
     let mut failure = ProviderFailure::new(
         ProviderErrorKind::UsageLimit,
         "ChatGPT subscription usage limit reached.",
@@ -399,6 +411,40 @@ fn usage_limit_uses_the_fixed_build_pause_outside_the_build_budget() {
     );
     assert_eq!(policy.waited, 300_000);
     assert_eq!(clock.now_ms(), 300_000);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn injected_login_failure_stops_without_refresh_retry_or_pause() {
+    let (root, mut request, mut auth, config) = setup("gpt-6-luna", "max");
+    let http = ScriptedHttp::new([attempt(
+        Err(ProviderFailure::new(
+            ProviderErrorKind::Login,
+            "unauthorized",
+        )),
+        Vec::new(),
+    )]);
+    let clock = FakeClock::default();
+    let mut policy = RetryReplay::default();
+    let result = go(
+        &mut request,
+        &mut auth,
+        &config,
+        &mut policy,
+        &options(false),
+        &http,
+        &clock,
+    );
+    let failure = match result {
+        Err(failure) => failure,
+        Ok(_) => panic!("injected credentials cannot be refreshed by the provider client"),
+    };
+
+    assert_eq!(failure.failure.kind, ProviderErrorKind::Login);
+    assert_eq!(http.requests().len(), 1);
+    assert!(failure.events.is_empty());
+    assert_eq!(policy.decision, "stop");
+    assert_eq!(clock.now_ms(), 0);
     std::fs::remove_dir_all(root).unwrap();
 }
 

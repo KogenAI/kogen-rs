@@ -6,6 +6,13 @@ pub fn run(
     project: &ProjectResolution,
     approved: &ApprovedBuild,
 ) -> Result<BuildOutcome, CoreError> {
+    let latest = ApprovedBuild::load(project, &approved.slug)?;
+    if latest.commit != approved.commit || latest.approval_sha256 != approved.approval_sha256 {
+        return Err(controller_error(
+            "approval_invalid",
+            "the approval changed while the queue was waiting",
+        ));
+    }
     let run_id = crate::queue::new_run_id()?;
     let claim = match crate::queue::claim(&project.origin, &run_id)? {
         crate::queue::ClaimStart::Acquired(claim) => claim,
@@ -26,13 +33,6 @@ pub fn run(
         }
     };
 
-    let latest = ApprovedBuild::load(project, &approved.slug)?;
-    if latest.commit != approved.commit || latest.approval_sha256 != approved.approval_sha256 {
-        return Err(controller_error(
-            "approval_invalid",
-            "the approval changed while the queue was waiting",
-        ));
-    }
     let options = BuildOptions::load(project)?;
     let origin = crate::git::GitRepo::new(&project.origin);
     let base_sha = origin

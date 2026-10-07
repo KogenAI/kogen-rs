@@ -70,6 +70,24 @@ impl ApprovedBuild {
                 "approval bytes do not match the document",
             ));
         }
+        let by = approval
+            .get("by")
+            .and_then(Value::as_str)
+            .filter(|by| !by.is_empty())
+            .ok_or_else(|| invalid_approval(slug, "approver is missing"))?;
+        let at = approval
+            .get("at")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_approval(slug, "approval time is missing"))?;
+        let message = origin
+            .text(&["show", "-s", "--format=%B", &commit])
+            .map_err(|error| invalid_approval(slug, error))?;
+        if !approval_commit_message_matches(&message, slug, by, expected_hash, at) {
+            return Err(invalid_approval(
+                slug,
+                "approval commit trailers do not match the document",
+            ));
+        }
         let intent =
             Intent::parse(slug, &intent_bytes).map_err(|error| invalid_approval(slug, error))?;
         if intent.acceptance.is_empty()
@@ -138,6 +156,19 @@ impl ApprovedBuild {
     }
 }
 
+fn approval_commit_message_matches(
+    message: &str,
+    slug: &str,
+    by: &str,
+    hash: &str,
+    at: &str,
+) -> bool {
+    message
+        == format!(
+            "Kogen immutable approval package\n\nKogen-Approval: {slug}\nKogen-Approved-By: {by}\nKogen-Approved-Hash: {hash}\nKogen-Approved-At: {at}"
+        )
+}
+
 fn invalid_approval(slug: &str, detail: impl std::fmt::Display) -> CoreError {
     CoreError::new(
         ErrorClass::Controller,
@@ -145,4 +176,28 @@ fn invalid_approval(slug: &str, detail: impl std::fmt::Display) -> CoreError {
         format!("{slug}: {detail}"),
         ExitCode::Bug,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approval_commit_message_matches;
+
+    #[test]
+    fn approval_trailers_must_match_the_approval_document() {
+        let message = "Kogen immutable approval package\n\nKogen-Approval: greet\nKogen-Approved-By: Kogen Test <test@kogen.invalid>\nKogen-Approved-Hash: abc123\nKogen-Approved-At: 2026-10-07T08:00:00Z";
+        assert!(approval_commit_message_matches(
+            message,
+            "greet",
+            "Kogen Test <test@kogen.invalid>",
+            "abc123",
+            "2026-10-07T08:00:00Z"
+        ));
+        assert!(!approval_commit_message_matches(
+            message,
+            "greet",
+            "Mallory <m@example.invalid>",
+            "abc123",
+            "2026-10-07T08:00:00Z"
+        ));
+    }
 }

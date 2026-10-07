@@ -65,7 +65,7 @@ pub(super) fn run_witness_build(
     run_dir: &std::path::Path,
     store: &crate::run::RunStore,
     snapshot: &mut crate::run::RunSnapshot,
-) -> Result<bool, CoreError> {
+) -> Result<super::WitnessBuildResult, CoreError> {
     execute::run_witness_build(
         project, approved, options, base_sha, run_dir, store, snapshot,
     )

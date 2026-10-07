@@ -1,4 +1,4 @@
-use super::workspace_changed;
+use super::{witness_auditor_instructions, workspace_changed};
 use crate::gate::commit_tree_id;
 use crate::git::GitRepo;
 use std::fs;
@@ -53,6 +53,14 @@ fn finish_guard_ignores_acceptance_copy_and_detects_builder_commit() {
     );
 
     fs::remove_dir_all(workspace).expect("remove temporary repository");
+}
+
+#[test]
+fn witness_auditor_prompt_uses_the_witness_verdict_contract() {
+    let prompt = witness_auditor_instructions();
+    assert!(prompt.contains(crate::run::orchestration::BUILD_AUDITOR_MARKER));
+    assert!(prompt.contains("TEST-WRONG|WITNESS-WRONG|UNDECIDED"));
+    assert!(prompt.contains("\"citation\""));
 }
 
 #[test]

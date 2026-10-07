@@ -158,6 +158,10 @@ pub fn respond(
         "role": options.role,
         "model": model_class(&request.model),
         "fallbackOn": options.fallback_on && wire_config.mode != super::wire::ResponseMode::Grok,
+        "refreshable": matches!(
+            wire_config.mode,
+            super::wire::ResponseMode::Owned | super::wire::ResponseMode::Grok
+        ),
         "bounded": options.wall_budget_ms.is_some(),
         "wall": options.wall_budget_ms.unwrap_or(0),
         "mode": options.mode,

@@ -18,6 +18,11 @@ pub use queue::{queue_start, queue_stop};
 use crate::ExitCode;
 use crate::error::{CoreError, ErrorClass};
 
+pub(crate) struct WitnessBuildResult {
+    pub proven: bool,
+    pub warnings: Vec<crate::intent::shaping::ShapeWarning>,
+}
+
 fn controller_error(reason: &str, detail: impl Into<String>) -> CoreError {
     CoreError::new(ErrorClass::Controller, reason, detail, ExitCode::Bug)
 }
@@ -37,7 +42,7 @@ pub(crate) fn run_witness_build(
     intent_bytes: Vec<u8>,
     acceptance_path: String,
     acceptance_bytes: Vec<u8>,
-) -> Result<bool, CoreError> {
+) -> Result<WitnessBuildResult, CoreError> {
     let origin = crate::git::GitRepo::new(&project.origin);
     let base_sha = origin
         .resolve_commit(&project.base)

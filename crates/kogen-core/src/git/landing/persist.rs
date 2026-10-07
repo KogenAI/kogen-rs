@@ -21,9 +21,7 @@ pub(super) fn save_landing(
         fields: Default::default(),
     });
     let event = RunEvent::new("landing_prepared", now_ms())
-        .with("expected_parent", json!(expected_parent))
-        .with("final_tree", json!(tree))
-        .with("candidate_commit", json!(candidate.commit));
+        .with("landing", json!(request.snapshot.landing));
     request.store.record(&event, request.snapshot)?;
     Ok(())
 }
@@ -155,10 +153,16 @@ pub(super) fn persist_terminal(
     event: &str,
     reason: &str,
 ) -> Result<(), LandingError> {
-    let mut entry = RunEvent::new(event, now_ms()).with("status", json!(request.snapshot.status));
-    if !reason.is_empty() {
-        entry = entry.with("reason", json!(reason));
-    }
+    let mut entry = RunEvent::new(event, now_ms())
+        .with("status", json!(request.snapshot.status))
+        .with(
+            "reason",
+            if reason.is_empty() {
+                serde_json::Value::Null
+            } else {
+                json!(reason)
+            },
+        );
     if let Some(verdict) = request.snapshot.fields.get("verdict") {
         entry = entry.with("verdict", verdict.clone());
     }

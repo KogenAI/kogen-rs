@@ -19,6 +19,8 @@ pub struct RetryReplay {
     pub attempt: u32,
     pub overloads: u32,
     pub refreshed: bool,
+    #[serde(default = "refreshable_by_default")]
+    pub refreshable: bool,
     pub waited: u64,
     pub decision: String,
     pub delay: u64,
@@ -45,6 +47,7 @@ impl Default for RetryReplay {
             attempt: 0,
             overloads: 0,
             refreshed: false,
+            refreshable: true,
             waited: 0,
             decision: String::new(),
             delay: 0,
@@ -107,6 +110,10 @@ impl RetryReplay {
         self.attempt = 1;
         self.overloads = 0;
         self.refreshed = false;
+        self.refreshable = value
+            .get("refreshable")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         self.decision.clear();
         self.delay = 0;
         self.reason.clear();
@@ -158,32 +165,39 @@ impl RetryReplay {
 
     fn credential(&mut self, kind: &str, retry_after_ms: Option<u64>) {
         let reason = provider_reason(kind);
-        if !self.refreshed {
-            self.refreshed = true;
-            self.decision = "refresh".to_owned();
-            self.delay = 0;
-            self.reason = reason;
-            self.continued = false;
-            self.phase = "open".to_owned();
-            self.exit = 0;
-            self.last = "ok".to_owned();
-        } else {
-            let wait = if self.mode == "build" {
-                PAUSE_MS
-            } else {
-                retry_after_ms.unwrap_or(PAUSE_MS)
-            };
-            if self.mode == "shape" || self.waited.saturating_add(wait) > PAUSE_CAP_MS {
+        if kind == "login" {
+            if !self.refreshable {
                 self.halt(&reason, 4);
-            } else {
-                self.waited += wait;
-                self.decision = "pause".to_owned();
-                self.delay = wait;
+                return;
+            }
+            if !self.refreshed {
+                self.refreshed = true;
+                self.decision = "refresh".to_owned();
+                self.delay = 0;
                 self.reason = reason;
                 self.continued = false;
-                self.phase = "idle".to_owned();
+                self.phase = "open".to_owned();
+                self.exit = 0;
                 self.last = "ok".to_owned();
+                return;
             }
+        }
+
+        let wait = if self.mode == "build" {
+            PAUSE_MS
+        } else {
+            retry_after_ms.unwrap_or(PAUSE_MS)
+        };
+        if self.mode == "shape" || self.waited.saturating_add(wait) > PAUSE_CAP_MS {
+            self.halt(&reason, 4);
+        } else {
+            self.waited += wait;
+            self.decision = "pause".to_owned();
+            self.delay = wait;
+            self.reason = reason;
+            self.continued = false;
+            self.phase = "idle".to_owned();
+            self.last = "ok".to_owned();
         }
     }
 
@@ -281,6 +295,10 @@ impl RetryReplay {
     }
 }
 
+fn refreshable_by_default() -> bool {
+    true
+}
+
 #[must_use]
 pub const fn retry_ceiling(attempt: u32) -> u64 {
     match attempt {
@@ -325,4 +343,33 @@ fn str_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
 
 fn bool_field(value: &Value, field: &str) -> bool {
     value.get(field).and_then(Value::as_bool).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RetryReplay;
+    use serde_json::json;
+
+    #[test]
+    fn usage_limit_pauses_even_when_credentials_cannot_be_refreshed() {
+        let mut replay = RetryReplay::default();
+        replay.apply(
+            "Open",
+            Some(&json!({
+                "role":"builder",
+                "model":"luna",
+                "mode":"build",
+                "fallbackOn":false,
+                "refreshable":false,
+                "bounded":true,
+                "wall":100_000
+            })),
+        );
+        replay.apply("Result", Some(&json!({"kind":"usage_limit"})));
+
+        assert_eq!(replay.phase, "idle");
+        assert_eq!(replay.decision, "pause");
+        assert_eq!(replay.delay, 300_000);
+        assert_eq!(replay.waited, 300_000);
+    }
 }

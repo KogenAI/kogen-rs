@@ -271,13 +271,15 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                 .map_err(|error| io_error("shape_output_unavailable", error))?;
             let acceptance = fs::read(&state.acceptance_path)
                 .map_err(|error| io_error("shape_output_unavailable", error))?;
-            if crate::build::run_witness_build(
+            let witness = crate::build::run_witness_build(
                 &project,
                 &state.options.slug,
                 intent,
                 state.acceptance_rel.clone(),
                 acceptance,
-            )? {
+            )?;
+            state.warnings.extend(witness.warnings);
+            if witness.proven {
                 if state
                     .warnings
                     .iter()

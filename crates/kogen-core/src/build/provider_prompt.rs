@@ -2,8 +2,6 @@ use crate::error::CoreError;
 use crate::provider::session::ConversationHistory;
 use crate::run::RunStore;
 use serde_json::{Value, json};
-use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub(super) fn planner_instructions() -> String {
@@ -13,6 +11,13 @@ pub(super) fn planner_instructions() -> String {
 pub(super) fn auditor_instructions() -> String {
     format!(
         "{} Check whether each failed acceptance test follows the verbatim Request. Reply with JSON only in this form: {{\"items\":[{{\"id\":\"A1\",\"verdict\":\"valid|over_strict|contradicts\",\"reason\":\"...\"}}]}}.",
+        crate::run::orchestration::BUILD_AUDITOR_MARKER
+    )
+}
+
+pub(super) fn witness_auditor_instructions() -> String {
+    format!(
+        "{} For each failing witness assertion, decide whether the test is wrong, the witness implementation is wrong, or the evidence is insufficient. Reply with JSON only in this form: {{\"items\":[{{\"id\":\"A1\",\"verdict\":\"TEST-WRONG|WITNESS-WRONG|UNDECIDED\",\"citation\":\"…\",\"reason\":\"…\"}}]}}.",
         crate::run::orchestration::BUILD_AUDITOR_MARKER
     )
 }
@@ -71,23 +76,8 @@ pub(super) fn append_turn_budget_note(
 }
 
 pub(super) fn append_transcript(store: &RunStore, row: Value) -> Result<(), CoreError> {
-    let path = store.directory().join("transcript.jsonl");
-    let mut options = OpenOptions::new();
-    options.create(true).append(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path).map_err(|error| {
-        super::controller_error(
-            "transcript_write_failed",
-            format!("{}: {error}", path.display()),
-        )
-    })?;
-    serde_json::to_writer(&mut file, &row)
-        .map_err(|error| super::controller_error("transcript_write_failed", error.to_string()))?;
-    file.write_all(b"\n")
+    store
+        .append_transcript(&row)
         .map_err(|error| super::controller_error("transcript_write_failed", error.to_string()))
 }
 

@@ -46,6 +46,10 @@ struct BuilderSession {
 
 const PROTECTED_RESTORE_LIMIT: u8 = 4;
 
+fn retry_after_provider_error(reason: &str, credential_source: &str) -> bool {
+    reason == "usage_limit" || (reason == "login" && credential_source != "injected")
+}
+
 fn protected_restore_limit_reached(restores: u8) -> bool {
     restores >= PROTECTED_RESTORE_LIMIT
 }
@@ -101,6 +105,25 @@ impl<'a> BuildProvider<'a> {
         &self.account
     }
 
+    pub fn fork(&self) -> Result<Self, CoreError> {
+        let http = crate::provider::http::ReqwestPort::new()
+            .map_err(|failure| provider_error(failure.kind, failure.message))?;
+        Ok(Self {
+            approved: self.approved,
+            options: self.options,
+            store: self.store,
+            builder_session: None,
+            rung_sessions: BTreeMap::new(),
+            shared_tools: self.shared_tools.clone(),
+            usage_paused_ms: self.usage_paused_ms,
+            build_started: self.build_started,
+            home: self.home.clone(),
+            account: self.account.clone(),
+            http,
+            clock: SystemClock::default(),
+        })
+    }
+
     pub fn record_event(
         &mut self,
         snapshot: &mut RunSnapshot,
@@ -138,7 +161,10 @@ impl<'a> BuildProvider<'a> {
                 Ok(call) => break (call, before.elapsed().as_millis() as u64),
                 Err(error)
                     if error.class == crate::error::ErrorClass::Provider
-                        && matches!(error.reason.as_str(), "usage_limit" | "login")
+                        && retry_after_provider_error(
+                            &error.reason,
+                            self.account.credential_source,
+                        )
                         && self.usage_paused_ms < 86_400_000 =>
                 {
                     self.usage_paused_ms =
@@ -194,14 +220,50 @@ impl<'a> BuildProvider<'a> {
         rung: &str,
         request: &crate::run::orchestration::BuildAuditRequest,
     ) -> Result<String, CoreError> {
+        self.audit_with_prompt(
+            snapshot,
+            run_dir,
+            rung,
+            "audit",
+            auditor_instructions(),
+            request,
+        )
+    }
+
+    pub fn witness_audit(
+        &mut self,
+        snapshot: &mut RunSnapshot,
+        run_dir: &Path,
+        rung: &str,
+        request: &crate::run::orchestration::BuildAuditRequest,
+    ) -> Result<String, CoreError> {
+        self.audit_with_prompt(
+            snapshot,
+            run_dir,
+            rung,
+            "witness_audit",
+            super::provider_prompt::witness_auditor_instructions(),
+            request,
+        )
+    }
+
+    fn audit_with_prompt(
+        &mut self,
+        snapshot: &mut RunSnapshot,
+        run_dir: &Path,
+        rung: &str,
+        stage: &str,
+        instructions: String,
+        request: &crate::run::orchestration::BuildAuditRequest,
+    ) -> Result<String, CoreError> {
         let mut context = self.request_context(
             run_dir,
-            "audit",
+            stage,
             "test-auditor",
             rung,
             "gpt-6.1-sol",
             "high",
-            auditor_instructions(),
+            instructions,
             vec![user_item(&request.user_message())],
             Vec::new(),
             false,
@@ -212,13 +274,13 @@ impl<'a> BuildProvider<'a> {
             snapshot,
             &mut context,
             "auditor",
-            "audit",
+            stage,
             Some(self.options.wall_ms),
         )?;
         let elapsed = before.elapsed().as_millis() as u64;
         self.record_call(
             snapshot,
-            "audit",
+            stage,
             rung,
             &call,
             elapsed,
@@ -231,7 +293,7 @@ impl<'a> BuildProvider<'a> {
         append_transcript(
             self.store,
             json!({
-                "stage":"audit",
+                "stage":stage,
                 "rung":rung,
                 "model":context.model,
                 "input":context.input,
@@ -508,7 +570,10 @@ impl<'a> BuildProvider<'a> {
                     Ok(call) => break call,
                     Err(error)
                         if error.class == crate::error::ErrorClass::Provider
-                            && matches!(error.reason.as_str(), "usage_limit" | "login")
+                            && retry_after_provider_error(
+                                &error.reason,
+                                self.account.credential_source,
+                            )
                             && self.usage_paused_ms < 86_400_000 =>
                     {
                         self.usage_paused_ms =
@@ -873,7 +938,7 @@ fn configure_build_tools(
 mod tests {
     use super::{
         append_tool_batch_history, configure_build_tools, protected_restore_limit_reached,
-        shared_build_tool_schemas,
+        retry_after_provider_error, shared_build_tool_schemas,
     };
     use crate::provider::auth::{InjectedCredential, RequestCredential};
     use crate::provider::http::{RequestContext, ResponseMode, WireConfig, build_wire_request};
@@ -910,6 +975,13 @@ mod tests {
     fn fourth_protected_restore_ends_the_rung() {
         assert!(!protected_restore_limit_reached(3));
         assert!(protected_restore_limit_reached(4));
+    }
+
+    #[test]
+    fn injected_login_stops_while_owned_login_and_usage_limit_can_resume() {
+        assert!(!retry_after_provider_error("login", "injected"));
+        assert!(retry_after_provider_error("login", "owned"));
+        assert!(retry_after_provider_error("usage_limit", "injected"));
     }
 
     #[test]

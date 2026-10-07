@@ -26,73 +26,40 @@ pub(super) fn gate_feedback(
     let mut errors = 0_usize;
     let warnings = report.checks.iter().filter(|check| check.excused).count();
     let mut tool_counts = BTreeMap::<String, usize>::new();
+    let mut omitted_findings = BTreeMap::<String, usize>::new();
+    for fix in report.fix_results.iter().filter(|fix| !fix.passed()) {
+        lines.push(format!("fix/{}: {}", fix.name, fix_failure_status(fix)));
+        lines.push(format!("raw log: {}", fix.log_path.display()));
+        append_raw_tail(&mut lines, &fix.name, &fix.log_path, run_dir);
+    }
     for check in report.checks.iter().filter(|check| check.blocks_gate()) {
         errors += 1;
-        let mut emitted = 0_usize;
-        for finding in &check.findings {
-            if emitted >= 10 || total_findings >= 20 {
-                break;
-            }
-            let line = finding
-                .line
-                .map_or_else(String::new, |line| line.to_string());
-            let column = finding
-                .column
-                .map_or_else(String::new, |column| column.to_string());
-            let position = match (line.is_empty(), column.is_empty()) {
-                (true, _) => String::new(),
-                (false, true) => format!(":{line}"),
-                (false, false) => format!(":{line}:{column}"),
-            };
-            let symbol = if finding.symbol.is_empty() {
-                String::new()
-            } else {
-                format!(" {}:", finding.symbol)
-            };
-            let message = finding.message.chars().take(200).collect::<String>();
-            lines.push(format!(
-                "{}{position}: error: [{}]{symbol} {message}",
-                finding.path, finding.rule
-            ));
-            emitted += 1;
-            total_findings += 1;
-            let tool = finding.rule.split('/').next().unwrap_or(&check.name);
-            *tool_counts.entry(tool.to_owned()).or_default() += 1;
-        }
-        if check.findings.len() > emitted {
-            lines.push(format!(
-                "… {} more {} findings",
-                check.findings.len() - emitted,
-                check.name
-            ));
-        }
+        append_check_details(
+            &mut lines,
+            check,
+            report
+                .base_checks
+                .iter()
+                .find(|base| base.name == check.name),
+            &mut total_findings,
+            &mut tool_counts,
+            &mut omitted_findings,
+        );
         lines.push(format!("raw log: {}", check.log_path.display()));
-        let tail = std::fs::read_to_string(&check.log_path)
-            .ok()
-            .map(|text| {
-                let mut tail = text.lines().rev().take(8).collect::<Vec<_>>();
-                tail.reverse();
-                let home = std::env::var("HOME").unwrap_or_default();
-                tail.join("\n")
-                    .replace(&run_dir.display().to_string(), "$TMPDIR")
-                    .replace(&home, "$HOME")
-            })
-            .unwrap_or_default();
-        if !tail.is_empty() {
-            let tail = tail.chars().take(600).collect::<String>();
-            lines.push(format!(
-                "raw tail (first failed step {}):\n{tail}",
-                check.name
-            ));
-        }
+        append_raw_tail(&mut lines, &check.name, &check.log_path, run_dir);
+    }
+    for (tool, count) in omitted_findings {
+        lines.push(format!("… {count} more {tool} findings"));
     }
     let failed_items = approved
         .intent
         .verify
         .iter()
-        .filter(|item| report.acceptance.item_pass.get(&item.id) != Some(&true))
+        .filter(|item| {
+            report.acceptance.item_pass.get(&item.id) != Some(&true)
+                && !report.demoted_items.contains(&item.id)
+        })
         .collect::<Vec<_>>();
-    errors += failed_items.len();
     for item in &failed_items {
         lines.push(format!("acceptance {}: failed", item.id));
     }
@@ -110,11 +77,14 @@ pub(super) fn gate_feedback(
         .map(|check| format!("{}={}", check.name, check.status.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
-    let passed = approved
-        .intent
-        .verify
-        .len()
-        .saturating_sub(failed_items.len());
+    let passed = approved.intent.verify.len().saturating_sub(
+        approved
+            .intent
+            .verify
+            .iter()
+            .filter(|item| report.acceptance.item_pass.get(&item.id) != Some(&true))
+            .count(),
+    );
     let counts = tool_counts
         .into_iter()
         .map(|(tool, count)| format!("{tool} {count}"))
@@ -125,6 +95,108 @@ pub(super) fn gate_feedback(
         approved.intent.verify.len()
     ));
     lines.join("\n")
+}
+
+fn append_check_details(
+    lines: &mut Vec<String>,
+    check: &crate::gate::CheckResult,
+    base: Option<&crate::gate::CheckResult>,
+    total_findings: &mut usize,
+    tool_counts: &mut BTreeMap<String, usize>,
+    omitted_findings: &mut BTreeMap<String, usize>,
+) {
+    use crate::gate::CheckStatus;
+
+    match check.status {
+        CheckStatus::Green => (),
+        CheckStatus::Mutating => {
+            let paths = check.changed_paths.join(", ");
+            if paths.is_empty() {
+                lines.push(format!("check {}: Mutating", check.name));
+            } else {
+                lines.push(format!(
+                    "check {}: Mutating; changed paths: {paths}",
+                    check.name
+                ));
+            }
+        }
+        CheckStatus::Timeout => lines.push(format!(
+            "check {}: timed out after {} s",
+            check.name,
+            check.timeout.as_secs_f64()
+        )),
+        CheckStatus::Unavailable if base.is_some_and(|base| base.status == CheckStatus::Green) => {
+            lines.push(format!(
+                "{} is not available, but it ran on the base",
+                check.program
+            ));
+        }
+        CheckStatus::Unavailable => {
+            lines.push(format!("check {}: Unavailable", check.name));
+        }
+        CheckStatus::Red => {
+            lines.push(format!("check {}: Red", check.name));
+            for finding in &check.findings {
+                let tool = finding
+                    .rule
+                    .split('/')
+                    .next()
+                    .unwrap_or(&finding.rule)
+                    .to_owned();
+                let count = tool_counts.entry(tool.clone()).or_default();
+                if *total_findings >= 20 || *count >= 10 {
+                    *omitted_findings.entry(tool).or_default() += 1;
+                    continue;
+                }
+                *total_findings += 1;
+                *count += 1;
+                let position = format!(
+                    "{}:{}",
+                    finding.line.unwrap_or(0),
+                    finding.column.unwrap_or(1)
+                );
+                let symbol = if finding.symbol.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}:", finding.symbol)
+                };
+                let message = finding.message.chars().take(200).collect::<String>();
+                lines.push(format!(
+                    "{}:{position}: error: [{}]{symbol} {message}",
+                    finding.path, finding.rule
+                ));
+            }
+        }
+    }
+}
+
+fn fix_failure_status(fix: &crate::gate::FixResult) -> String {
+    if fix.timed_out {
+        "timed out".to_owned()
+    } else if fix.unavailable {
+        "unavailable".to_owned()
+    } else {
+        format!("exit {}", fix.exit_status.unwrap_or(-1))
+    }
+}
+
+fn append_raw_tail(lines: &mut Vec<String>, step: &str, path: &Path, run_dir: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut tail = text.lines().rev().take(8).collect::<Vec<_>>();
+    tail.reverse();
+    let mut tail = tail.join("\n");
+    tail = tail.replace(&run_dir.display().to_string(), "$TMPDIR");
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        tail = tail.replace(&home, "$HOME");
+    }
+    if !tail.is_empty() {
+        let tail = tail.chars().take(600).collect::<String>();
+        lines.push(format!("raw tail (first failed step {step}):\n{tail}"));
+    }
 }
 
 pub(super) fn gate_failure_count(report: &crate::gate::GateReport) -> usize {
@@ -537,4 +609,96 @@ fn controller_error(reason: &str, detail: impl std::fmt::Display) -> CoreError {
         detail.to_string(),
         ExitCode::Bug,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_check_details, append_raw_tail, fix_failure_status};
+    use crate::gate::{CheckResult, CheckStatus, FixResult};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn gate_feedback_details_cover_mutation_timeout_unavailable_fixes_and_raw_tail() {
+        let mut lines = Vec::new();
+        let mut total_findings = 0;
+        let mut tool_counts = BTreeMap::new();
+        let mut omitted_findings = BTreeMap::new();
+
+        let mut mutating = check("unit", CheckStatus::Mutating);
+        mutating.changed_paths = vec!["lib/generated.txt".to_owned()];
+        append_check_details(
+            &mut lines,
+            &mutating,
+            None,
+            &mut total_findings,
+            &mut tool_counts,
+            &mut omitted_findings,
+        );
+        assert!(lines.join("\n").contains("lib/generated.txt"));
+
+        append_check_details(
+            &mut lines,
+            &check("unit", CheckStatus::Timeout),
+            None,
+            &mut total_findings,
+            &mut tool_counts,
+            &mut omitted_findings,
+        );
+        assert!(lines.join("\n").contains("timed out after 3 s"));
+
+        append_check_details(
+            &mut lines,
+            &check("unit", CheckStatus::Unavailable),
+            Some(&check("unit", CheckStatus::Green)),
+            &mut total_findings,
+            &mut tool_counts,
+            &mut omitted_findings,
+        );
+        assert!(
+            lines
+                .join("\n")
+                .contains("sh is not available, but it ran on the base")
+        );
+
+        let failed_fix = FixResult {
+            name: "fmt".to_owned(),
+            exit_status: Some(1),
+            timed_out: false,
+            unavailable: false,
+            log_path: PathBuf::from("fix.log"),
+            duration_ms: 1,
+        };
+        assert_eq!(fix_failure_status(&failed_fix), "exit 1");
+
+        let root = std::env::temp_dir().join(format!(
+            "kogen-gate-feedback-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(root.join("logs")).expect("create feedback log directory");
+        let log = root.join("logs/unit.log");
+        std::fs::write(&log, format!("{}/diagnostic\n", root.display()))
+            .expect("write feedback log");
+        append_raw_tail(&mut lines, "unit", &log, &root);
+        assert!(lines.last().is_some_and(|line| {
+            line == "raw tail (first failed step unit):\n$TMPDIR/diagnostic"
+        }));
+        std::fs::remove_dir_all(root).expect("remove feedback log directory");
+    }
+
+    fn check(name: &str, status: CheckStatus) -> CheckResult {
+        CheckResult {
+            name: name.to_owned(),
+            program: "sh".to_owned(),
+            status,
+            exit_status: Some(1),
+            findings: Vec::new(),
+            changed_paths: Vec::new(),
+            log_path: PathBuf::from("check.log"),
+            duration_ms: 1,
+            timeout: std::time::Duration::from_secs(3),
+            excused: false,
+        }
+    }
 }

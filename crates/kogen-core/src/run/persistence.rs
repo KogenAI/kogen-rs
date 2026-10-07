@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -24,7 +25,7 @@ pub struct RunSnapshot {
     pub owner_pid: u32,
     pub owner_started_ms: i64,
     pub started_ms: i64,
-    #[serde(flatten)]
+    #[serde(skip)]
     pub fields: BTreeMap<String, Value>,
 }
 
@@ -35,8 +36,77 @@ pub struct LandingRecord {
     pub expected_parent: String,
     pub final_tree: String,
     pub candidate_commit: String,
-    #[serde(flatten)]
+    #[serde(skip)]
     pub fields: BTreeMap<String, Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunSnapshot, RunStore};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn run_snapshot_serializes_only_the_specified_fields() {
+        let snapshot = RunSnapshot {
+            schema: 2,
+            run_id: "a".repeat(32),
+            slug: "greet".to_owned(),
+            approval_sha256: "b".repeat(64),
+            approval_commit: "c".repeat(40),
+            target_branch: "main".to_owned(),
+            status: "running".to_owned(),
+            landing: None,
+            owner_pid: 7,
+            owner_started_ms: 1,
+            started_ms: 2,
+            fields: BTreeMap::from([("verdict".to_owned(), json!("green"))]),
+        };
+
+        let value = serde_json::to_value(&snapshot).expect("serialize run snapshot");
+        let keys = value
+            .as_object()
+            .expect("snapshot object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "schema",
+                "run_id",
+                "slug",
+                "approval_sha256",
+                "approval_commit",
+                "target_branch",
+                "status",
+                "landing",
+                "owner_pid",
+                "owner_started_ms",
+                "started_ms",
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "kogen-run-snapshot-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let store = RunStore::new(&directory);
+        store.create(&snapshot).expect("persist snapshot");
+        let loaded: Value = serde_json::from_slice(
+            &std::fs::read(directory.join("run.json")).expect("read run.json"),
+        )
+        .expect("parse run.json");
+        assert_eq!(loaded, value);
+        std::fs::remove_dir_all(directory).expect("remove snapshot fixture");
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -88,6 +158,7 @@ impl std::error::Error for RunPersistenceError {}
 #[derive(Clone, Debug)]
 pub struct RunStore {
     directory: PathBuf,
+    append_lock: Arc<Mutex<()>>,
 }
 
 impl RunStore {
@@ -95,6 +166,7 @@ impl RunStore {
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
+            append_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -118,6 +190,10 @@ impl RunStore {
         snapshot: &RunSnapshot,
     ) -> Result<(), RunPersistenceError> {
         let path = self.directory.join("events.jsonl");
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|error| persistence_error("lock run journal", &path, error))?;
         fs::create_dir_all(&self.directory)
             .map_err(|error| persistence_error("create run directory", &self.directory, error))?;
         set_private_dir(&self.directory)
@@ -132,7 +208,27 @@ impl RunStore {
         File::open(&self.directory)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| persistence_error("sync run directory", &self.directory, error))?;
+        drop(_guard);
         self.write_snapshot(snapshot)
+    }
+
+    pub fn append_transcript(&self, row: &Value) -> Result<(), RunPersistenceError> {
+        let path = self.directory.join("transcript.jsonl");
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|error| persistence_error("lock run transcript", &path, error))?;
+        fs::create_dir_all(&self.directory)
+            .map_err(|error| persistence_error("create run directory", &self.directory, error))?;
+        set_private_dir(&self.directory)
+            .map_err(|error| persistence_error("protect run directory", &self.directory, error))?;
+        let mut file = private_append(&path)
+            .map_err(|error| persistence_error("append run transcript", &path, error))?;
+        serde_json::to_writer(&mut file, row)
+            .map_err(|error| persistence_error("append run transcript", &path, error))?;
+        file.write_all(b"\n")
+            .and_then(|()| file.sync_all())
+            .map_err(|error| persistence_error("append run transcript", &path, error))
     }
 
     pub fn write_snapshot(&self, snapshot: &RunSnapshot) -> Result<(), RunPersistenceError> {
