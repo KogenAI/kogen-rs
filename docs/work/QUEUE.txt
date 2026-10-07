@@ -19,3 +19,7 @@
 # Integration after 01-11: run all applicable v1.1 profiles, six named v1.2
 # cases, all G-slice replays, then the separate live >95% warm-cache smoke.
 # Existing v1.1/v1.2 conflicts are reported, not papered over.
+
+# Follow-up (7 Oct): a kogen-core test fails when the user's global git config has commit.gpgsign=true
+# and gpg can't sign non-interactively. Tests must isolate git config (GIT_CONFIG_GLOBAL/HOME), and
+# Kogen's own commits (approval, landing) must decide signing explicitly per spec rather than inherit it.
