@@ -171,6 +171,7 @@ fn login_attempt(
             ("redirect_uri", redirect_uri.as_str()),
             ("client_id", returned_client_id),
             ("code_verifier", verifier.as_str()),
+            ("resource", "https://api.openai.com/v1"),
         ])
         .send()
         .map_err(|_| provider_error("login", "ChatGPT token exchange failed"))?;
@@ -207,6 +208,7 @@ pub(super) fn refresh(
             ("grant_type", "refresh_token"),
             ("client_id", credential.client_id.as_str()),
             ("refresh_token", credential.refresh_token.as_str()),
+            ("resource", "https://api.openai.com/v1"),
         ])
         .send()
         .map_err(|_| provider_error("login", "ChatGPT token refresh failed"))?;
