@@ -60,8 +60,11 @@ fn login_with_auth(
         .map(|credential| credential.client_id.as_str());
     let (credential, subject, email, plan_usage) =
         owned_login(home, previous_client, &mut progress)?;
-    if let Some(previous_subject) = old_profile
+    // The account-change guard applies only to a readable, signed-in credential;
+    // an unreadable or absent credential is replaced as a fresh sign-in.
+    if let Some(previous_subject) = old_credential
         .as_ref()
+        .and(old_profile.as_ref())
         .and_then(|record| record.get("subject"))
         .and_then(Value::as_str)
         && previous_subject != subject
@@ -96,7 +99,9 @@ fn login_with_auth(
 
 pub fn logout(home: &Path) -> Result<String, super::CoreError> {
     let mut profiles = read_profiles(home)?;
-    let credential = auth::get_credential(home, LABEL)?;
+    // An unreadable credential (e.g. from an older Kogen) is removed locally;
+    // it can't be revoked remotely.
+    let credential = auth::get_login_credential(home, LABEL)?.credential;
     let remote_revoked = credential.as_ref().is_some_and(auth::revoke_owned);
     auth::delete_credential(home, LABEL)?;
     if let Some(credential) = credential.as_ref() {
