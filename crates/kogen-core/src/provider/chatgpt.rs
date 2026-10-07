@@ -676,6 +676,8 @@ mod tests {
     }
 
     fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        // Accepted sockets inherit non-blocking mode from the listener on macOS.
+        stream.set_nonblocking(false).unwrap();
         let mut header_bytes = Vec::new();
         while !header_bytes.ends_with(b"\r\n\r\n") {
             let mut byte = [0_u8; 1];
