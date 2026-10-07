@@ -35,6 +35,11 @@ fn green_verification_receipt_binds_the_candidate_tree_and_change_items_land() {
         fs::read(fixture.candidate.join("test/acceptance/greet.t.sh")).unwrap(),
         fixture.acceptance
     );
+    let ledger = fs::read_to_string(fixture.run.join("ledger.jsonl")).unwrap();
+    let row: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
+    assert_eq!(row["tag"], "greet/A1");
+    assert_eq!(row["status"], "passed");
+    assert_eq!(row.as_object().unwrap().len(), 3);
     fixture.remove();
 }
 

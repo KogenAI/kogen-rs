@@ -78,7 +78,7 @@ pub(super) fn baseline_key(
     }
     let material = json!({"v":3,"checked_base_tree":tree,"setup_key":setup.digest(),"checks":checks,
         "child_env":setup_material["child_env"],"toolchain":toolchain,"os":std::env::consts::OS,
-        "arch":std::env::consts::ARCH,"adapter_version":"kogen-baseline-v3"});
+        "arch":std::env::consts::ARCH,"adapter_version":"kogen-baseline-v3-adapters-1"});
     Ok(Some(format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&material).expect("baseline identity"))

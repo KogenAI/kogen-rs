@@ -16,7 +16,7 @@ pub use ledger::{
     run_command_acceptance,
 };
 
-pub(crate) use checks::is_test_rule;
+pub(crate) use checks::parse_check_findings;
 pub use checks::{
     CheckBaseline, CheckCommand, CheckConfigError, CheckFinding, CheckResult, CheckRunError,
     CheckStatus, FixResult, configured_commands, is_excused, run_check,
