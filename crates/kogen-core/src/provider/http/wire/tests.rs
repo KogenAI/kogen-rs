@@ -343,9 +343,9 @@ fn build_prefix_is_shared_across_stages_and_static_bytes_across_runs() {
         assert_ne!(bodies[0]["prompt_cache_key"], bodies[3]["prompt_cache_key"]);
         assert_ne!(threads[0], threads[1]);
         let shared_length = match mode {
-            ResponseMode::Lite => 3,
-            ResponseMode::Owned => 2,
-            _ => 1,
+            ResponseMode::Lite => 4,
+            ResponseMode::Owned => 3,
+            _ => 2,
         };
         for body in &bodies[1..3] {
             assert_eq!(

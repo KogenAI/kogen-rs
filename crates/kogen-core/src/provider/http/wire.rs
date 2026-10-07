@@ -143,6 +143,9 @@ impl RequestContext {
         if !text.is_empty() {
             self.input.insert(0, serde_json::json!({"role":"developer","content":[{"type":"input_text","text":text}]}));
         }
+        // Give codecs that inspect input items an explicit static/role boundary.
+        // This also keeps Build data from being mistaken for generic instructions.
+        self.input.insert(0, serde_json::json!({"role":"developer","content":[{"type":"input_text","text":self.shared_instructions}]}));
     }
 }
 
