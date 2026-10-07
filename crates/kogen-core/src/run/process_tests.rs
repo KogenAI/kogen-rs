@@ -14,8 +14,12 @@ fn chatty_child_times_out_and_keeps_bounded_tail() {
     let mut request = ProcessRequest::new("/bin/sh", &root, &root);
     request.args = vec![
         "-c".into(),
-        "while :; do printf '0123456789abcdef'; done".into(),
+        // Fill beyond the retained tail immediately, then exercise the timeout.
+        // Small repeated writes depended on scheduler throughput under parallel gates.
+        "dd if=/dev/zero bs=32768 count=1 2>/dev/null; while :; do printf '0123456789abcdef'; done"
+            .into(),
     ];
+    request.env = BTreeMap::from([("PATH".into(), "/bin:/usr/bin".into())]);
     request.timeout = Duration::from_millis(250);
     request.log_name = "chatty".to_owned();
 
