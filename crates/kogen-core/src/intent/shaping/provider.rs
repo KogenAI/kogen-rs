@@ -54,6 +54,7 @@ impl ShapeProvider {
             })],
         )
         .map_err(provider_io_error)?;
+        context.set_shared_context("");
         configure_tools(&mut context, spec.tools);
         if spec.tools {
             self.accounting.borrow_mut().start_conversation(

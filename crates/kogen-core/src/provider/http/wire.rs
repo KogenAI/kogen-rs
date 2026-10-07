@@ -138,10 +138,11 @@ impl RequestContext {
     /// Place immutable Build data before stage instructions and conversation history.
     pub fn set_shared_context(&mut self, text: &str) {
         self.instructions = self.shared_instructions.clone();
-        self.input.splice(0..0, [
-            serde_json::json!({"role":"developer","content":[{"type":"input_text","text":text}]}),
-            serde_json::json!({"role":"developer","content":[{"type":"input_text","text":self.role_instructions}]}),
-        ]);
+        let role = serde_json::json!({"role":"developer","content":[{"type":"input_text","text":self.role_instructions}]});
+        self.input.insert(0, role);
+        if !text.is_empty() {
+            self.input.insert(0, serde_json::json!({"role":"developer","content":[{"type":"input_text","text":text}]}));
+        }
     }
 }
 
