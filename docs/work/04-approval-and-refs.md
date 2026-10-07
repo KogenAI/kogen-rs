@@ -69,3 +69,31 @@ Generated Quint matrices used `gen --traces 500 --steps 25 --seed <seed>` and `c
 | `approve` | 41 | 0/500 | 699 | `g0000`, step 1: expected `check/acceptance_check_failed`; hash-first source check returned `intent/hash_mismatch` (`sha8=eab21f39`) |
 
 The targeted real-byte adapter control passed on these binaries with temporary `HOME` and isolated temp origins. It supplied `prefixOk=false` while passing the correct source SHA; card exit was 5, the initial approval wrote a real ref, late changed Intent and late changed test each returned `intent/hash_mismatch` while preserving the old ref, same-hash reapproval chained as approval 2, one lost CAS retried in two attempts, and two lost CAS attempts returned `controller/approval_cas_lost` while the observed approval hash/count stayed at the previous value. No provider was contacted by this control.
+
+## Symbolic-digest adapter follow-up (2026-10-07)
+
+The adapter now translates a symbolic Quint digest claim deterministically to a real SHA prefix while preserving the model's match or mismatch result, then verifies that result against the SHA computed from the actual source bytes. Model-owned digest observations remain symbolic where the Quint trace specifies them; approval commits and refs still contain the real byte-derived SHA. The production hash remains SHA-256 over `Intent bytes || NUL || acceptance-test bytes`, as specified. No Quint expectation or conformance case was changed.
+
+Implementation source commit: `739215c2841268e3aa8b778ef16fff2f56b51f40`. Release adapter SHA-256:
+
+| Binary | SHA-256 |
+|---|---|
+| `target/release/kogen-xspec` | `fd6146be8dbe00f8000a8a849d82c15c60069b30946b9838425b11dc668c6fa3` |
+
+`make check` passed with an isolated temporary `HOME` (formatting, clippy, and workspace tests).
+
+Before this follow-up, `INTEGRATION-1.md` recorded `approve` at 3/1,518 and `intent` at 1,063/1,506. The results below are after the adapter fix.
+
+The hand scenarios were regenerated with `xspec.py spec`; each of the six generated matrices below used `gen --traces 500 --steps 25 --seed <seed>` and passed model invariants. The adapter commands replayed every hand and generated trace with full observations and no `--project` projection:
+
+```sh
+XSPEC_SLICE=/tmp/kogen-int2-hash-final-20261007/approve XSPEC_GOLDEN=/tmp/kogen-int2-hash-final-20261007/approve/golden python3 "$HOME/Areas/Kogen/kogen-spec/quint/prototype/harness/xspec.py" conform -- "$PWD/target/release/kogen-xspec" approve
+XSPEC_SLICE=/tmp/kogen-int2-hash-final-20261007/intent XSPEC_GOLDEN=/tmp/kogen-int2-hash-final-20261007/intent/golden python3 "$HOME/Areas/Kogen/kogen-spec/quint/prototype/harness/xspec.py" conform -- "$PWD/target/release/kogen-xspec" intent
+```
+
+| Slice | Hand | Generated | Total agreement | Steps | Failed IDs | First divergence |
+|---|---:|---:|---:|---:|---|---|
+| `approve` | 18/18 | 1,500/1,500 (500 each, seeds 17, 23, 41) | 1,518/1,518 | 37,550 | none | none |
+| `intent` | 6/6 | 1,500/1,500 (500 each, seeds 17, 23, 41) | 1,506/1,506 | 37,534 | none | none |
+
+All named hand scenario IDs in the two slice directories passed; generated IDs `g0000`–`g1499` passed in each slice. The earlier symbolic-digest divergences recorded above are resolved by this adapter follow-up.
