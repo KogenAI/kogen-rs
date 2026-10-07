@@ -1,5 +1,6 @@
 use kogen_core::ExitCode;
 use kogen_core::error::{CliOutput, CoreError, ErrorClass};
+use kogen_core::project::valid_slug;
 use kogen_core::provider::chatgpt;
 use kogen_core::provider::grok;
 use std::io::{Read as _, Write as _};
@@ -61,11 +62,22 @@ pub fn dispatch(command: Command) -> CliOutput {
             };
             provider_output(grok::use_account(&home, &label, project.as_deref()))
         }
+        Command::IntentShape { slug, .. } if !valid_slug(&slug) => {
+            invalid_slug_error().into_cli_output()
+        }
         Command::IntentShape {
             slug,
             request,
             project,
         } => shape_output(shape_command(slug, request, project)),
+        Command::IntentApprove { slug, .. } | Command::IntentRemove { slug, .. }
+            if !valid_slug(&slug) =>
+        {
+            invalid_slug_error().into_cli_output()
+        }
+        Command::Status {
+            slug: Some(slug), ..
+        } if !valid_slug(&slug) => invalid_slug_error().into_cli_output(),
         Command::ProviderLogin { provider }
         | Command::ProviderLogout { provider }
         | Command::ProviderUse { provider, .. } => CoreError::new(
@@ -133,7 +145,7 @@ fn shape_command(
             CoreError::new(
                 ErrorClass::Intent,
                 "request_unavailable",
-                format!("stdin: {error}"),
+                format!("stdin: {}", request_read_error(&error)),
                 ExitCode::Usage,
             )
         })?;
@@ -149,7 +161,7 @@ fn shape_command(
             CoreError::new(
                 ErrorClass::Intent,
                 "request_unavailable",
-                format!("{}: {error}", path.display()),
+                format!("{}: {}", path.display(), request_read_error(&error)),
                 ExitCode::Usage,
             )
         })?;
@@ -263,6 +275,22 @@ fn home_error() -> CliOutput {
         ExitCode::Environment,
     )
     .into_cli_output()
+}
+
+fn invalid_slug_error() -> CoreError {
+    CoreError::new(
+        ErrorClass::Intent,
+        "invalid_slug",
+        "Slug must use lowercase letters, digits, and dashes.",
+        ExitCode::Usage,
+    )
+}
+
+fn request_read_error(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "not found",
+        _ => "unreadable",
+    }
 }
 
 fn with_home<T>(handler: impl FnOnce(&Path) -> Result<T, CoreError>) -> Result<T, CoreError> {

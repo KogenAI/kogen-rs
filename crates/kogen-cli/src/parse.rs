@@ -1,7 +1,5 @@
 use std::path::Path;
 
-use kogen_core::project::valid_slug;
-
 use crate::arguments::{
     build_command, collect_positionals, missing_positional, scan_options, unexpected_positional,
 };
@@ -90,6 +88,12 @@ fn parse_route(route: Route, tail: &[String], page: HelpPage, cwd: &Path) -> Par
             page,
         );
     }
+    if let Some(option) = options.disallowed_option.as_deref() {
+        return usage(
+            format!("kogen {}: unknown option '{option}'", route.path()),
+            page,
+        );
+    }
     if let Some(option) = options.missing_value.as_deref() {
         return usage(
             format!("kogen {}: {option} needs a value", route.path()),
@@ -107,27 +111,6 @@ fn parse_route(route: Route, tail: &[String], page: HelpPage, cwd: &Path) -> Par
             page,
         );
     }
-    if let Some(option) = options.disallowed_option.as_deref() {
-        return usage(
-            format!("kogen {}: unknown option '{option}'", route.path()),
-            page,
-        );
-    }
-
-    if matches!(
-        route,
-        Route::Status | Route::IntentShape | Route::IntentApprove | Route::IntentRemove
-    ) && positional.first().is_some_and(|slug| !valid_slug(slug))
-    {
-        return usage(
-            format!(
-                "kogen {}: <slug> must be 3 to 48 lowercase letters, digits or single dashes",
-                route.path()
-            ),
-            page,
-        );
-    }
-
     match build_command(route, positional, options, cwd) {
         Ok(command) => ParsedRequest::Command(command),
         Err(message) => usage(message, page),
@@ -146,27 +129,47 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn invalid_slugs_are_usage_errors_with_the_route_help_page() {
-        for (args, message, page) in [
-            (
-                vec!["intent", "approve", "--", "--by"],
-                "kogen intent approve: <slug> must be 3 to 48 lowercase letters, digits or single dashes",
-                HelpPage::IntentApprove,
-            ),
-            (
-                vec!["status", "ab"],
-                "kogen status: <slug> must be 3 to 48 lowercase letters, digits or single dashes",
-                HelpPage::Status,
-            ),
+    fn invalid_slug_validation_is_deferred_to_the_command_handler() {
+        for args in [
+            vec!["intent", "approve", "--", "--by"],
+            vec!["status", "ab"],
+            vec!["intent", "shape", "a--b", "-"],
         ] {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            assert_eq!(
+            assert!(matches!(
                 parse(&args, Path::new("/checkout")),
-                ParsedRequest::Usage(UsageError {
-                    message: message.to_owned(),
-                    page,
-                })
-            );
+                ParsedRequest::Command(_)
+            ));
         }
+    }
+
+    #[test]
+    fn disallowed_option_precedes_missing_positionals() {
+        let args = ["intent", "shape", "greet", "--json"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse(&args, Path::new("/checkout")),
+            ParsedRequest::Usage(UsageError {
+                message: "kogen intent shape: unknown option '--json'".to_owned(),
+                page: HelpPage::IntentShape,
+            })
+        );
+    }
+
+    #[test]
+    fn disallowed_value_option_precedes_missing_value() {
+        let args = ["provider", "login", "chatgpt", "--as"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse(&args, Path::new("/checkout")),
+            ParsedRequest::Usage(UsageError {
+                message: "kogen provider login: unknown option '--as'".to_owned(),
+                page: HelpPage::ProviderLogin,
+            })
+        );
     }
 }

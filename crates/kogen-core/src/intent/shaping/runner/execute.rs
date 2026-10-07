@@ -29,7 +29,7 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         return Err(shape_error(
             ErrorClass::Intent,
             "invalid_slug",
-            format!("invalid slug {}", options.slug),
+            "Slug must use lowercase letters, digits, and dashes.",
             crate::ExitCode::Usage,
         ));
     }

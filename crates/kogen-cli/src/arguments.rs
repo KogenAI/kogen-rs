@@ -39,6 +39,9 @@ pub(super) fn scan_options(route: Route, tail: &[String]) -> Options {
                 }
             }
             "--project" | "--origin" | "--base" | "--by" | "--as" => {
+                if !option_allowed(route, name) {
+                    options.disallowed_option.get_or_insert(name.to_owned());
+                }
                 let value = if let Some(value) = attached {
                     Some(value.to_owned())
                 } else if index + 1 < tail.len() && tail[index + 1] != "--" {
@@ -55,9 +58,6 @@ pub(super) fn scan_options(route: Route, tail: &[String]) -> Options {
                         "--by" => options.by = Some(value),
                         "--as" => options.as_label = Some(value),
                         _ => unreachable!(),
-                    }
-                    if !option_allowed(route, name) {
-                        options.disallowed_option.get_or_insert(name.to_owned());
                     }
                 } else {
                     options.missing_value.get_or_insert(name.to_owned());
