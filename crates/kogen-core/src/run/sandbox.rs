@@ -22,6 +22,7 @@ pub struct SandboxPolicy {
     forced_unavailable: Option<String>,
     verify_integrity: bool,
     writable_paths: Vec<PathBuf>,
+    write_denied_paths: Vec<PathBuf>,
     protected_paths: Vec<PathBuf>,
 }
 
@@ -36,6 +37,7 @@ impl SandboxPolicy {
             forced_unavailable: None,
             verify_integrity: false,
             writable_paths: vec![workspace, run_dir, PathBuf::from("/tmp")],
+            write_denied_paths: Vec::new(),
             protected_paths: Vec::new(),
         }
     }
@@ -103,6 +105,10 @@ impl SandboxPolicy {
 
     pub fn protect_read(&mut self, path: impl Into<PathBuf>) {
         self.protected_paths.push(path.into());
+    }
+
+    pub fn deny_write(&mut self, path: impl Into<PathBuf>) {
+        self.write_denied_paths.push(path.into());
     }
 
     #[must_use]

@@ -84,6 +84,11 @@ pub struct GateReport {
     pub acceptance: CommandAcceptanceResult,
     pub protection_findings: Vec<ProtectedFinding>,
     pub restored_paths: Vec<String>,
+    pub demoted_items: BTreeSet<String>,
+    checks_green: bool,
+    fixes_green: bool,
+    tree_stable: bool,
+    change_items: BTreeSet<String>,
     change_item_passes: bool,
     receipt: Option<VerificationReceipt>,
 }
@@ -102,6 +107,44 @@ impl GateReport {
     #[must_use]
     pub fn receipt(&self) -> Option<&VerificationReceipt> {
         self.receipt.as_ref()
+    }
+
+    pub(crate) fn apply_audit_demotions(&mut self, item_ids: &[String]) {
+        self.demoted_items.extend(
+            item_ids
+                .iter()
+                .filter(|id| self.acceptance.item_pass.contains_key(*id))
+                .cloned(),
+        );
+        let acceptance_green = !self.acceptance.item_pass.is_empty()
+            && self.acceptance.failures.is_empty()
+            && self
+                .acceptance
+                .item_pass
+                .iter()
+                .all(|(id, passed)| *passed || self.demoted_items.contains(id));
+        let verified = self.fixes_green
+            && self.checks_green
+            && acceptance_green
+            && self.protection_findings.is_empty()
+            && self.tree_stable;
+        self.verdict = if verified {
+            GateVerdict::Green
+        } else {
+            GateVerdict::Unverified
+        };
+        self.receipt = if verified {
+            self.verified_tree
+                .as_ref()
+                .map(|tree_id| VerificationReceipt {
+                    tree_id: tree_id.clone(),
+                })
+        } else {
+            None
+        };
+        self.change_item_passes = self.change_items.iter().any(|id| {
+            self.acceptance.item_pass.get(id) == Some(&true) && !self.demoted_items.contains(id)
+        });
     }
 }
 
@@ -335,6 +378,11 @@ pub fn run_gate(runner: &dyn ProcessPort, request: &GateRequest) -> Result<GateR
         acceptance,
         protection_findings,
         restored_paths: support::deduplicate_paths(restored_paths),
+        demoted_items: BTreeSet::new(),
+        checks_green,
+        fixes_green,
+        tree_stable,
+        change_items: request.acceptance.change_items.clone(),
         change_item_passes: changed_item_passes,
         receipt,
     })

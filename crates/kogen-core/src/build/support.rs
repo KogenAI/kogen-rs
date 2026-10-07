@@ -52,7 +52,7 @@ impl SandboxIntegrityPort for IntegritySnapshot {
 }
 
 pub(super) fn sandboxed<'a>(
-    _project: &ProjectResolution,
+    project: &ProjectResolution,
     options: &BuildOptions,
     workspace: &Path,
     run_dir: &Path,
@@ -60,12 +60,14 @@ pub(super) fn sandboxed<'a>(
     integrity: &'a IntegritySnapshot,
 ) -> SandboxedProcessPort<'a> {
     let host = crate::run::host_environment();
-    let policy = SandboxPolicy::for_build(options.sandbox, workspace, run_dir, &host);
+    let mut policy = SandboxPolicy::for_build(options.sandbox, workspace, run_dir, &host);
+    policy.deny_write(project.checkout.clone());
+    policy.deny_write(project.origin.clone());
     SandboxedProcessPort::new(process, policy, Some(integrity))
 }
 
 pub(super) fn sandboxed_pair<'a>(
-    _project: &ProjectResolution,
+    project: &ProjectResolution,
     options: &BuildOptions,
     candidate: &Path,
     base: &Path,
@@ -76,6 +78,8 @@ pub(super) fn sandboxed_pair<'a>(
     let host = crate::run::host_environment();
     let mut policy = SandboxPolicy::for_build(options.sandbox, candidate, run_dir, &host);
     policy.allow_write(base.to_path_buf());
+    policy.deny_write(project.checkout.clone());
+    policy.deny_write(project.origin.clone());
     SandboxedProcessPort::new(process, policy, Some(integrity))
 }
 
@@ -147,7 +151,7 @@ pub(super) fn run_setup_cached(
     run_dir: &Path,
     environment: &ChildEnvironment,
 ) -> Result<(String, crate::run::setup_cache::SetupCacheOutcome), CoreError> {
-    let tree = crate::git::GitRepo::new(workspace)
+    let tree = crate::git::GitRepo::workspace(workspace)
         .resolve_tree("HEAD")
         .map_err(|error| environment_error("setup_key_failed", error.to_string()))?;
     let key = crate::run::setup_cache::SetupCacheKey::from_project(

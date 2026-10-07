@@ -162,10 +162,13 @@ fn append_build_details(output: &mut String, run: &kogen_core::status::StatusRun
             .filter_map(|item| string(item, "id"))
             .collect::<Vec<_>>();
         if !verified.is_empty() || !remaining.is_empty() {
-            output.push_str(&format!("  acceptance verified: {}\n", verified.join(", ")));
+            output.push_str(&format!(
+                "  acceptance verified: {}\n",
+                display_ids(&verified)
+            ));
             output.push_str(&format!(
                 "  acceptance remaining: {}\n",
-                remaining.join(", ")
+                display_ids(&remaining)
             ));
         }
     }
@@ -184,6 +187,14 @@ fn string<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
 
 fn integer(event: &Value, key: &str) -> Option<i64> {
     event.get(key).and_then(Value::as_i64)
+}
+
+fn display_ids(ids: &[&str]) -> String {
+    if ids.is_empty() {
+        "-".to_owned()
+    } else {
+        ids.join(", ")
+    }
 }
 
 pub(super) fn building_detail(intent: &IntentStatus, report: &StatusReport) -> String {
@@ -233,4 +244,15 @@ fn duration(milliseconds: i64) -> String {
 
 pub(super) fn short_id(value: &str) -> &str {
     value.get(..8).unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_ids;
+
+    #[test]
+    fn empty_acceptance_progress_lists_render_a_dash() {
+        assert_eq!(display_ids(&[]), "-");
+        assert_eq!(display_ids(&["A1", "A2"]), "A1, A2");
+    }
 }

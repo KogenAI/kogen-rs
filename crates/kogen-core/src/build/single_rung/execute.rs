@@ -7,8 +7,10 @@ use super::{BuildOutcome, BuildStatus};
 mod helpers;
 mod start;
 use crate::error::CoreError;
+use crate::gate::GateVerdict;
 use crate::git::landing::LandingRepository;
 use crate::project::ProjectResolution;
+use crate::run::orchestration::{BuildAuditRequest, BuildAuditor};
 use crate::run::{RunEvent, RunSnapshot, RunStore};
 use helpers::*;
 use serde_json::{Value, json};
@@ -179,8 +181,10 @@ fn run_rung(
         &protection,
         matches!(options.recipe.as_str(), "direct" | "direct-escalate"),
     )?;
-    drop(provider);
-    let report = run_gate(
+    candidate
+        .reset_workspace_git_settings()
+        .map_err(|error| controller_error("workspace_git_config_failed", error.to_string()))?;
+    let mut report = run_gate(
         project,
         approved,
         options,
@@ -192,18 +196,93 @@ fn run_rung(
         &child_env,
         protection,
     )?;
+    candidate
+        .reset_workspace_git_settings()
+        .map_err(|error| controller_error("workspace_git_config_failed", error.to_string()))?;
     let tree = report.verified_tree.clone().unwrap_or(
         crate::gate::snapshot_tree(candidate.workspace())
             .map_err(|error| environment_error("candidate_snapshot_failed", error.to_string()))?,
     );
+    let diff = candidate_diff(candidate.workspace(), base_sha, &tree)?;
+    let failed_ids = report
+        .acceptance
+        .item_pass
+        .iter()
+        .filter_map(|(id, passed)| (!passed).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    let acceptance_only_red = report.verdict == GateVerdict::Unverified
+        && report.verified_tree.is_some()
+        && report.checks.iter().all(|check| !check.blocks_gate())
+        && report
+            .fix_results
+            .iter()
+            .all(crate::gate::FixResult::passed)
+        && report.acceptance.failures.is_empty()
+        && !failed_ids.is_empty()
+        && report.protection_findings.is_empty();
+    let witness_mode = approved
+        .approval
+        .get("witness")
+        .is_some_and(|witness| !witness.is_null());
+    let mut auditor = BuildAuditor::default();
+    let pending_audit = auditor.begin_rung_audit(&failed_ids, acceptance_only_red, witness_mode);
+    if !pending_audit.is_empty() {
+        let request = BuildAuditRequest {
+            ids: pending_audit.clone(),
+            request: approved.intent.request.clone().unwrap_or_default(),
+            test_source: String::from_utf8_lossy(&approved.acceptance_bytes).into_owned(),
+            failure_output: String::from_utf8_lossy(&report.acceptance.process.output_tail)
+                .into_owned(),
+            candidate_diff: String::from_utf8_lossy(&diff).into_owned(),
+        };
+        let reply = provider.audit(run_dir, &request)?;
+        let dispositions = auditor.complete_rung_audit(&pending_audit, &reply);
+        provider.record_event(
+            &RunEvent::new("audit", now_ms())
+                .with("rung", json!("R1"))
+                .with(
+                    "items",
+                    json!(
+                        dispositions
+                            .iter()
+                            .map(|item| json!({
+                                "id":item.id,
+                                "verdict":item.verdict.as_str(),
+                                "reason":item.reason,
+                            }))
+                            .collect::<Vec<_>>()
+                    ),
+                ),
+        )?;
+        let demoted_ids = dispositions
+            .iter()
+            .filter(|item| item.demote)
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        report.apply_audit_demotions(&demoted_ids);
+        for item in dispositions {
+            let event = if item.demote {
+                "acceptance_demoted"
+            } else {
+                "acceptance_upheld"
+            };
+            provider.record_event(
+                &RunEvent::new(event, now_ms())
+                    .with("rung", json!("R1"))
+                    .with("id", json!(item.id))
+                    .with("verdict", json!(item.verdict.as_str()))
+                    .with("reason", json!(item.reason)),
+            )?;
+        }
+    }
+    drop(provider);
+    write_private(&run_dir.join("candidate-R1.diff"), &diff)?;
+    write_private(&run_dir.join("candidate.diff"), &diff)?;
     let verdict = if report.is_landable() {
         "green"
     } else {
         "unverified"
     };
-    let diff = candidate_diff(candidate.workspace(), base_sha)?;
-    write_private(&run_dir.join("candidate-R1.diff"), &diff)?;
-    write_private(&run_dir.join("candidate.diff"), &diff)?;
     let setup_outputs = options
         .setup_outputs
         .iter()
@@ -220,6 +299,7 @@ fn run_rung(
         .map_err(|error| controller_error("candidate_commit_failed", error.to_string()))?;
     publish_candidate(
         candidate.workspace(),
+        candidate.origin(),
         &candidate_commit.commit,
         &snapshot.run_id,
     )?;
@@ -334,11 +414,7 @@ fn run_rung(
             commit,
             verdict: "green".to_owned(),
             reason: String::new(),
-            stderr: [sandbox_warning, warnings.join("\n")]
-                .into_iter()
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
+            stderr: landing_stderr(&sandbox_warning, &warnings),
             has_run: true,
         }),
         crate::git::landing::LandingOutcome::Parked { commit, reason, .. } => {
@@ -370,5 +446,35 @@ fn run_rung(
                 has_run: true,
             })
         }
+    }
+}
+
+fn landing_stderr(sandbox_warning: &str, warnings: &[String]) -> String {
+    let mut stderr = sandbox_warning.to_owned();
+    for warning in warnings {
+        stderr.push_str(warning.trim_end_matches('\n'));
+        stderr.push('\n');
+    }
+    stderr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::landing_stderr;
+
+    #[test]
+    fn landing_warnings_end_with_newlines() {
+        let warning = "land: warning: checkout is dirty".to_owned();
+        assert_eq!(
+            landing_stderr("", std::slice::from_ref(&warning)),
+            format!("{warning}\n")
+        );
+        assert_eq!(
+            landing_stderr(
+                "kogen: warning: sandbox unavailable\n",
+                std::slice::from_ref(&warning)
+            ),
+            format!("kogen: warning: sandbox unavailable\n{warning}\n")
+        );
     }
 }

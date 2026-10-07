@@ -180,28 +180,42 @@ pub(super) fn base_acceptance_text(
         .join("\n")
 }
 
-pub(super) fn candidate_diff(workspace: &Path, base: &str) -> Result<Vec<u8>, CoreError> {
-    let repo = crate::git::GitRepo::new(workspace);
-    let _ = repo.output(&["add", "-N", "--all"]);
-    repo.output(&["diff", "--binary", base, "--"])
+pub(super) fn candidate_diff(
+    workspace: &Path,
+    base: &str,
+    tree: &str,
+) -> Result<Vec<u8>, CoreError> {
+    crate::git::GitRepo::workspace(workspace)
+        .output(&[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            base,
+            tree,
+            "--",
+        ])
         .map_err(|error| environment_error("candidate_diff_failed", error.to_string()))
 }
 
 pub(super) fn publish_candidate(
     workspace: &Path,
+    origin: &Path,
     commit: &str,
     run_id: &str,
 ) -> Result<(), CoreError> {
     let reference = format!("refs/kogen/candidates/{run_id}/R1");
     let lease = format!("--force-with-lease={reference}:");
     let source = format!("{commit}:{reference}");
-    crate::git::GitRepo::new(workspace)
+    let origin = origin.to_string_lossy();
+    crate::git::GitRepo::workspace(workspace)
         .output(&[
             "push",
             "--porcelain",
             "--no-recurse-submodules",
+            "--no-verify",
             &lease,
-            "origin",
+            &origin,
             &source,
         ])
         .map_err(|error| environment_error("candidate_publish_failed", error.to_string()))?;
@@ -242,7 +256,7 @@ pub(super) fn acceptance_json(report: &crate::gate::GateReport) -> Value {
             .map(|(id, passed)| json!({
                 "id":id,
                 "status":if *passed {"passed"} else {"failed"},
-                "demoted":false
+                "demoted":report.demoted_items.contains(id)
             }))
             .collect::<Vec<_>>()
     )
@@ -257,4 +271,97 @@ pub(super) fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gate::snapshot_tree;
+    use crate::git::GitRepo;
+    use crate::git::landing::LandingRepository;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn candidate_diff_ignores_workspace_filter_and_exclude_controls() {
+        let root = test_dir();
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        git(
+            &root,
+            &["init", "--bare", "--initial-branch=main", path(&origin)],
+        );
+        git(&root, &["init", "--initial-branch=main", path(&seed)]);
+        kogen_test_support::set_identity(&seed, "Kogen Test", "test@kogen.invalid")
+            .expect("set fixture identity");
+        fs::write(seed.join("greet.txt"), b"Hello!\n").expect("write base file");
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-m", "base"]);
+        git(&seed, &["remote", "add", "origin", path(&origin)]);
+        git(&seed, &["push", "origin", "main"]);
+        let base = GitRepo::new(&origin)
+            .resolve_commit("refs/heads/main")
+            .expect("resolve base");
+        let repository = LandingRepository::clone_fresh(&origin, &workspace, &base)
+            .expect("clone candidate workspace");
+
+        fs::write(workspace.join("greet.txt"), b"Hello, Almir!\n")
+            .expect("write changed tracked file");
+        fs::create_dir_all(workspace.join("lib")).expect("create hidden file directory");
+        fs::write(workspace.join("lib/hidden.txt"), b"secret\n")
+            .expect("write excluded untracked file");
+        let marker = root.join("filter-ran");
+        let filter = format!("sh -c 'touch {}; cat'", path(&marker));
+        git(
+            &workspace,
+            &["config", "filter.evil.clean", filter.as_str()],
+        );
+        git(&workspace, &["config", "filter.evil.smudge", "cat"]);
+        fs::write(workspace.join(".git/info/attributes"), "* filter=evil\n")
+            .expect("install workspace filter attribute");
+        fs::write(workspace.join(".git/info/exclude"), "lib/hidden.txt\n")
+            .expect("install workspace exclude");
+
+        repository
+            .reset_workspace_git_settings()
+            .expect("restore trusted workspace Git settings");
+        let tree = snapshot_tree(&workspace).expect("snapshot every workspace file");
+        let diff = candidate_diff(&workspace, &base, &tree).expect("render candidate diff");
+        let diff = String::from_utf8_lossy(&diff);
+        assert!(diff.contains("lib/hidden.txt"), "diff was {diff}");
+        assert!(diff.contains("secret"), "diff was {diff}");
+        assert!(!marker.exists(), "workspace clean filter ran");
+        assert!(!workspace.join(".git/info/attributes").exists());
+        assert!(!workspace.join(".git/info/exclude").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn git(directory: &Path, args: &[&str]) {
+        let output = kogen_test_support::git_command()
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .expect("run fixture Git command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn path(path: &Path) -> &str {
+        path.to_str().expect("temporary path is UTF-8")
+    }
+
+    fn test_dir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kogen-candidate-diff-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("create candidate diff fixture root");
+        path
+    }
 }

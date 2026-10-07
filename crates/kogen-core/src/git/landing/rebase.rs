@@ -17,7 +17,7 @@ pub(super) fn rebase_candidate(
 ) -> Result<RebaseAttempt, LandingError> {
     check_commit(new_parent)?;
     let reference = base_ref(branch)?;
-    let repo = GitRepo::new(repository.workspace());
+    let repo = GitRepo::workspace(repository.workspace());
     git(
         repository.workspace(),
         &args(&[

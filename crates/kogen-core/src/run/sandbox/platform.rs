@@ -119,6 +119,14 @@ fn macos_profile(policy: &SandboxPolicy) -> String {
             ));
         }
     }
+    for path in normalized_paths(&policy.write_denied_paths) {
+        if let Some(path) = path.to_str() {
+            profile.push_str(&format!(
+                "(deny file-write* (subpath {}))\n",
+                sbpl_literal(path)
+            ));
+        }
+    }
     profile
 }
 
@@ -160,6 +168,16 @@ fn prepare_linux(
             continue;
         }
         push_path_mount(&mut args, "--bind", &path)?;
+    }
+    for path in policy
+        .write_denied_paths
+        .iter()
+        .map(|path| canonical_path(path))
+        .collect::<BTreeSet<_>>()
+    {
+        if path.exists() {
+            push_path_mount(&mut args, "--ro-bind", &path)?;
+        }
     }
     for path in policy
         .protected_paths
@@ -221,7 +239,7 @@ fn push_path_mount(
         )));
     }
     args.extend([OsString::from(option), path.as_os_str().to_owned()]);
-    if option == "--bind" {
+    if matches!(option, "--bind" | "--ro-bind") {
         args.push(path.as_os_str().to_owned());
     }
     Ok(())

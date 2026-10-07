@@ -50,7 +50,8 @@ pub(super) fn render_overview(report: &StatusReport) -> String {
     } else {
         output.push_str("Queue: stopped\n");
     }
-    if let Some(slug) = queue.first()
+    if report.queue_pid.is_none()
+        && let Some(slug) = queue.first()
         && let Some(intent) = find(report, slug)
     {
         let dependencies = if intent.facts.dependencies.is_empty() {

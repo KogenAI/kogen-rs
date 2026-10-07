@@ -36,6 +36,7 @@ pub struct WorktreeUpdate {
 pub struct LandingRepository {
     workspace: PathBuf,
     origin: PathBuf,
+    object_format: &'static str,
 }
 
 impl LandingRepository {
@@ -74,7 +75,20 @@ impl LandingRepository {
             let _ = fs::remove_dir_all(&workspace);
             return Err(error);
         }
-        let repo = Self { workspace, origin };
+        let object_format = if base_commit.len() == 64 {
+            "sha256"
+        } else {
+            "sha1"
+        };
+        let repo = Self {
+            workspace,
+            origin,
+            object_format,
+        };
+        if let Err(error) = repo.reset_workspace_git_settings() {
+            let _ = fs::remove_dir_all(&repo.workspace);
+            return Err(error);
+        }
         let checkout = [
             arg("checkout"),
             arg("--detach"),
@@ -96,6 +110,46 @@ impl LandingRepository {
     #[must_use]
     pub fn origin(&self) -> &Path {
         &self.origin
+    }
+
+    /// Restore the small trusted Git configuration Kogen uses in a build workspace.
+    /// Candidate code can change the workspace's config and info files, so call this
+    /// again after project code has run and before Kogen performs Git operations.
+    pub fn reset_workspace_git_settings(&self) -> Result<(), LandingError> {
+        let git_dir = self.workspace.join(".git");
+        let metadata = fs::symlink_metadata(&git_dir).map_err(|error| {
+            LandingError::io("inspect workspace Git directory", &git_dir, error)
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(LandingError::invalid(
+                "reset workspace Git settings",
+                ".git is not a workspace Git directory",
+            ));
+        }
+
+        let config = git_dir.join("config");
+        remove_workspace_entry(&config)?;
+        let info = git_dir.join("info");
+        if fs::symlink_metadata(&info).is_ok_and(|metadata| !metadata.file_type().is_dir()) {
+            remove_workspace_entry(&info)?;
+        }
+        fs::create_dir_all(&info).map_err(|error| {
+            LandingError::io("create workspace Git info directory", &info, error)
+        })?;
+        for name in ["exclude", "attributes"] {
+            remove_workspace_entry(&info.join(name))?;
+        }
+
+        let origin = config_quote(&self.origin.to_string_lossy());
+        let (repository_version, extension) = match self.object_format {
+            "sha256" => (1, "\n[extensions]\n\tobjectformat = sha256\n"),
+            _ => (0, ""),
+        };
+        let contents = format!(
+            "[core]\n\trepositoryformatversion = {repository_version}\n\tfilemode = true\n\tbare = false\n\thooksPath = /dev/null\n\tfsmonitor = false\n\tautocrlf = false\n\texcludesfile = /dev/null\n\tattributesfile = /dev/null\n[remote \"origin\"]\n\turl = {origin}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n{extension}"
+        );
+        fs::write(&config, contents)
+            .map_err(|error| LandingError::io("write trusted workspace Git config", &config, error))
     }
 
     pub fn current_base(&self, branch: &str) -> Result<String, LandingError> {
@@ -205,7 +259,7 @@ impl LandingRepository {
         check_commit(commit)?;
         check_commit(expected_parent)?;
         check_commit(expected_tree)?;
-        let repo = GitRepo::new(&self.workspace);
+        let repo = GitRepo::workspace(&self.workspace);
         let parents = repo.text(&["show", "-s", "--format=%P", commit])?;
         let tree = repo.resolve_tree(commit)?;
         if parents != expected_parent {
@@ -330,4 +384,40 @@ impl LandingRepository {
         fs::remove_dir_all(&self.workspace)
             .map_err(|error| LandingError::io("remove landing workspace", &self.workspace, error))
     }
+}
+
+fn remove_workspace_entry(path: &Path) -> Result<(), LandingError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(LandingError::io(
+                "inspect workspace Git setting",
+                path,
+                error,
+            ));
+        }
+    };
+    let result = if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|error| LandingError::io("remove workspace Git setting", path, error))
+}
+
+fn config_quote(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }

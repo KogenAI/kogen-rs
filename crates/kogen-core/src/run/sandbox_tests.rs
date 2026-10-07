@@ -184,6 +184,52 @@ fn macos_profile_allows_workspace_writes_and_denies_secret_reads() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_build_policy_denies_checkout_and_origin_under_tmp() {
+    let root =
+        PathBuf::from("/tmp").join(format!("kogen-sandbox-deny-write-{}", std::process::id()));
+    let workspace = root.join("workspace");
+    let run_dir = root.join("run");
+    let checkout = root.join("checkout");
+    let origin = root.join("origin");
+    for path in [&workspace, &run_dir, &checkout, &origin] {
+        fs::create_dir_all(path).expect("create sandbox fixture directory");
+    }
+    let allowed = workspace.join("allowed.txt");
+    let checkout_write = checkout.join("escaped.txt");
+    let origin_write = origin.join("escaped.txt");
+    let command = format!(
+        "printf allowed > '{}' && if printf denied > '{}'; then exit 42; fi && if printf denied > '{}'; then exit 43; fi",
+        allowed.display(),
+        checkout_write.display(),
+        origin_write.display()
+    );
+    let mut request = ProcessRequest::new("/bin/sh", &workspace, &run_dir);
+    request.args = vec!["-c".into(), command.into()];
+    request.env = ChildEnvironment::from([
+        ("HOME".into(), root.join("home").into_os_string()),
+        ("PATH".into(), "/bin:/usr/bin".into()),
+    ]);
+    let supervisor = ProcessSupervisor;
+    let mut policy = SandboxPolicy::new(true, &workspace, &run_dir);
+    policy.deny_write(&checkout);
+    policy.deny_write(&origin);
+    let sandboxed = SandboxedProcessPort::new(&supervisor, policy, None);
+    let result = sandboxed.run(request).expect("sandboxed process");
+    assert_eq!(
+        result.exit_status,
+        Some(0),
+        "sandbox output: {}",
+        String::from_utf8_lossy(&result.output_tail)
+    );
+    assert_eq!(fs::read_to_string(allowed).unwrap(), "allowed");
+    assert!(!checkout_write.exists());
+    assert!(!origin_write.exists());
+    assert_eq!(result.sandbox.unwrap().status, SandboxStatus::Confined);
+    let _ = fs::remove_dir_all(root);
+}
+
 fn test_dir(label: &str) -> PathBuf {
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(

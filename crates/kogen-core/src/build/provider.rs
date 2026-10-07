@@ -2,8 +2,8 @@ use super::approval::ApprovedBuild;
 use super::config::BuildOptions;
 use super::provider_error::provider_error;
 use super::provider_prompt::{
-    append_transcript, builder_instructions, builder_message, now_ms, planner_instructions,
-    user_item, workspace_changed,
+    append_transcript, auditor_instructions, builder_instructions, builder_message, now_ms,
+    planner_instructions, user_item, workspace_changed,
 };
 use crate::error::CoreError;
 use crate::project::ProjectResolution;
@@ -123,6 +123,41 @@ impl<'a> BuildProvider<'a> {
             }),
         )?;
         Ok((format!("{difficulty}\0{}", call.response.text), elapsed))
+    }
+
+    pub fn audit(
+        &mut self,
+        run_dir: &Path,
+        request: &crate::run::orchestration::BuildAuditRequest,
+    ) -> Result<String, CoreError> {
+        let mut context = self.request_context(
+            run_dir,
+            "audit",
+            "auditor",
+            "gpt-6.1-sol",
+            "high",
+            auditor_instructions(),
+            vec![user_item(&request.user_message())],
+            Vec::new(),
+            Vec::new(),
+            false,
+        )?;
+        context.tool_choice = "none".to_owned();
+        let before = Instant::now();
+        let call = self.call(&mut context, "auditor", "audit", None)?;
+        let elapsed = before.elapsed().as_millis() as u64;
+        self.record_call("audit", "R1", &call, elapsed)?;
+        append_transcript(
+            self.store,
+            json!({
+                "stage":"audit",
+                "model":context.model,
+                "input":context.input,
+                "text":&call.response.text,
+                "raw_items":&call.response.raw_items,
+            }),
+        )?;
+        Ok(call.response.text)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -77,6 +77,20 @@ fn failed_tagged_acceptance_item_refuses_a_green_check() {
     fixture.remove();
 }
 
+#[test]
+fn demoting_a_failed_change_item_rescores_but_does_not_land_it_alone() {
+    let fixture = Fixture::new("demoted-change-item");
+    let runner = Runner::new(Some(0), LedgerStatus::Failed);
+    let mut report =
+        run_gate(&runner, &fixture.request(BTreeSet::from(["A1".to_owned()]))).unwrap();
+    report.apply_audit_demotions(&["A1".to_owned()]);
+    assert_eq!(report.verdict, GateVerdict::Green);
+    assert!(report.is_verified());
+    assert!(!report.is_landable());
+    assert!(report.demoted_items.contains("A1"));
+    fixture.remove();
+}
+
 struct Fixture {
     root: PathBuf,
     base: PathBuf,

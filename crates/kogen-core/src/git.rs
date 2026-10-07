@@ -12,9 +12,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_INDEX: AtomicU64 = AtomicU64::new(0);
 
+const WORKSPACE_SAFE_CONFIG: &[&str] = &[
+    "core.hooksPath=/dev/null",
+    "core.fsmonitor=false",
+    "core.autocrlf=false",
+    "core.filemode=true",
+    "core.excludesFile=/dev/null",
+    "core.attributesFile=/dev/null",
+    "commit.gpgsign=false",
+];
+
 #[derive(Clone, Debug)]
 pub struct GitRepo {
     path: PathBuf,
+    workspace: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,7 +45,19 @@ impl std::error::Error for GitError {}
 impl GitRepo {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            workspace: false,
+        }
+    }
+
+    /// A build workspace whose local and global Git controls must not run Kogen commands.
+    #[must_use]
+    pub fn workspace(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            workspace: true,
+        }
     }
 
     #[must_use]
@@ -54,9 +77,11 @@ impl GitRepo {
     ) -> Result<Vec<u8>, GitError> {
         let mut command = Command::new("git");
         command
+            .args(self.safe_workspace_args())
             .args(args)
             .current_dir(&self.path)
             .envs(env.iter().copied());
+        self.configure_workspace_environment(&mut command);
         #[cfg(any(test, feature = "hermetic-git-tests"))]
         kogen_test_support::configure_git_command(&mut command);
         if input.is_some() {
@@ -92,6 +117,24 @@ impl GitRepo {
             });
         }
         Ok(output.stdout)
+    }
+
+    fn safe_workspace_args(&self) -> impl Iterator<Item = OsString> + '_ {
+        self.workspace
+            .then_some(WORKSPACE_SAFE_CONFIG)
+            .into_iter()
+            .flatten()
+            .flat_map(|value| [OsString::from("-c"), OsString::from(*value)])
+    }
+
+    fn configure_workspace_environment(&self, command: &mut Command) {
+        if self.workspace {
+            command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_ATTR_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0");
+        }
     }
 
     pub fn text(&self, args: &[&str]) -> Result<String, GitError> {

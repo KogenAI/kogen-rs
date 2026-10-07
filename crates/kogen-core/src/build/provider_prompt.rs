@@ -10,6 +10,13 @@ pub(super) fn planner_instructions() -> String {
     "You are Kogen's planner. Produce a one-shot implementation plan for a cheaper coding agent. Return Difficulty: easy or hard, then ## Acceptance criteria, ## Technical approach, and ## Implementation steps.".to_owned()
 }
 
+pub(super) fn auditor_instructions() -> String {
+    format!(
+        "{} Check whether each failed acceptance test follows the verbatim Request. Reply with JSON only in this form: {{\"items\":[{{\"id\":\"A1\",\"verdict\":\"valid|over_strict|contradicts\",\"reason\":\"...\"}}]}}.",
+        crate::run::orchestration::BUILD_AUDITOR_MARKER
+    )
+}
+
 pub(super) fn builder_instructions(direct: bool) -> String {
     let access = if direct {
         "Use read, search, edit, write and shell tools as needed."
