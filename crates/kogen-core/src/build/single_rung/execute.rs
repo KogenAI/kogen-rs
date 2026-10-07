@@ -387,7 +387,7 @@ fn run_rung(
         .fields
         .insert("sandbox_warning".to_owned(), json!(sandbox_warning));
     let run_id = snapshot.run_id.clone();
-    let mut provider = BuildProvider::new(project, approved, options, store)?;
+    let mut provider = BuildProvider::new(project, approved, options, store, base_sha)?;
     let account = provider.account().clone();
     record_started(
         &mut provider,
@@ -1597,7 +1597,7 @@ pub(super) fn run_witness_build(
     let child_env = support::child_environment(project, run_dir, candidate.workspace(), options)?;
     let base_env = support::child_environment(project, run_dir, base.workspace(), options)?;
     let sandbox = probe_sandbox(&builder_runner, candidate.workspace(), run_dir, &child_env)?;
-    let mut provider = BuildProvider::new(project, approved, options, store)?;
+    let mut provider = BuildProvider::new(project, approved, options, store, base_sha)?;
     let account = provider.account().clone();
     record_started(
         &mut provider,

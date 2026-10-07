@@ -69,6 +69,7 @@ impl<'a> BuildProvider<'a> {
         approved: &'a ApprovedBuild,
         options: &'a BuildOptions,
         store: &'a RunStore,
+        base_sha: &str,
     ) -> Result<Self, CoreError> {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -108,7 +109,7 @@ impl<'a> BuildProvider<'a> {
             http,
             clock: SystemClock::default(),
             shared_tools: shared_build_tool_schemas(tool_role),
-            shared_context: shared_build_context(project, approved, options)?,
+            shared_context: shared_build_context(project, approved, options, base_sha)?,
         })
     }
 
@@ -957,6 +958,7 @@ fn shared_build_context(
     project: &ProjectResolution,
     approved: &ApprovedBuild,
     options: &BuildOptions,
+    base_sha: &str,
 ) -> Result<String, CoreError> {
     let files = if matches!(
         options.recipe.as_str(),
@@ -965,7 +967,7 @@ fn shared_build_context(
         "No repository file list was supplied.".to_owned()
     } else {
         crate::git::GitRepo::new(&project.origin)
-            .list_paths(&approved.base_sha)
+            .list_paths(base_sha)
             .map_err(|error| super::environment_error("base_files_unavailable", error.to_string()))?
             .join("\n")
     };
