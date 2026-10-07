@@ -362,3 +362,45 @@ All hand scenarios passed the Quint model checks (`xspec.py spec`). Every genera
 The public parser constructs `QueueStart`/`QueueStop`, but `crates/kogen-cli/src/handlers.rs` still falls through to `controller/internal_error: command handler is not available` for those commands. This blocks queue/Build-dependent guaranteed black-box cases across `cli`, `state`, `approval`, `build`, `provider`, `custody`, and v1.2, and causes later “no run found” or fake-request wait timeouts. The `queue`, `rebase`, and `recovery` Quint transition slices pass exactly, but they do not supply the missing public process/Build dispatch. Existing work notes (`docs/work/04-approval-and-refs.md`, `05-serial-queue.md`, `07-gate-and-protection.md`, and `08-cas-landing.md`) record this dependency. Completing the remaining black-box failures requires the queue/Build workflow integration; the pending LIKELY package 13 area was left untouched.
 
 The integration fixes in this worktree are limited to CLI slug boundary validation, config diagnostic indentation, Intent parse line reporting, style warnings in approval cards, workspace-root tool path rendering, and per-checkout shape serialization. Regression coverage was added; `make check` and the previously passing profile cases remain green. No conformance/spec files or package 13 files were edited.
+
+## Fixed CLI and v1.2 follow-up (2026-10-07)
+
+Source commit: `790be014109b5e96009670465f14f881b885a16c`. The change defers slug validation to command dispatch and emits `intent/invalid_slug` with exit 2; gives route-disallowed options precedence over missing positionals/values; and maps request read failures to the stable `not found` or `unreadable` detail. The spec and conformance checkout remain unchanged.
+
+Built from the source commit with `cargo build --release --bin kogen --bin kogen-xspec`. Binary SHA-256:
+
+| Binary | SHA-256 |
+|---|---|
+| `target/release/kogen` | `14498d5e51e6c6252427fc6cc94ad6c88798f0300cf209b5e54862cc4404ef92` |
+| `target/release/kogen-xspec` | `3055a70951d6d5affdb7d50910b8af3c2ad4d70b338a960c166c05d05f9f01a4` |
+
+`make check` passed: formatting, Clippy with warnings denied, 3 CLI tests, 113 core tests, and 2 xspec tests.
+
+The final profile command was:
+
+```sh
+/Users/almirsarajcic/Areas/Kogen/kogen-conformance/bin/kogen-conformance run --kogen /Users/almirsarajcic/Areas/Kogen/kogen-rs-wt/int2-cli/target/release/kogen --profile cli,state,approval,shape --jobs 8 --time-scale 0.01 --workdir /tmp/kogen-int2-profile-final/work --out /tmp/kogen-int2-profile-final/results.jsonl --keep --quiet
+```
+
+Case and instance counts before → after:
+
+| Profile | Cases passed | Instances passed |
+|---|---:|---:|
+| `cli` | 8/30 → 8/30 | 61/156 → 55/156 |
+| `state` | 17/30 → 17/30 | 66/80 → 66/80 |
+| `approval` | 22/24 → 22/24 | 27/29 → 27/29 |
+| `shape` | 20/26 → 20/26 | 23/30 → 23/30 |
+
+Passing case IDs after the change: `cli-10, cli-15, cli-18, cli-19, cli-20, cli-22, cli-23, cli-28`; `state-01, state-03, state-04, state-05, state-07, state-08, state-09, state-13, state-16, state-17, state-19, state-21, state-24, state-25, state-28, state-29, state-30`; `approval-01`–`approval-17, approval-19`–`approval-23`; `shape-01, shape-03`–`shape-13, shape-15`–`shape-18, shape-21, shape-23`–`shape-25`.
+
+Failing case IDs after the change: `cli-01`–`cli-09, cli-11`–`cli-14, cli-16, cli-17, cli-21, cli-24`–`cli-27, cli-29, cli-30`; `state-02, state-06, state-10`–`state-12, state-14, state-15, state-18, state-20, state-22, state-23, state-26, state-27`; `approval-18, approval-24`; `shape-02, shape-14, shape-19, shape-20, shape-22, shape-26`. First divergences remain those listed in the profile table above: legacy v1.1 assertions, fixture issues, or queue/Build dispatch owned by the adjacent worker.
+
+Focused formatting/help command:
+
+```sh
+/Users/almirsarajcic/Areas/Kogen/kogen-conformance/bin/kogen-conformance run --kogen /Users/almirsarajcic/Areas/Kogen/kogen-rs-wt/int2-cli/target/release/kogen --case format-01,format-06,format-09,v1.2-01-fixed-cli-help-and-grok --jobs 4 --time-scale 0.01 --workdir /tmp/kogen-int2-format-committed/work --out /tmp/kogen-int2-format-committed/results.jsonl --keep --quiet
+```
+
+`format-09` improved from 14/15 to 15/15 instances. `format-06` passed 15/15 and `v1.2-01-fixed-cli-help-and-grok` passed 21/21. `format-01` remains 0/16 because it freezes v1.1 help bytes; the fixed v1.2 help corpus passes its v1.2 oracle.
+
+Additional frozen v1.1 conflicts now recorded by exact behavior: `cli-06` expects missing `<file|->` before the v1.2 unknown-option error for `intent shape greet --json`; `cli-08` expects `--as needs a value` on `provider login`, while v1.2 rejects `--as` there as an unknown option; `cli-13` expects parse-time slug usage pages for tokens after `--`; and `cli-21` expects parse-time usage pages for invalid slugs. Under v1.2 the parser honors `--`, then command dispatch prints the typed `intent/invalid_slug` line with exit 2. Their case-level failures remain listed; these expectations were not copied into the implementation.
