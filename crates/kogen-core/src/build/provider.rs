@@ -3,7 +3,7 @@ use super::config::BuildOptions;
 use super::provider_error::provider_error;
 use super::provider_prompt::{
     append_transcript, auditor_instructions, builder_instructions, builder_message, now_ms,
-    planner_instructions, user_item, workspace_changed,
+    planner_instructions, user_item, workspace_changed, workspace_tree,
 };
 use crate::error::CoreError;
 use crate::project::ProjectResolution;
@@ -15,18 +15,26 @@ use crate::provider::http::{ProviderCall, RequestEvent, RequestPolicy, SystemClo
 use crate::provider::session::{ConversationBinding, ConversationHistory};
 use crate::run::{RunEvent, RunSnapshot, RunStore};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub(super) struct BuildProvider<'a> {
     approved: &'a ApprovedBuild,
     options: &'a BuildOptions,
     store: &'a RunStore,
-    snapshot: &'a mut RunSnapshot,
+    builder_session: Option<BuilderSession>,
     home: std::path::PathBuf,
     account: RunAccount,
     http: crate::provider::http::ReqwestPort,
     clock: SystemClock,
+}
+
+struct BuilderSession {
+    context: RequestContext,
+    turns: u32,
+    empty_finish_count: u8,
+    budget_note_added: bool,
+    recipe_direct: bool,
 }
 
 impl<'a> BuildProvider<'a> {
@@ -35,7 +43,6 @@ impl<'a> BuildProvider<'a> {
         approved: &'a ApprovedBuild,
         options: &'a BuildOptions,
         store: &'a RunStore,
-        snapshot: &'a mut RunSnapshot,
     ) -> Result<Self, CoreError> {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -60,7 +67,7 @@ impl<'a> BuildProvider<'a> {
             approved,
             options,
             store,
-            snapshot,
+            builder_session: None,
             home,
             account,
             http,
@@ -72,11 +79,20 @@ impl<'a> BuildProvider<'a> {
         &self.account
     }
 
-    pub fn record_event(&mut self, event: &RunEvent) -> Result<(), CoreError> {
-        self.record(event)
+    pub fn record_event(
+        &mut self,
+        snapshot: &mut RunSnapshot,
+        event: &RunEvent,
+    ) -> Result<(), CoreError> {
+        self.record(snapshot, event)
     }
 
-    pub fn plan(&mut self, run_dir: &Path, files: &str) -> Result<(String, u64), CoreError> {
+    pub fn plan(
+        &mut self,
+        snapshot: &mut RunSnapshot,
+        run_dir: &Path,
+        files: &str,
+    ) -> Result<(String, u64), CoreError> {
         let input = format!(
             "Approved Intent:\n{}\n\nRepository files:\n{}",
             String::from_utf8_lossy(&self.approved.intent_bytes),
@@ -95,7 +111,7 @@ impl<'a> BuildProvider<'a> {
             false,
         )?;
         let before = Instant::now();
-        let call = self.call(&mut context, "planner", "plan", None)?;
+        let call = self.call(snapshot, &mut context, "planner", "plan", None)?;
         let elapsed = before.elapsed().as_millis() as u64;
         let difficulty = call
             .response
@@ -107,11 +123,12 @@ impl<'a> BuildProvider<'a> {
             .unwrap_or("easy")
             .to_owned();
         self.record(
+            snapshot,
             &RunEvent::new("plan", now_ms())
                 .with("difficulty", json!(difficulty))
                 .with("wall_ms", json!(elapsed)),
         )?;
-        self.record_call("plan", "", &call, elapsed)?;
+        self.record_call(snapshot, "plan", "", &call, elapsed)?;
         append_transcript(
             self.store,
             json!({
@@ -127,6 +144,7 @@ impl<'a> BuildProvider<'a> {
 
     pub fn audit(
         &mut self,
+        snapshot: &mut RunSnapshot,
         run_dir: &Path,
         request: &crate::run::orchestration::BuildAuditRequest,
     ) -> Result<String, CoreError> {
@@ -144,9 +162,9 @@ impl<'a> BuildProvider<'a> {
         )?;
         context.tool_choice = "none".to_owned();
         let before = Instant::now();
-        let call = self.call(&mut context, "auditor", "audit", None)?;
+        let call = self.call(snapshot, &mut context, "auditor", "audit", None)?;
         let elapsed = before.elapsed().as_millis() as u64;
-        self.record_call("audit", "R1", &call, elapsed)?;
+        self.record_call(snapshot, "audit", "R1", &call, elapsed)?;
         append_transcript(
             self.store,
             json!({
@@ -163,8 +181,11 @@ impl<'a> BuildProvider<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn develop(
         &mut self,
+        snapshot: &mut RunSnapshot,
         run_dir: &Path,
         workspace: &Path,
+        baseline_tree: &str,
+        excluded_paths: &[PathBuf],
         plan: &str,
         base_acceptance: &str,
         process: &dyn crate::run::ProcessPort,
@@ -190,7 +211,7 @@ impl<'a> BuildProvider<'a> {
             .collect();
         let builder_instructions = builder_instructions(recipe_direct);
         let first = builder_message(&self.approved.intent_bytes, base_acceptance, plan);
-        let mut context = self.request_context(
+        let context = self.request_context(
             run_dir,
             "develop",
             "builder",
@@ -202,49 +223,210 @@ impl<'a> BuildProvider<'a> {
             callable.iter().map(|name| (*name).to_owned()).collect(),
             true,
         )?;
-        let mut turns = 0_u32;
-        let mut empty_finish_count = 0_u8;
-        let mut budget_note_added = false;
+        self.builder_session = Some(BuilderSession {
+            context,
+            turns: 0,
+            empty_finish_count: 0,
+            budget_note_added: false,
+            recipe_direct,
+        });
+        self.drive_builder(
+            snapshot,
+            run_dir,
+            workspace,
+            baseline_tree,
+            baseline_tree,
+            excluded_paths,
+            process,
+            environment,
+            protected,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn repair(
+        &mut self,
+        snapshot: &mut RunSnapshot,
+        run_dir: &Path,
+        workspace: &Path,
+        baseline_tree: &str,
+        excluded_paths: &[PathBuf],
+        process: &dyn crate::run::ProcessPort,
+        environment: crate::run::ChildEnvironment,
+        protected: &crate::gate::ProtectedWorkspace,
+        feedback: &str,
+        deadline: Option<Instant>,
+    ) -> Result<DevelopResult, CoreError> {
+        let progress_baseline = workspace_tree(workspace, excluded_paths).map_err(|error| {
+            super::environment_error("candidate_snapshot_failed", error.to_string())
+        })?;
+        let session = self.builder_session.as_mut().ok_or_else(|| {
+            super::controller_error(
+                "builder_session_missing",
+                "the builder conversation is unavailable",
+            )
+        })?;
+        let mut history = ConversationHistory::new(std::mem::take(&mut session.context.input));
+        history.append_user(format!(
+            "Kogen's controller reported this failure. Continue the same session and fix it:\n\n{feedback}"
+        ));
+        session.context.input = history.items().to_vec();
+        self.drive_builder(
+            snapshot,
+            run_dir,
+            workspace,
+            baseline_tree,
+            &progress_baseline,
+            excluded_paths,
+            process,
+            environment,
+            protected,
+            deadline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_builder(
+        &mut self,
+        snapshot: &mut RunSnapshot,
+        run_dir: &Path,
+        workspace: &Path,
+        baseline_tree: &str,
+        progress_baseline: &str,
+        excluded_paths: &[PathBuf],
+        process: &dyn crate::run::ProcessPort,
+        environment: crate::run::ChildEnvironment,
+        protected: &crate::gate::ProtectedWorkspace,
+        deadline: Option<Instant>,
+    ) -> Result<DevelopResult, CoreError> {
+        let mut session = self.builder_session.take().ok_or_else(|| {
+            super::controller_error(
+                "builder_session_missing",
+                "the builder conversation is unavailable",
+            )
+        })?;
+        let result = self.drive_session(
+            snapshot,
+            &mut session,
+            run_dir,
+            workspace,
+            baseline_tree,
+            progress_baseline,
+            excluded_paths,
+            process,
+            environment,
+            protected,
+            deadline,
+        );
+        self.builder_session = Some(session);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_session(
+        &mut self,
+        snapshot: &mut RunSnapshot,
+        session: &mut BuilderSession,
+        run_dir: &Path,
+        workspace: &Path,
+        baseline_tree: &str,
+        progress_baseline: &str,
+        excluded_paths: &[PathBuf],
+        process: &dyn crate::run::ProcessPort,
+        environment: crate::run::ChildEnvironment,
+        protected: &crate::gate::ProtectedWorkspace,
+        deadline: Option<Instant>,
+    ) -> Result<DevelopResult, CoreError> {
+        let role = if session.recipe_direct {
+            crate::provider::tools::ToolRole::BuilderDirect
+        } else {
+            crate::provider::tools::ToolRole::BuilderShell
+        };
         loop {
-            turns = turns.saturating_add(1);
-            if turns > 60 {
-                return Ok(DevelopResult {
-                    reason: "turn_cap".to_owned(),
-                    turns,
-                    changed: workspace_changed(workspace, &self.options.setup_outputs),
-                    tool_outputs: Vec::new(),
-                    model_stages: 0,
-                });
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return self.develop_result(
+                    session,
+                    workspace,
+                    baseline_tree,
+                    progress_baseline,
+                    excluded_paths,
+                    "landing_allowance_spent",
+                    Vec::new(),
+                    0,
+                );
             }
+            if deadline.is_none() && session.turns >= 60 {
+                return self.develop_result(
+                    session,
+                    workspace,
+                    baseline_tree,
+                    progress_baseline,
+                    excluded_paths,
+                    "turn_cap",
+                    Vec::new(),
+                    0,
+                );
+            }
+            session.turns = session.turns.saturating_add(1);
             let before = Instant::now();
+            let wall_budget_ms = deadline
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .max(1)
+                        .min(u64::MAX as u128) as u64
+                })
+                .unwrap_or(self.options.wall_ms);
             let call = self.call(
-                &mut context,
+                snapshot,
+                &mut session.context,
                 "builder",
                 "develop",
-                Some(self.options.wall_ms),
+                Some(wall_budget_ms),
             )?;
-            self.record_call("develop", "R1", &call, before.elapsed().as_millis() as u64)?;
+            self.record_call(
+                snapshot,
+                "develop",
+                "R1",
+                &call,
+                before.elapsed().as_millis() as u64,
+            )?;
             append_transcript(
                 self.store,
                 json!({
                     "stage":"develop",
-                    "turn":turns,
-                    "model":context.model,
-                    "input":&context.input,
+                    "turn":session.turns,
+                    "model":session.context.model,
+                    "input":&session.context.input,
                     "raw_items":&call.response.raw_items,
                     "text":&call.response.text,
                 }),
             )?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return self.develop_result(
+                    session,
+                    workspace,
+                    baseline_tree,
+                    progress_baseline,
+                    excluded_paths,
+                    "landing_allowance_spent",
+                    Vec::new(),
+                    0,
+                );
+            }
             if call.response.tool_calls.is_empty() {
-                let mut history = ConversationHistory::new(std::mem::take(&mut context.input));
+                let mut history =
+                    ConversationHistory::new(std::mem::take(&mut session.context.input));
                 history.append_all(call.response.raw_items.clone());
                 history.append_user("Continue the entire approved Intent with the next useful tool call. Brief progress text does not finish the Build; call finish alone with {} when implementation and targeted verification are complete.");
                 super::provider_prompt::append_turn_budget_note(
                     &mut history,
-                    turns,
-                    &mut budget_note_added,
+                    session.turns,
+                    &mut session.budget_note_added,
                 );
-                context.input = history.items().to_vec();
+                session.context.input = history.items().to_vec();
                 continue;
             }
             let calls = call.response.tool_calls.clone();
@@ -256,15 +438,17 @@ impl<'a> BuildProvider<'a> {
                         || !tool_call
                             .arguments
                             .as_object()
-                            .is_some_and(|v| v.is_empty())
+                            .is_some_and(|value| value.is_empty())
                     {
                         outputs.push(crate::provider::tools::ToolError::FinishGuard.render());
                         continue;
                     }
-                    if !workspace_changed(workspace, &self.options.setup_outputs)
-                        && empty_finish_count == 0
-                    {
-                        empty_finish_count = 1;
+                    let changed = workspace_changed(workspace, baseline_tree, excluded_paths)
+                        .map_err(|error| {
+                            super::environment_error("candidate_snapshot_failed", error.to_string())
+                        })?;
+                    if !changed && session.empty_finish_count == 0 {
+                        session.empty_finish_count = 1;
                         outputs.push("Kogen found no changed files. Make the requested change before claiming done.".to_owned());
                         continue;
                     }
@@ -287,6 +471,7 @@ impl<'a> BuildProvider<'a> {
                 let restored = protected.restore_after_batch(workspace).unwrap_or_default();
                 for path in restored {
                     self.record(
+                        snapshot,
                         &RunEvent::new("protected_restored", now_ms())
                             .with("rung", json!("R1"))
                             .with("path", json!(path)),
@@ -294,25 +479,53 @@ impl<'a> BuildProvider<'a> {
                     outputs.push(format!("You changed {path}; acceptance tests and the Intent are read-only and have been restored. Make the implementation satisfy them."));
                 }
             }
-            let mut history = ConversationHistory::new(std::mem::take(&mut context.input));
+            let mut history = ConversationHistory::new(std::mem::take(&mut session.context.input));
             history.append_all(call.response.raw_items.clone());
             history.append_tool_results(&calls, &outputs);
             super::provider_prompt::append_turn_budget_note(
                 &mut history,
-                turns,
-                &mut budget_note_added,
+                session.turns,
+                &mut session.budget_note_added,
             );
-            context.input = history.items().to_vec();
+            session.context.input = history.items().to_vec();
             if finish {
-                return Ok(DevelopResult {
-                    reason: "finish".to_owned(),
-                    turns,
-                    changed: workspace_changed(workspace, &self.options.setup_outputs),
-                    tool_outputs: outputs,
-                    model_stages: turns,
-                });
+                return self.develop_result(
+                    session,
+                    workspace,
+                    baseline_tree,
+                    progress_baseline,
+                    excluded_paths,
+                    "finish",
+                    outputs,
+                    session.turns,
+                );
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn develop_result(
+        &self,
+        session: &BuilderSession,
+        workspace: &Path,
+        baseline_tree: &str,
+        progress_baseline: &str,
+        excluded_paths: &[PathBuf],
+        reason: &str,
+        tool_outputs: Vec<String>,
+        model_stages: u32,
+    ) -> Result<DevelopResult, CoreError> {
+        let current_tree = workspace_tree(workspace, excluded_paths).map_err(|error| {
+            super::environment_error("candidate_snapshot_failed", error.to_string())
+        })?;
+        Ok(DevelopResult {
+            reason: reason.to_owned(),
+            turns: session.turns,
+            changed: current_tree != baseline_tree,
+            progressed: current_tree != progress_baseline,
+            tool_outputs,
+            model_stages,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -351,6 +564,7 @@ impl<'a> BuildProvider<'a> {
 
     fn call(
         &mut self,
+        snapshot: &mut RunSnapshot,
         context: &mut RequestContext,
         role: &str,
         mode: &str,
@@ -389,7 +603,7 @@ impl<'a> BuildProvider<'a> {
         match result {
             Ok(call) => Ok(call),
             Err(failure) => {
-                self.record_provider_events(mode, &failure.events)?;
+                self.record_provider_events(snapshot, mode, &failure.events)?;
                 let detail = failure.failure.message.clone();
                 Err(provider_error(failure.failure.kind, detail))
             }
@@ -398,24 +612,26 @@ impl<'a> BuildProvider<'a> {
 
     fn record_provider_events(
         &mut self,
+        snapshot: &mut RunSnapshot,
         stage: &str,
         events: &[RequestEvent],
     ) -> Result<(), CoreError> {
-        super::provider_journal::record_provider_events(self.store, self.snapshot, stage, events)
+        super::provider_journal::record_provider_events(self.store, snapshot, stage, events)
     }
 
     fn record_call(
         &mut self,
+        snapshot: &mut RunSnapshot,
         stage: &str,
         rung: &str,
         call: &ProviderCall,
         wall_ms: u64,
     ) -> Result<(), CoreError> {
-        super::provider_journal::record_call(self.store, self.snapshot, stage, rung, call, wall_ms)
+        super::provider_journal::record_call(self.store, snapshot, stage, rung, call, wall_ms)
     }
 
-    fn record(&mut self, event: &RunEvent) -> Result<(), CoreError> {
-        super::provider_journal::record_event(self.store, self.snapshot, event)
+    fn record(&mut self, snapshot: &mut RunSnapshot, event: &RunEvent) -> Result<(), CoreError> {
+        super::provider_journal::record_event(self.store, snapshot, event)
     }
 }
 
@@ -424,6 +640,7 @@ pub(super) struct DevelopResult {
     pub reason: String,
     pub turns: u32,
     pub changed: bool,
+    pub progressed: bool,
     pub tool_outputs: Vec<String>,
     pub model_stages: u32,
 }

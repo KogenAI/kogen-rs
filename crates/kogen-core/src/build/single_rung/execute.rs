@@ -61,10 +61,11 @@ fn run_rung(
     snapshot
         .fields
         .insert("sandbox_warning".to_owned(), json!(sandbox_warning));
-    let mut provider = BuildProvider::new(project, approved, options, store, snapshot)?;
+    let mut provider = BuildProvider::new(project, approved, options, store)?;
     let account = provider.account().clone();
     record_started(
         &mut provider,
+        snapshot,
         approved,
         options,
         base_sha,
@@ -77,12 +78,14 @@ fn run_rung(
         .filter(|_| sandbox.status == crate::run::SandboxStatus::Unconfined)
     {
         provider.record_event(
+            snapshot,
             &RunEvent::new("sandbox_unavailable", now_ms()).with("reason", json!(reason)),
         )?;
     }
     let _interrupt = super::super::interrupt::InterruptMonitor::install(store.clone())?;
     if base_sha != approved.base_sha {
         provider.record_event(
+            snapshot,
             &RunEvent::new("base_moved_at_start", now_ms())
                 .with("approved", json!(approved.base_sha))
                 .with("tip", json!(base_sha))
@@ -101,10 +104,11 @@ fn run_rung(
         ("easy\0".to_owned(), 0)
     } else {
         let plan_files = tracked_paths(project, base_sha)?;
-        provider.plan(run_dir, &plan_files)?
+        provider.plan(snapshot, run_dir, &plan_files)?
     };
     let (_, plan_text) = plan.split_once('\0').unwrap_or(("easy", plan.as_str()));
     provider.record_event(
+        snapshot,
         &RunEvent::new("rung_started", now_ms())
             .with("rung", json!("R1"))
             .with("model", json!(options.builder_model))
@@ -128,6 +132,7 @@ fn run_rung(
             support::run_setup_cached(project, options, runner, workspace, run_dir, environment)?;
         if outcome.reused {
             provider.record_event(
+                snapshot,
                 &RunEvent::new("setup_reused", now_ms())
                     .with("setup_key", json!(key))
                     .with("saved_wall_ms", json!(outcome.saved_wall_ms)),
@@ -136,6 +141,10 @@ fn run_rung(
     }
 
     install_approved(candidate.workspace(), approved, options)?;
+    let excluded_paths = progress_exclusions(approved, options);
+    let baseline_tree =
+        crate::gate::snapshot_tree_excluding(candidate.workspace(), &excluded_paths)
+            .map_err(|error| environment_error("candidate_snapshot_failed", error.to_string()))?;
     let base_acceptance = support::base_acceptance(
         &base_runner,
         options,
@@ -155,6 +164,7 @@ fn run_rung(
     }
     let acceptance_text = base_acceptance_text(approved, &base_acceptance);
     provider.record_event(
+        snapshot,
         &RunEvent::new("base_acceptance", now_ms()).with(
             "items",
             json!(approved
@@ -172,8 +182,11 @@ fn run_rung(
 
     let protection = support::protected_workspace(project, approved, options, base_sha)?;
     let develop = provider.develop(
+        snapshot,
         run_dir,
         candidate.workspace(),
+        &baseline_tree,
+        &excluded_paths,
         plan_text,
         &acceptance_text,
         &builder_runner,
@@ -181,24 +194,69 @@ fn run_rung(
         &protection,
         matches!(options.recipe.as_str(), "direct" | "direct-escalate"),
     )?;
-    candidate
-        .reset_workspace_git_settings()
-        .map_err(|error| controller_error("workspace_git_config_failed", error.to_string()))?;
-    let mut report = run_gate(
-        project,
-        approved,
-        options,
-        run_dir,
-        base.workspace(),
-        candidate.workspace(),
-        &supervisor,
-        &integrity,
-        &child_env,
-        protection,
-    )?;
-    candidate
-        .reset_workspace_git_settings()
-        .map_err(|error| controller_error("workspace_git_config_failed", error.to_string()))?;
+    let mut develop = develop;
+    let mut repair_count = 0_u8;
+    let mut previous_red_count = None;
+    let mut report = loop {
+        candidate
+            .reset_workspace_git_settings()
+            .map_err(|error| controller_error("workspace_git_config_failed", error.to_string()))?;
+        let report = run_gate(
+            project,
+            approved,
+            options,
+            run_dir,
+            base.workspace(),
+            candidate.workspace(),
+            &supervisor,
+            &integrity,
+            &child_env,
+            protection.clone(),
+        )?;
+        candidate
+            .reset_workspace_git_settings()
+            .map_err(|error| controller_error("workspace_git_config_failed", error.to_string()))?;
+        if report.is_landable() || repair_count >= 6 {
+            break report;
+        }
+        if repair_count > 0 && !develop.progressed {
+            develop.reason = "unchanged".to_owned();
+            break report;
+        }
+        let count = support::gate_failure_count(&report);
+        if previous_red_count.is_some_and(|previous| count >= previous) {
+            develop.reason = "no_progress".to_owned();
+            break report;
+        }
+        previous_red_count = Some(count);
+        record(
+            store,
+            snapshot,
+            RunEvent::new("repair", now_ms())
+                .with("rung", json!("R1"))
+                .with("reason", json!("verification_red"))
+                .with("repairs_left", json!(6_u8.saturating_sub(repair_count)))
+                .with("count", json!(count)),
+        )?;
+        let feedback = support::gate_feedback(approved, &report, run_dir);
+        develop = provider.repair(
+            snapshot,
+            run_dir,
+            candidate.workspace(),
+            &baseline_tree,
+            &excluded_paths,
+            &builder_runner,
+            child_env.clone(),
+            &protection,
+            &feedback,
+            None,
+        )?;
+        repair_count = repair_count.saturating_add(1);
+        if !develop.progressed {
+            develop.reason = "unchanged".to_owned();
+            break report;
+        }
+    };
     let tree = report.verified_tree.clone().unwrap_or(
         crate::gate::snapshot_tree(candidate.workspace())
             .map_err(|error| environment_error("candidate_snapshot_failed", error.to_string()))?,
@@ -235,9 +293,10 @@ fn run_rung(
                 .into_owned(),
             candidate_diff: String::from_utf8_lossy(&diff).into_owned(),
         };
-        let reply = provider.audit(run_dir, &request)?;
+        let reply = provider.audit(snapshot, run_dir, &request)?;
         let dispositions = auditor.complete_rung_audit(&pending_audit, &reply);
         provider.record_event(
+            snapshot,
             &RunEvent::new("audit", now_ms())
                 .with("rung", json!("R1"))
                 .with(
@@ -267,6 +326,7 @@ fn run_rung(
                 "acceptance_upheld"
             };
             provider.record_event(
+                snapshot,
                 &RunEvent::new(event, now_ms())
                     .with("rung", json!("R1"))
                     .with("id", json!(item.id))
@@ -275,7 +335,6 @@ fn run_rung(
             )?;
         }
     }
-    drop(provider);
     write_private(&run_dir.join("candidate-R1.diff"), &diff)?;
     write_private(&run_dir.join("candidate.diff"), &diff)?;
     let verdict = if report.is_landable() {
@@ -283,6 +342,15 @@ fn run_rung(
     } else {
         "unverified"
     };
+    record_scope_warnings(
+        project,
+        approved,
+        options,
+        candidate.workspace(),
+        base_sha,
+        store,
+        snapshot,
+    )?;
     let setup_outputs = options
         .setup_outputs
         .iter()
@@ -317,7 +385,7 @@ fn run_rung(
             .with("result", json!(verdict))
             .with("checks", checks_json(&report))
             .with("acceptance", acceptance_json(&report))
-            .with("count", json!(usize::from(!report.is_landable()))),
+            .with("count", json!(support::gate_failure_count(&report))),
     )?;
     record(
         store,
@@ -326,10 +394,10 @@ fn run_rung(
             .with("rung", json!("R1"))
             .with(
                 "reason",
-                json!(if report.is_landable() {
-                    &develop.reason
-                } else {
+                json!(if !report.is_landable() && develop.reason == "finish" {
                     "verification_red"
+                } else {
+                    &develop.reason
                 }),
             )
             .with("verdict", json!(verdict))
@@ -403,6 +471,9 @@ fn run_rung(
         &tree,
         &integrity,
         &supervisor,
+        &mut provider,
+        &baseline_tree,
+        &excluded_paths,
     )?;
     cleanup_path(base.workspace());
     match result.outcome {

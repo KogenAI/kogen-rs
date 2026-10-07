@@ -1,14 +1,17 @@
 use super::super::approval::ApprovedBuild;
 use super::super::config::BuildOptions;
+use super::super::provider::BuildProvider;
 use super::super::support::{self, IntegritySnapshot};
 use super::super::{controller_error, environment_error};
-use crate::error::CoreError;
+use crate::error::{CoreError, ErrorClass};
 use crate::git::landing::{
     IntegrationGate, IntegrationResult, LandingOutcome, LandingRepository, LandingRequest,
     LandingWait, RebaseAttempt, RebaseKind, RepairResult,
 };
 use crate::project::ProjectResolution;
-use crate::run::{ChildEnvironment, ProcessSupervisor, RunSnapshot, RunStore};
+use crate::run::{ChildEnvironment, ProcessSupervisor, RunEvent, RunSnapshot, RunStore};
+use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -28,17 +31,22 @@ pub(super) fn land_candidate(
     tree: &str,
     integrity: &IntegritySnapshot,
     supervisor: &ProcessSupervisor,
+    provider: &mut BuildProvider<'_>,
+    baseline_tree: &str,
+    excluded_paths: &[PathBuf],
 ) -> Result<LandResult, CoreError> {
     let mut integration = Reverify {
         project,
         approved,
         options,
         store,
-        run_id: snapshot.run_id.clone(),
         run_dir: store.directory().to_path_buf(),
         candidate_workspace: candidate.workspace().to_path_buf(),
         integrity,
         supervisor,
+        provider,
+        baseline_tree,
+        excluded_paths,
     };
     let mut wait = ScaledLandingWait;
     let setup_outputs = options
@@ -69,59 +77,196 @@ pub(super) fn land_candidate(
     Ok(LandResult { outcome })
 }
 
-struct Reverify<'a> {
+struct Reverify<'a, 'p, 'build> {
     project: &'a ProjectResolution,
     approved: &'a ApprovedBuild,
     options: &'a BuildOptions,
     store: &'a RunStore,
-    run_id: String,
     run_dir: PathBuf,
     candidate_workspace: PathBuf,
     integrity: &'a IntegritySnapshot,
     supervisor: &'a ProcessSupervisor,
+    provider: &'p mut BuildProvider<'build>,
+    baseline_tree: &'a str,
+    excluded_paths: &'a [PathBuf],
 }
 
-impl IntegrationGate for Reverify<'_> {
+impl IntegrationGate for Reverify<'_, '_, '_> {
     fn reverify_and_repair(
         &mut self,
         _workspace: &Path,
         new_parent: &str,
         rebase: &RebaseAttempt,
-        _deadline: Instant,
+        snapshot: &mut RunSnapshot,
+        deadline: Instant,
     ) -> Result<IntegrationResult, crate::git::landing::LandingError> {
-        if !matches!(rebase, RebaseAttempt::Clean) {
+        if matches!(rebase, RebaseAttempt::Impossible { .. }) {
             return Ok(IntegrationResult {
-                rebase: RebaseKind::Conflict,
-                repairs: vec![RepairResult::Red],
+                rebase: RebaseKind::Impossible,
+                repairs: Vec::new(),
                 verified_tree: None,
             });
         }
+
         let base_path = self
             .project
             .state_root
-            .join(format!("{}-moved-base", self.run_id));
+            .join(format!("{}-moved-base", snapshot.run_id));
         let base = LandingRepository::clone_fresh(&self.project.origin, &base_path, new_parent)
             .map_err(landing_failure)?;
-        let environment = support::child_environment(
+        let candidate_env = support::child_environment(
             self.project,
             &self.run_dir,
             &self.candidate_workspace,
             self.options,
         )
         .map_err(|error| landing_failure(core_error_text(error)))?;
-        let result = self.verify_moved_base(&base, new_parent, &environment);
+
+        let (mut rebase_kind, mut feedback, mut count, conflict_paths) = match rebase {
+            RebaseAttempt::Impossible { .. } => unreachable!(),
+            RebaseAttempt::Conflict { paths, detail } => {
+                let feedback = format!(
+                    "Moved-base rebase conflict. Conflicting paths: {}\n{}",
+                    paths.join(", "),
+                    detail
+                );
+                (RebaseKind::Conflict, feedback, paths.len(), paths.clone())
+            }
+            RebaseAttempt::Clean => {
+                let report =
+                    self.verify_moved_base(&base, new_parent, &candidate_env, snapshot, &[])?;
+                if report.is_landable() {
+                    let tree = report.verified_tree.clone();
+                    let _ = std::fs::remove_dir_all(base.workspace());
+                    return Ok(IntegrationResult {
+                        rebase: RebaseKind::Green,
+                        repairs: Vec::new(),
+                        verified_tree: tree,
+                    });
+                }
+                (
+                    RebaseKind::Red,
+                    support::gate_feedback(self.approved, &report, &self.run_dir),
+                    support::gate_failure_count(&report),
+                    Vec::new(),
+                )
+            }
+        };
+
+        let mut repairs = Vec::new();
+        let mut verified_tree = None;
+        loop {
+            if Instant::now() >= deadline {
+                repairs.push(RepairResult::Spent);
+                break;
+            }
+            self.record_repair(snapshot, &rebase_kind, count, deadline)?;
+            let protection =
+                support::protected_workspace(self.project, self.approved, self.options, new_parent)
+                    .map_err(|error| landing_failure(core_error_text(error)))?;
+            let builder_runner = support::sandboxed(
+                self.project,
+                self.options,
+                &self.candidate_workspace,
+                &self.run_dir,
+                self.supervisor,
+                self.integrity,
+            );
+            let conflict_before = conflict_paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        conflict_path_state(&self.candidate_workspace, path),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let develop = loop {
+                match self.provider.repair(
+                    snapshot,
+                    &self.run_dir,
+                    &self.candidate_workspace,
+                    self.baseline_tree,
+                    self.excluded_paths,
+                    &builder_runner,
+                    candidate_env.clone(),
+                    &protection,
+                    &feedback,
+                    Some(deadline),
+                ) {
+                    Ok(result) => break Some(result),
+                    Err(error)
+                        if error.class == ErrorClass::Provider && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_error) if Instant::now() >= deadline => break None,
+                    Err(error) => {
+                        let _ = std::fs::remove_dir_all(base.workspace());
+                        return Err(landing_failure(core_error_text(error)));
+                    }
+                }
+            };
+            let Some(develop) = develop else {
+                repairs.push(RepairResult::Spent);
+                break;
+            };
+            if develop.reason == "landing_allowance_spent" {
+                repairs.push(RepairResult::Spent);
+                break;
+            }
+
+            let unresolved = stage_resolved_conflicts(
+                &self.candidate_workspace,
+                &conflict_paths,
+                &conflict_before,
+            )?;
+            let report =
+                self.verify_moved_base(&base, new_parent, &candidate_env, snapshot, &unresolved)?;
+            if report.is_landable() && unresolved.is_empty() {
+                let tree = report.verified_tree.clone().ok_or_else(|| {
+                    landing_failure("green moved-base verification omitted its tree")
+                })?;
+                verified_tree = Some(tree.clone());
+                repairs.push(RepairResult::Green {
+                    verified_tree: tree,
+                });
+                break;
+            }
+            count = support::gate_failure_count(&report);
+            feedback = support::gate_feedback(self.approved, &report, &self.run_dir);
+            if !unresolved.is_empty() {
+                count = count.saturating_add(unresolved.len());
+                feedback.push_str(&format!(
+                    "\nMoved-base rebase still has unresolved conflicts: {}",
+                    unresolved.join(", ")
+                ));
+            }
+            repairs.push(RepairResult::Red);
+            rebase_kind = match rebase_kind {
+                RebaseKind::Conflict => RebaseKind::Conflict,
+                _ => RebaseKind::Red,
+            };
+        }
+
         let _ = std::fs::remove_dir_all(base.workspace());
-        result
+        Ok(IntegrationResult {
+            rebase: rebase_kind,
+            repairs,
+            verified_tree,
+        })
     }
 }
 
-impl Reverify<'_> {
+impl Reverify<'_, '_, '_> {
     fn verify_moved_base(
         &self,
         base: &LandingRepository,
         new_parent: &str,
         candidate_env: &ChildEnvironment,
-    ) -> Result<IntegrationResult, crate::git::landing::LandingError> {
+        snapshot: &mut RunSnapshot,
+        guard_findings: &[String],
+    ) -> Result<crate::gate::GateReport, crate::git::landing::LandingError> {
         let protection =
             support::protected_workspace(self.project, self.approved, self.options, new_parent)
                 .map_err(|error| landing_failure(core_error_text(error)))?;
@@ -146,32 +291,99 @@ impl Reverify<'_> {
             self.integrity,
         );
         let report = crate::gate::run_gate(&runner, &request).map_err(landing_failure)?;
-        let green = report.is_landable();
         let tree = report.verified_tree.clone();
-        let event = crate::run::RunEvent::new("verification", now_ms())
-            .with("rung", serde_json::json!("R1"))
-            .with("tree", serde_json::json!(tree))
+        let mut checks = json!(
+            report
+                .checks
+                .iter()
+                .map(|check| json!({
+                    "name":check.name,
+                    "exit_status":check.exit_status,
+                    "status":check.status.as_str(),
+                    "excused":check.excused,
+                    "findings":check.findings.iter().map(|finding| json!({
+                        "path":finding.path,
+                        "rule":finding.rule,
+                        "symbol":finding.symbol,
+                        "message":finding.message,
+                    })).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>()
+        );
+        if !guard_findings.is_empty() {
+            checks
+                .as_array_mut()
+                .expect("serialized checks are an array")
+                .push(json!({
+                    "name":"rebase",
+                    "exit_status":null,
+                    "status":"red",
+                    "excused":false,
+                    "findings":guard_findings.iter().map(|path| json!({
+                        "path":path,
+                        "rule":"rebase/unresolved",
+                        "symbol":"",
+                        "message":"moved-base conflict has not been resolved",
+                    })).collect::<Vec<_>>(),
+                }));
+        }
+        let acceptance = json!(
+            report
+                .acceptance
+                .item_pass
+                .iter()
+                .map(|(id, passed)| json!({
+                    "id":id,
+                    "status":if *passed {"passed"} else {"failed"},
+                    "demoted":false,
+                }))
+                .collect::<Vec<_>>()
+        );
+        let event = RunEvent::new("verification", now_ms())
+            .with("rung", json!("R1"))
+            .with("tree", json!(tree))
             .with(
                 "result",
-                serde_json::json!(if green { "green" } else { "red" }),
+                json!(if report.is_landable() && guard_findings.is_empty() {
+                    "green"
+                } else {
+                    "red"
+                }),
+            )
+            .with("checks", checks)
+            .with("acceptance", acceptance)
+            .with(
+                "count",
+                json!(support::gate_failure_count(&report) + guard_findings.len()),
             );
-        let snapshot = self.store.read_snapshot().map_err(landing_failure)?;
         self.store
-            .record(&event, &snapshot)
+            .record(&event, snapshot)
             .map_err(landing_failure)?;
-        if green {
-            Ok(IntegrationResult {
-                rebase: RebaseKind::Green,
-                repairs: Vec::new(),
-                verified_tree: tree,
-            })
+        Ok(report)
+    }
+
+    fn record_repair(
+        &self,
+        snapshot: &mut RunSnapshot,
+        rebase: &RebaseKind,
+        count: usize,
+        deadline: Instant,
+    ) -> Result<(), crate::git::landing::LandingError> {
+        let reason = if *rebase == RebaseKind::Conflict {
+            "rebase_conflict"
         } else {
-            Ok(IntegrationResult {
-                rebase: RebaseKind::Red,
-                repairs: vec![RepairResult::Red],
-                verified_tree: None,
-            })
-        }
+            "verification_red"
+        };
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let event = RunEvent::new("repair", now_ms())
+            .with("rung", json!("R1"))
+            .with("reason", json!(reason))
+            .with("repairs_left", json!(remaining_ms))
+            .with("count", json!(count));
+        self.store.record(&event, snapshot).map_err(landing_failure)
     }
 }
 
@@ -190,6 +402,58 @@ fn core_error_text(error: CoreError) -> String {
         error.reason,
         error.detail
     )
+}
+
+fn conflict_path_state(workspace: &Path, relative: &str) -> Option<(u32, Vec<u8>)> {
+    let path = workspace.join(relative);
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o177_777
+    };
+    #[cfg(not(unix))]
+    let mode = u32::from(metadata.permissions().readonly());
+    let bytes = if metadata.file_type().is_symlink() {
+        std::fs::read_link(path)
+            .ok()?
+            .to_string_lossy()
+            .as_bytes()
+            .to_vec()
+    } else if metadata.is_file() {
+        std::fs::read(path).ok()?
+    } else {
+        Vec::new()
+    };
+    Some((mode, bytes))
+}
+
+fn stage_resolved_conflicts(
+    workspace: &Path,
+    conflict_paths: &[String],
+    before: &BTreeMap<String, Option<(u32, Vec<u8>)>>,
+) -> Result<Vec<String>, crate::git::landing::LandingError> {
+    let repo = crate::git::GitRepo::new(workspace);
+    for path in conflict_paths {
+        let current = conflict_path_state(workspace, path);
+        if before.get(path) != Some(&current) {
+            repo.output(&["add", "--", path]).map_err(landing_failure)?;
+        }
+    }
+    let unmerged = repo
+        .output(&["ls-files", "-u", "-z"])
+        .map_err(landing_failure)?;
+    let unresolved = unmerged
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let entry = std::str::from_utf8(entry).ok()?;
+            let (_, path) = entry.split_once('\t')?;
+            Some(path.to_owned())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(unresolved)
 }
 
 #[derive(Default)]

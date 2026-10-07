@@ -4,7 +4,7 @@ use crate::run::RunStore;
 use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(super) fn planner_instructions() -> String {
     "You are Kogen's planner. Produce a one-shot implementation plan for a cheaper coding agent. Return Difficulty: easy or hard, then ## Acceptance criteria, ## Technical approach, and ## Implementation steps.".to_owned()
@@ -91,18 +91,19 @@ pub(super) fn append_transcript(store: &RunStore, row: Value) -> Result<(), Core
         .map_err(|error| super::controller_error("transcript_write_failed", error.to_string()))
 }
 
-pub(super) fn workspace_changed(workspace: &Path, excluded_paths: &[String]) -> bool {
-    let excluded_paths = excluded_paths
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect::<Vec<_>>();
-    crate::gate::snapshot_tree_excluding(workspace, &excluded_paths)
-        .ok()
-        .is_some_and(|tree| {
-            crate::gate::commit_tree_id(workspace, "HEAD")
-                .ok()
-                .is_some_and(|base| base != tree)
-        })
+pub(super) fn workspace_tree(
+    workspace: &Path,
+    excluded_paths: &[PathBuf],
+) -> Result<String, crate::gate::TreeSnapshotError> {
+    crate::gate::snapshot_tree_excluding(workspace, excluded_paths)
+}
+
+pub(super) fn workspace_changed(
+    workspace: &Path,
+    baseline_tree: &str,
+    excluded_paths: &[PathBuf],
+) -> Result<bool, crate::gate::TreeSnapshotError> {
+    Ok(workspace_tree(workspace, excluded_paths)? != baseline_tree)
 }
 
 pub(super) fn now_ms() -> i64 {
@@ -111,3 +112,7 @@ pub(super) fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
+
+#[cfg(test)]
+#[path = "provider_prompt_tests.rs"]
+mod tests;

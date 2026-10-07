@@ -53,6 +53,7 @@ pub(super) fn install_approved(
 
 pub(super) fn record_started(
     provider: &mut BuildProvider<'_>,
+    snapshot: &mut RunSnapshot,
     approved: &ApprovedBuild,
     options: &BuildOptions,
     base_sha: &str,
@@ -69,6 +70,7 @@ pub(super) fn record_started(
         json!({"model":options.builder_model,"effort":options.builder_effort}),
     );
     provider.record_event(
+        snapshot,
         &RunEvent::new("started", now_ms())
             .with("approval_commit", json!(approved.commit))
             .with(
@@ -85,6 +87,89 @@ pub(super) fn record_started(
             .with("credential_label", json!(account.label))
             .with("sandbox", json!(sandbox)),
     )
+}
+
+pub(super) fn progress_exclusions(
+    approved: &ApprovedBuild,
+    options: &BuildOptions,
+) -> Vec<std::path::PathBuf> {
+    options
+        .setup_outputs
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(std::iter::once(support::candidate_path(
+            options,
+            &approved.slug,
+        )))
+        .collect()
+}
+
+pub(super) fn record_scope_warnings(
+    project: &ProjectResolution,
+    approved: &ApprovedBuild,
+    options: &BuildOptions,
+    workspace: &Path,
+    base: &str,
+    store: &RunStore,
+    snapshot: &mut RunSnapshot,
+) -> Result<(), CoreError> {
+    let repo = crate::git::GitRepo::new(workspace);
+    let _ = repo.output(&["add", "-N", "--all"]);
+    let paths = repo
+        .output(&["diff", "--name-only", "-z", "--no-renames", base, "--"])
+        .map_err(|error| environment_error("candidate_diff_failed", error.to_string()))?;
+    let configured = project
+        .config
+        .as_ref()
+        .and_then(|config| config.raw.get("domains"))
+        .and_then(serde_yaml::Value::as_mapping);
+    let mut allowed = Vec::new();
+    if let Some(configured) = configured {
+        for domain in &approved.intent.frontmatter.domains {
+            if let Some(paths) = configured
+                .get(serde_yaml::Value::String(domain.clone()))
+                .and_then(serde_yaml::Value::as_sequence)
+            {
+                allowed.extend(paths.iter().filter_map(serde_yaml::Value::as_str));
+            }
+        }
+    }
+    let candidate = support::candidate_path(options, &approved.slug);
+    let candidate = candidate.to_string_lossy();
+    let intent_copy = format!(".kogen/intents/{}/intent.md", approved.slug);
+    for path in paths
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(String::from_utf8_lossy)
+        .map(|path| path.into_owned())
+    {
+        if path == candidate
+            || path == intent_copy
+            || options
+                .setup_outputs
+                .iter()
+                .any(|output| path == *output || path.starts_with(&format!("{output}/")))
+        {
+            continue;
+        }
+        if allowed
+            .iter()
+            .any(|prefix| path == **prefix || path.starts_with(&format!("{prefix}/")))
+        {
+            continue;
+        }
+        record(
+            store,
+            snapshot,
+            RunEvent::new("scope_warning", now_ms())
+                .with("path", json!(path))
+                .with(
+                    "declared_domains",
+                    json!(approved.intent.frontmatter.domains),
+                ),
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn probe_sandbox(
@@ -210,6 +295,8 @@ pub(super) fn publish_candidate(
     let origin = origin.to_string_lossy();
     crate::git::GitRepo::workspace(workspace)
         .output(&[
+            "-c",
+            "core.hooksPath=/dev/null",
             "push",
             "--porcelain",
             "--no-recurse-submodules",

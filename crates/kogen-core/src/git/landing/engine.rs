@@ -9,8 +9,6 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const LANDING_ALLOWANCE: Duration = Duration::from_secs(10 * 60);
-
 pub struct LandingRequest<'a> {
     pub repository: &'a LandingRepository,
     pub store: &'a RunStore,
@@ -41,6 +39,7 @@ pub trait IntegrationGate {
         workspace: &Path,
         new_parent: &str,
         rebase: &RebaseAttempt,
+        snapshot: &mut RunSnapshot,
         deadline: Instant,
     ) -> Result<IntegrationResult, LandingError>;
 }
@@ -322,11 +321,12 @@ fn integrate_moved(
         model.apply(LandingEvent::Rebase(RebaseKind::Impossible));
         return Ok(None);
     }
-    let deadline = Instant::now() + LANDING_ALLOWANCE;
+    let deadline = Instant::now() + landing_allowance();
     let result = integration.reverify_and_repair(
         request.repository.workspace(),
         &new_parent,
         &rebase,
+        request.snapshot,
         deadline,
     )?;
     let observation = model.apply(LandingEvent::Rebase(result.rebase));
@@ -368,4 +368,16 @@ fn integrate_moved(
         ));
     };
     Ok(Some((new_parent, tree)))
+}
+
+fn landing_allowance() -> Duration {
+    let scale = std::env::var("KOGEN_TIME_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(1.0);
+    let millis = (crate::run::orchestration::LANDING_ALLOWANCE_MS as f64 * scale)
+        .floor()
+        .max(1.0) as u64;
+    Duration::from_millis(millis)
 }

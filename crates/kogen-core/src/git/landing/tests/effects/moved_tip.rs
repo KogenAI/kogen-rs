@@ -70,6 +70,7 @@ impl IntegrationGate for RepairConflict {
         workspace: &Path,
         _new_parent: &str,
         rebase: &RebaseAttempt,
+        _snapshot: &mut crate::run::RunSnapshot,
         deadline: Instant,
     ) -> Result<IntegrationResult, LandingError> {
         self.calls += 1;
@@ -87,9 +88,12 @@ impl IntegrationGate for RepairConflict {
         let tree = snapshot_tree(workspace).expect("re-gate repaired tree");
         Ok(IntegrationResult {
             rebase: crate::git::landing::RebaseKind::Conflict,
-            repairs: vec![RepairResult::Green {
-                verified_tree: tree,
-            }],
+            repairs: vec![
+                RepairResult::Red,
+                RepairResult::Green {
+                    verified_tree: tree,
+                },
+            ],
             verified_tree: None,
         })
     }
@@ -143,7 +147,7 @@ fn moved_tip_rebases_repairs_and_regates_before_a_new_parent_cas() {
         b"new base file\n"
     );
     assert_eq!(integration.calls, 1);
-    assert_eq!(observation.repairs, 1);
+    assert_eq!(observation.repairs, 2);
     assert_eq!(
         fixture.snapshot.landing.as_ref().unwrap().expected_parent,
         moved_tip

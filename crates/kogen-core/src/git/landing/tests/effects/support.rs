@@ -20,6 +20,7 @@ impl IntegrationGate for NeverMoved {
         _workspace: &Path,
         _new_parent: &str,
         _rebase: &RebaseAttempt,
+        _snapshot: &mut crate::run::RunSnapshot,
         _deadline: Instant,
     ) -> Result<IntegrationResult, LandingError> {
         panic!("the base did not move")

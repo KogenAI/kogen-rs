@@ -8,11 +8,149 @@ use crate::run::{
     ChildEnvironment, EnvironmentRequest, ProcessError, ProcessPort, ProcessRequest,
     ProcessSupervisor, SandboxIntegrityPort, SandboxPolicy, SandboxedProcessPort,
 };
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod acceptance;
 pub(super) use acceptance::candidate_path;
 use acceptance::{acceptance_request, baseline};
+
+pub(super) fn gate_feedback(
+    approved: &ApprovedBuild,
+    report: &crate::gate::GateReport,
+    run_dir: &Path,
+) -> String {
+    let mut lines = Vec::new();
+    let mut total_findings = 0_usize;
+    let mut errors = 0_usize;
+    let warnings = report.checks.iter().filter(|check| check.excused).count();
+    let mut tool_counts = BTreeMap::<String, usize>::new();
+    for check in report.checks.iter().filter(|check| check.blocks_gate()) {
+        errors += 1;
+        let mut emitted = 0_usize;
+        for finding in &check.findings {
+            if emitted >= 10 || total_findings >= 20 {
+                break;
+            }
+            let line = finding
+                .line
+                .map_or_else(String::new, |line| line.to_string());
+            let column = finding
+                .column
+                .map_or_else(String::new, |column| column.to_string());
+            let position = match (line.is_empty(), column.is_empty()) {
+                (true, _) => String::new(),
+                (false, true) => format!(":{line}"),
+                (false, false) => format!(":{line}:{column}"),
+            };
+            let symbol = if finding.symbol.is_empty() {
+                String::new()
+            } else {
+                format!(" {}:", finding.symbol)
+            };
+            let message = finding.message.chars().take(200).collect::<String>();
+            lines.push(format!(
+                "{}{position}: error: [{}]{symbol} {message}",
+                finding.path, finding.rule
+            ));
+            emitted += 1;
+            total_findings += 1;
+            let tool = finding.rule.split('/').next().unwrap_or(&check.name);
+            *tool_counts.entry(tool.to_owned()).or_default() += 1;
+        }
+        if check.findings.len() > emitted {
+            lines.push(format!(
+                "… {} more {} findings",
+                check.findings.len() - emitted,
+                check.name
+            ));
+        }
+        lines.push(format!("raw log: {}", check.log_path.display()));
+        let tail = std::fs::read_to_string(&check.log_path)
+            .ok()
+            .map(|text| {
+                let mut tail = text.lines().rev().take(8).collect::<Vec<_>>();
+                tail.reverse();
+                let home = std::env::var("HOME").unwrap_or_default();
+                tail.join("\n")
+                    .replace(&run_dir.display().to_string(), "$TMPDIR")
+                    .replace(&home, "$HOME")
+            })
+            .unwrap_or_default();
+        if !tail.is_empty() {
+            let tail = tail.chars().take(600).collect::<String>();
+            lines.push(format!(
+                "raw tail (first failed step {}):\n{tail}",
+                check.name
+            ));
+        }
+    }
+    let failed_items = approved
+        .intent
+        .verify
+        .iter()
+        .filter(|item| report.acceptance.item_pass.get(&item.id) != Some(&true))
+        .collect::<Vec<_>>();
+    errors += failed_items.len();
+    for item in &failed_items {
+        lines.push(format!("acceptance {}: failed", item.id));
+    }
+    if warnings > 0 {
+        for check in report.checks.iter().filter(|check| check.excused) {
+            lines.push(format!(
+                "Base-red warning: check \"{}\" still has only findings recorded at approval.",
+                check.name
+            ));
+        }
+    }
+    let check_status = report
+        .checks
+        .iter()
+        .map(|check| format!("{}={}", check.name, check.status.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let passed = approved
+        .intent
+        .verify
+        .len()
+        .saturating_sub(failed_items.len());
+    let counts = tool_counts
+        .into_iter()
+        .map(|(tool, count)| format!("{tool} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(format!(
+        "gate: {errors} errors, {warnings} warnings ({counts}); checks {check_status}; acceptance {passed}/{}",
+        approved.intent.verify.len()
+    ));
+    lines.join("\n")
+}
+
+pub(super) fn gate_failure_count(report: &crate::gate::GateReport) -> usize {
+    let mut findings = BTreeSet::new();
+    let mut checks_without_identity = 0_usize;
+    for check in report.checks.iter().filter(|check| check.blocks_gate()) {
+        if check.findings.is_empty() {
+            checks_without_identity += 1;
+        } else {
+            findings.extend(check.findings.iter().map(|finding| {
+                (
+                    finding.path.clone(),
+                    finding.rule.clone(),
+                    finding.symbol.clone(),
+                )
+            }));
+        }
+    }
+    let failed_items = report
+        .acceptance
+        .item_pass
+        .values()
+        .filter(|passed| !**passed)
+        .count();
+    findings.len() + checks_without_identity + failed_items
+}
 
 pub(super) struct IntegritySnapshot {
     checkout: PathBuf,
