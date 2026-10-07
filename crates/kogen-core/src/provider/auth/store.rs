@@ -19,6 +19,18 @@ use rand::RngCore as _;
 use super::super::{accounts, environment_error, provider_error};
 use super::Credential;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoreFormat {
+    Json,
+    Encrypted,
+}
+
+#[derive(Debug)]
+pub(crate) struct LoginCredential<T> {
+    pub(crate) credential: Option<T>,
+    pub(crate) unreadable: bool,
+}
+
 pub(crate) fn get(home: &Path, label: &str) -> Result<Option<Credential>, super::super::CoreError> {
     get_for(home, "chatgpt", label)
 }
@@ -28,28 +40,83 @@ pub(crate) fn get_for<T: serde::de::DeserializeOwned>(
     provider: &str,
     label: &str,
 ) -> Result<Option<T>, super::super::CoreError> {
+    Ok(read_for(
+        home,
+        provider,
+        label,
+        store_format(),
+        false,
+        |path, bytes| decrypt_for_store(home, provider, label, path, bytes),
+    )?
+    .credential)
+}
+
+pub(crate) fn get_for_login<T: serde::de::DeserializeOwned>(
+    home: &Path,
+    provider: &str,
+    label: &str,
+) -> Result<LoginCredential<T>, super::super::CoreError> {
+    read_for(
+        home,
+        provider,
+        label,
+        store_format(),
+        true,
+        |path, bytes| decrypt_for_store(home, provider, label, path, bytes),
+    )
+}
+
+fn read_for<T: serde::de::DeserializeOwned>(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    format: StoreFormat,
+    tolerate_undecryptable: bool,
+    decrypt: impl FnOnce(&Path, &[u8]) -> Result<Vec<u8>, super::super::CoreError>,
+) -> Result<LoginCredential<T>, super::super::CoreError> {
     validate_identity(provider, label)?;
-    let path = credential_path(home, provider, label);
+    let path = credential_path_for(home, provider, label, format);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(invalid_credential(&path)),
-    };
-    let plaintext = if encrypted_store() {
-        #[cfg(target_os = "macos")]
-        {
-            decrypt(home, provider, label, &bytes)?
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoginCredential {
+                credential: None,
+                unreadable: false,
+            });
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            return Err(invalid_credential(&path));
+        Err(_) => return Err(invalid_credential(&path, provider)),
+    };
+    let plaintext = if format == StoreFormat::Encrypted {
+        match decrypt(&path, &bytes) {
+            Ok(plaintext) => plaintext,
+            Err(error)
+                if tolerate_undecryptable
+                    && is_undecryptable_error(&error)
+                    && format == StoreFormat::Encrypted =>
+            {
+                return Ok(LoginCredential {
+                    credential: None,
+                    unreadable: true,
+                });
+            }
+            Err(error) => return Err(with_login_hint(error, provider)),
         }
     } else {
         bytes
     };
-    serde_json::from_slice(&plaintext)
-        .map(Some)
-        .map_err(|_| invalid_credential(&path))
+    match serde_json::from_slice(&plaintext) {
+        Ok(credential) => Ok(LoginCredential {
+            credential: Some(credential),
+            unreadable: false,
+        }),
+        Err(_) if tolerate_undecryptable && format == StoreFormat::Encrypted => {
+            Ok(LoginCredential {
+                credential: None,
+                unreadable: true,
+            })
+        }
+        Err(_) => Err(invalid_credential(&path, provider)),
+    }
 }
 
 pub(crate) fn put(
@@ -66,19 +133,54 @@ pub(crate) fn put_for<T: serde::Serialize>(
     label: &str,
     credential: &T,
 ) -> Result<(), super::super::CoreError> {
+    put_for_mode(home, provider, label, credential, false)
+}
+
+pub(crate) fn put_for_login<T: serde::Serialize>(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    credential: &T,
+) -> Result<(), super::super::CoreError> {
+    put_for_mode(home, provider, label, credential, true)
+}
+
+fn put_for_mode<T: serde::Serialize>(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    credential: &T,
+    replace_existing: bool,
+) -> Result<(), super::super::CoreError> {
+    let format = store_format();
+    put_for_with(
+        home,
+        provider,
+        label,
+        credential,
+        format,
+        replace_existing,
+        |plaintext, replace_existing| {
+            encrypt_for_store(home, provider, label, plaintext, format, replace_existing)
+        },
+    )
+}
+
+fn put_for_with<T: serde::Serialize>(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    credential: &T,
+    format: StoreFormat,
+    replace_existing: bool,
+    encrypt: impl FnOnce(&[u8], bool) -> Result<Vec<u8>, super::super::CoreError>,
+) -> Result<(), super::super::CoreError> {
     validate_identity(provider, label)?;
-    let path = credential_path(home, provider, label);
+    let path = credential_path_for(home, provider, label, format);
     let plaintext = serde_json::to_vec(credential)
         .map_err(|_| environment_error("credential_write_failed", "could not encode credential"))?;
-    let bytes = if encrypted_store() {
-        #[cfg(target_os = "macos")]
-        {
-            encrypt(home, provider, label, &plaintext)?
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            plaintext
-        }
+    let bytes = if format == StoreFormat::Encrypted {
+        encrypt(&plaintext, replace_existing)?
     } else {
         plaintext
     };
@@ -119,13 +221,24 @@ pub(crate) fn delete_for(
 }
 
 fn credential_path(home: &Path, provider: &str, label: &str) -> PathBuf {
-    let suffix = if encrypted_store() && cfg!(target_os = "macos") {
-        "enc"
-    } else {
-        "json"
+    credential_path_for(home, provider, label, store_format())
+}
+
+fn credential_path_for(home: &Path, provider: &str, label: &str, format: StoreFormat) -> PathBuf {
+    let suffix = match format {
+        StoreFormat::Json => "json",
+        StoreFormat::Encrypted => "enc",
     };
     home.join(".kogen/credentials")
         .join(format!("{provider}-{label}.{suffix}"))
+}
+
+fn store_format() -> StoreFormat {
+    if encrypted_store() && cfg!(target_os = "macos") {
+        StoreFormat::Encrypted
+    } else {
+        StoreFormat::Json
+    }
 }
 
 #[cfg(test)]
@@ -162,11 +275,80 @@ fn validate_identity(provider: &str, label: &str) -> Result<(), super::super::Co
     validate_label(label)
 }
 
-fn invalid_credential(path: &Path) -> super::super::CoreError {
+fn invalid_credential(path: &Path, provider: &str) -> super::super::CoreError {
     environment_error(
         "invalid_credential_file",
-        format!("{} is not valid", path.display()),
+        format!(
+            "{} is not valid; run kogen provider login {provider}",
+            path.display()
+        ),
     )
+}
+
+fn with_login_hint(error: super::super::CoreError, provider: &str) -> super::super::CoreError {
+    let hint = format!("run kogen provider login {provider}");
+    if error.detail.contains(&hint) {
+        return error;
+    }
+    super::super::CoreError::new(
+        error.class,
+        error.reason,
+        format!("{}; {hint}", error.detail),
+        error.exit_code,
+    )
+}
+
+fn is_undecryptable_error(error: &super::super::CoreError) -> bool {
+    error.reason == "credential_store_unavailable"
+        && matches!(
+            error.detail.as_str(),
+            "encrypted credential is invalid"
+                | "credential key is missing from Keychain"
+                | "credential decryption failed"
+                | "invalid Keychain key"
+                | "Keychain key is invalid"
+        )
+}
+
+fn decrypt_for_store(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<Vec<u8>, super::super::CoreError> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = path;
+        decrypt(home, provider, label, bytes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (home, provider, label, bytes);
+        Err(invalid_credential(path, provider))
+    }
+}
+
+fn encrypt_for_store(
+    home: &Path,
+    provider: &str,
+    label: &str,
+    plaintext: &[u8],
+    format: StoreFormat,
+    replace_existing: bool,
+) -> Result<Vec<u8>, super::super::CoreError> {
+    if format == StoreFormat::Json {
+        return Ok(plaintext.to_vec());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        encrypt(home, provider, label, plaintext, replace_existing)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (home, provider, label, replace_existing);
+        Ok(plaintext.to_vec())
+    }
 }
 
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -206,8 +388,9 @@ fn encrypt(
     provider: &str,
     label: &str,
     plaintext: &[u8],
+    replace_existing: bool,
 ) -> Result<Vec<u8>, super::super::CoreError> {
-    let key = get_or_create_key(home, provider, label)?;
+    let key = get_or_create_key(home, provider, label, replace_existing)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|_| environment_error("credential_store_unavailable", "invalid Keychain key"))?;
     let mut nonce_bytes = [0_u8; 12];
@@ -261,11 +444,15 @@ fn get_or_create_key(
     home: &Path,
     provider: &str,
     label: &str,
+    replace_existing: bool,
 ) -> Result<Vec<u8>, super::super::CoreError> {
-    if let Some(key) = keychain_get(provider, label)? {
-        return Ok(key);
+    match keychain_get(provider, label) {
+        Ok(Some(key)) => return Ok(key),
+        Ok(None) => {}
+        Err(error) if replace_existing && is_invalid_keychain_key(&error) => {}
+        Err(error) => return Err(error),
     }
-    if credential_path(home, provider, label).exists() {
+    if credential_path(home, provider, label).exists() && !replace_existing {
         return Err(environment_error(
             "credential_store_unavailable",
             "credential key is missing from Keychain",
@@ -314,6 +501,11 @@ fn get_or_create_key(
 }
 
 #[cfg(target_os = "macos")]
+fn is_invalid_keychain_key(error: &super::super::CoreError) -> bool {
+    error.reason == "credential_store_unavailable" && error.detail == "Keychain key is invalid"
+}
+
+#[cfg(target_os = "macos")]
 fn keychain_get(provider: &str, label: &str) -> Result<Option<Vec<u8>>, super::super::CoreError> {
     let account = format!("{provider}:{label}:key");
     let output = Command::new("security")
@@ -358,5 +550,112 @@ fn keychain_delete(provider: &str, label: &str) -> Result<(), super::super::Core
     } else {
         // A deleted or never-created key is already the desired local state.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::{LoginCredential, StoreFormat, credential_path_for, put_for_with, read_for};
+
+    #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+    struct FixtureCredential {
+        access_token: String,
+    }
+
+    #[test]
+    fn login_replaces_a_fabricated_undecryptable_enc_file() {
+        let home = std::env::temp_dir().join(format!(
+            "kogen-credential-store-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let path = credential_path_for(&home, "chatgpt", "default", StoreFormat::Encrypted);
+        std::fs::create_dir_all(path.parent().expect("credential parent"))
+            .expect("create temporary credential directory");
+        std::fs::write(&path, b"fabricated ciphertext from an older format")
+            .expect("write fabricated encrypted credential");
+
+        let undecrypt = |_: &std::path::Path, _: &[u8]| {
+            Err(super::super::super::environment_error(
+                "credential_store_unavailable",
+                "credential decryption failed",
+            ))
+        };
+        let login_read: LoginCredential<FixtureCredential> = read_for(
+            &home,
+            "chatgpt",
+            "default",
+            StoreFormat::Encrypted,
+            true,
+            undecrypt,
+        )
+        .expect("login treats an undecryptable credential as absent");
+        assert!(login_read.credential.is_none());
+        assert!(login_read.unreadable);
+
+        let read_error = read_for::<FixtureCredential>(
+            &home,
+            "chatgpt",
+            "default",
+            StoreFormat::Encrypted,
+            false,
+            |_, _| {
+                Err(super::super::super::environment_error(
+                    "credential_store_unavailable",
+                    "credential decryption failed",
+                ))
+            },
+        )
+        .expect_err("commands that need the credential still fail");
+        assert_eq!(read_error.reason, "credential_store_unavailable");
+        assert!(
+            read_error
+                .detail
+                .contains("run kogen provider login chatgpt")
+        );
+
+        let replacement = FixtureCredential {
+            access_token: "fabricated replacement token".to_owned(),
+        };
+        let mut allowed_key_replacement = false;
+        put_for_with(
+            &home,
+            "chatgpt",
+            "default",
+            &replacement,
+            StoreFormat::Encrypted,
+            true,
+            |plaintext, replace_existing| {
+                allowed_key_replacement = replace_existing;
+                let mut sealed = b"test-sealed:".to_vec();
+                sealed.extend_from_slice(plaintext);
+                Ok(sealed)
+            },
+        )
+        .expect("atomically replace fabricated encrypted credential");
+        assert!(allowed_key_replacement);
+
+        let replaced = std::fs::read(&path).expect("read fabricated test credential");
+        let plaintext = replaced
+            .strip_prefix(b"test-sealed:")
+            .expect("replacement uses the test encryption wrapper");
+        let stored: FixtureCredential =
+            serde_json::from_slice(plaintext).expect("decode fabricated replacement");
+        assert_eq!(stored, replacement);
+        let entries = std::fs::read_dir(path.parent().expect("credential parent"))
+            .expect("list temporary credential directory")
+            .count();
+        assert_eq!(entries, 1, "atomic replacement leaves no temporary files");
+
+        std::fs::remove_dir_all(&home).expect("remove temporary HOME");
+    }
+
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
     }
 }

@@ -199,6 +199,21 @@ pub(crate) fn revoke_owned(credential: &Credential) -> bool {
     oauth::revoke(credential)
 }
 
+pub(crate) fn get_login_credential(
+    home: &Path,
+    label: &str,
+) -> Result<store::LoginCredential<Credential>, super::CoreError> {
+    store::get_for_login(home, "chatgpt", label)
+}
+
+pub(crate) fn put_login_credential(
+    home: &Path,
+    label: &str,
+    credential: &Credential,
+) -> Result<(), super::CoreError> {
+    store::put_for_login(home, "chatgpt", label, credential)
+}
+
 pub(crate) fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -10,6 +10,8 @@ use serde_json::{Map, Value};
 use super::{accounts, auth, environment_error, provider_error};
 
 const LABEL: &str = "default";
+const UNREADABLE_CREDENTIAL_WARNING: &str =
+    "kogen: warning: saved ChatGPT credential could not be read; login will replace it.\n";
 
 pub fn list(home: &Path) -> Result<String, super::CoreError> {
     accounts::list(home)
@@ -17,7 +19,11 @@ pub fn list(home: &Path) -> Result<String, super::CoreError> {
 
 /// Complete ChatGPT's PKCE flow. The progress callback is flushed by the CLI
 /// before the browser opens so users can see and copy the authorization URL.
-pub fn login(home: &Path, mut progress: impl FnMut(&str)) -> Result<String, super::CoreError> {
+pub fn login(
+    home: &Path,
+    mut progress: impl FnMut(&str),
+    mut warning: impl FnMut(&str),
+) -> Result<String, super::CoreError> {
     let profiles = read_profiles(home)?;
     let old_profile = profile(&profiles, "chatgpt", LABEL).cloned();
     let show_notice = old_profile
@@ -25,7 +31,9 @@ pub fn login(home: &Path, mut progress: impl FnMut(&str)) -> Result<String, supe
         .and_then(|record| record.get("notice_shown"))
         .and_then(Value::as_bool)
         != Some(true);
-    let old_credential = auth::get_credential(home, LABEL)?;
+    let login_credential = auth::get_login_credential(home, LABEL)?;
+    warn_unreadable_credential(login_credential.unreadable, &mut warning);
+    let old_credential = login_credential.credential;
     let previous_client = old_credential
         .as_ref()
         .map(|credential| credential.client_id.as_str())
@@ -48,7 +56,7 @@ pub fn login(home: &Path, mut progress: impl FnMut(&str)) -> Result<String, supe
             "ChatGPT account subject changed for the default label; sign out before changing accounts",
         ));
     }
-    auth::put_credential(home, LABEL, &credential)?;
+    auth::put_login_credential(home, LABEL, &credential)?;
     let mut profiles = profiles;
     update_profile(
         &mut profiles,
@@ -208,6 +216,12 @@ fn profile<'a>(profiles: &'a Value, provider: &str, label: &str) -> Option<&'a V
     profiles.get(provider)?.get(label)
 }
 
+fn warn_unreadable_credential(unreadable: bool, warning: &mut impl FnMut(&str)) {
+    if unreadable {
+        warning(UNREADABLE_CREDENTIAL_WARNING);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_profile(
     profiles: &mut Value,
@@ -303,4 +317,28 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(temp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::warn_unreadable_credential;
+
+    #[test]
+    fn unreadable_credential_warning_is_one_stderr_line() {
+        let mut warnings = Vec::new();
+        warn_unreadable_credential(true, &mut |line| warnings.push(line.to_owned()));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0],
+            "kogen: warning: saved ChatGPT credential could not be read; login will replace it.\n"
+        );
+        assert_eq!(warnings[0].lines().count(), 1);
+    }
+
+    #[test]
+    fn readable_or_missing_credential_does_not_warn() {
+        let mut warnings = Vec::new();
+        warn_unreadable_credential(false, &mut |line| warnings.push(line.to_owned()));
+        assert!(warnings.is_empty());
+    }
 }

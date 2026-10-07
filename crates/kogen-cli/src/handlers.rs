@@ -18,11 +18,19 @@ pub fn dispatch(command: Command) -> CliOutput {
             let Some(home) = home_dir() else {
                 return home_error();
             };
-            let output = chatgpt::login(&home, |line| {
-                let mut stdout = std::io::stdout().lock();
-                let _ = stdout.write_all(line.as_bytes());
-                let _ = stdout.flush();
-            });
+            let output = chatgpt::login(
+                &home,
+                |line| {
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = stdout.write_all(line.as_bytes());
+                    let _ = stdout.flush();
+                },
+                |line| {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = stderr.write_all(line.as_bytes());
+                    let _ = stderr.flush();
+                },
+            );
             provider_output(output)
         }
         Command::ProviderLogin { provider } if provider == "grok" => {
