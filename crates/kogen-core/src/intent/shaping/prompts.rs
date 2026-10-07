@@ -8,6 +8,8 @@ pub(super) const SHAPER_SYSTEM: &str = r#"You are Kogen Intent shaper. Read the 
 
 Write exactly the two paths supplied by the user. Use only the read, search, and write tools. Do not change any other path.
 
+Kogen configuration, acceptance sources, and effective gate files are protected. Do not edit them unless the Intent declares `changes_gate: true` and the task truly requires the edit. Keep protected paths out of the change list unless that change is required.
+
 Use this Intent structure. Replace every placeholder with real content. Do not write a `## Brief` or `## Request` heading; Kogen appends the original Request verbatim after shaping.
 
 ```markdown
@@ -207,5 +209,77 @@ mod tests {
         );
         assert!(repair.ends_with(&format!("Exact failure output:\n\n{feedback}")));
         assert!(fallback.ends_with(&format!("Last validation failure:\n\n{feedback}")));
+    }
+
+    #[test]
+    fn r10_repeated_gate_feedback_is_repaired_with_path_and_action() {
+        const TRANSCRIPT: &str = include_str!("testdata/syn-20-r10-undeclared-gate-feedback.jsonl");
+
+        let events = TRANSCRIPT
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 5);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["pass_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5, 6]
+        );
+        let original_feedback = events[0]["feedback"]
+            .as_str()
+            .expect("r10 feedback is text");
+        assert!(
+            events
+                .iter()
+                .all(|event| event["feedback"] == original_feedback)
+        );
+        let matched_path = original_feedback
+            .split("matched path ")
+            .nth(1)
+            .and_then(|path| path.strip_suffix('.'))
+            .expect("r10 feedback names its matched path");
+        assert_eq!(matched_path, ".kogen/project.yaml");
+
+        let failure = ValidationFailure {
+            reason: "undeclared_gate_path",
+            detail: super::super::validation::undeclared_gate_path_detail(matched_path),
+        };
+        let feedback = validation_feedback(&failure);
+        let remove_instruction = format!("Remove `{matched_path}` from the change list");
+        for required in [
+            "Kogen configuration, acceptance sources, and effective gate files",
+            "unless the Intent declares `changes_gate: true` and the change is required",
+            "declare `changes_gate: true` if changing it is truly required",
+        ] {
+            assert!(
+                feedback.contains(required),
+                "missing {required:?} in {feedback:?}"
+            );
+        }
+        assert!(feedback.contains(matched_path));
+        assert!(feedback.contains(&remove_instruction));
+    }
+
+    #[test]
+    fn shaper_system_protects_configuration_acceptance_and_gate_paths() {
+        for required in [
+            "Kogen configuration, acceptance sources, and effective gate files are protected",
+            "Do not edit them unless the Intent declares `changes_gate: true` and the task truly requires the edit",
+            "Keep protected paths out of the change list",
+        ] {
+            assert!(SHAPER_SYSTEM.contains(required), "missing {required:?}");
+        }
+
+        let message = super::first_message(
+            "syn-20-email-invite-flow",
+            &[],
+            &[".kogen/project.yaml".to_owned()],
+            b"request",
+            ".kogen/intents/syn-20-email-invite-flow/intent.md",
+            ".kogen/acceptance/syn-20-email-invite-flow_test.exs",
+        );
+        assert!(message.contains("Effective gate paths: `.kogen/project.yaml`."));
     }
 }

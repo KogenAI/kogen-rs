@@ -6,6 +6,7 @@ use super::super::provider::{
     ShapeProvider, ShapeSession, ShapeSessionSpec, dispatch_shaper_tools,
 };
 use super::super::validation::ValidationFailure;
+use super::accounting::ShapeAccounting;
 use super::checkout_lock::CheckoutLock;
 use super::config::{domains, gate_paths, role_config, selected_account};
 use super::files::{
@@ -20,11 +21,12 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::time::Instant;
 
 const SHAPER_DEFAULT: (&str, &str) = ("gpt-6.1-sol", "high");
-const FALLBACK_SHAPER: (&str, &str) = ("gpt-6.1-sol", "high");
 
 pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
+    let started = Instant::now();
     if !valid_slug(&options.slug) {
         return Err(shape_error(
             ErrorClass::Intent,
@@ -33,6 +35,31 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
             crate::ExitCode::Usage,
         ));
     }
+    let run_dir = create_run_dir(&options.home, &options.slug)?;
+    let mut accounting = ShapeAccounting::new(&run_dir, started);
+    let result = run_in_directory(options, run_dir, &mut accounting);
+    finish_with_accounting(&mut accounting, result)
+}
+
+fn finish_with_accounting<T>(
+    accounting: &mut ShapeAccounting,
+    result: Result<T, CoreError>,
+) -> Result<T, CoreError> {
+    accounting.finish(&result);
+    match accounting.write() {
+        Ok(()) => result,
+        Err(write_error) => match result {
+            Ok(_) => Err(write_error),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn run_in_directory(
+    options: ShapeOptions,
+    run_dir: PathBuf,
+    accounting: &mut ShapeAccounting,
+) -> Result<ShapeReport, CoreError> {
     if request_is_empty(&options.request) {
         return Err(shape_error(
             ErrorClass::Intent,
@@ -66,8 +93,49 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
     remove_stale(&intent_dir.join("ledger.json"))?;
     remove_stale(&intent_dir.join("shape-warnings.json"))?;
 
-    let run_dir = create_run_dir(&options.home, &options.slug)?;
     let transcript_path = run_dir.join("transcript.jsonl");
+    run_with_scratch(
+        options,
+        project,
+        ShapeScratch {
+            intent_path,
+            acceptance_path,
+            intent_rel,
+            acceptance_rel,
+            candidate_rel,
+            run_dir,
+            transcript_path,
+        },
+        accounting,
+    )
+}
+
+struct ShapeScratch {
+    intent_path: PathBuf,
+    acceptance_path: PathBuf,
+    intent_rel: String,
+    acceptance_rel: String,
+    candidate_rel: String,
+    run_dir: PathBuf,
+    transcript_path: PathBuf,
+}
+
+fn run_with_scratch(
+    options: ShapeOptions,
+    project: ProjectResolution,
+    scratch: ShapeScratch,
+    accounting: &mut ShapeAccounting,
+) -> Result<ShapeReport, CoreError> {
+    let ShapeScratch {
+        intent_path,
+        acceptance_path,
+        intent_rel,
+        acceptance_rel,
+        candidate_rel,
+        run_dir,
+        transcript_path,
+    } = scratch;
+    let config = project.config.as_ref();
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -78,6 +146,7 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
     let commands = ShapeCommands::new(&project.checkout, &run_dir, config)?;
     commands.setup(&project.checkout, config)?;
     let account = selected_account(&options.home, &project)?;
+    accounting.set_provider(&account.provider);
     let provider = ShapeProvider::new(&options.home, account)?;
     let domains = domains(config);
     let gate_paths = gate_paths(config);
@@ -90,10 +159,18 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         &acceptance_rel,
     );
     let shaper_role = role_config(config, "shaper", SHAPER_DEFAULT);
-    // §3.2 fixes the fallback conversation to Sol/high. A project role override
-    // for `fallback_shaper` must not turn the fallback into another Luna pass.
-    let fallback_role = (FALLBACK_SHAPER.0.to_owned(), FALLBACK_SHAPER.1.to_owned());
+    // §3.2 resolves the fresh fallback conversation from the effective shaper
+    // profile; provider-specific selection is preserved.
+    let fallback_role = shaper_role.clone();
     let auditor_role = role_config(config, "auditor", SHAPER_DEFAULT);
+    accounting.set_role("shaper", "shaper", &shaper_role.0, &shaper_role.1);
+    accounting.set_role(
+        "fallback_shaper",
+        "fallback_shaper",
+        &fallback_role.0,
+        &fallback_role.1,
+    );
+    accounting.set_role("auditor", "auditor", &auditor_role.0, &auditor_role.1);
     let result_tokens = config
         .and_then(|config| config.raw["build"]["tool_result_tokens"].as_u64())
         .unwrap_or(2_000);
@@ -127,9 +204,11 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         coverage_repaired: false,
         audit_repaired: false,
         concern_seen: BTreeSet::new(),
+        accounting,
     };
     let mut conversation_style_repairs = 0;
-    for pass in 1..=6 {
+    let mut pass = 1;
+    'passes: while pass <= 6 {
         state
             .warnings
             .retain(|warning| warning.code == "feasibility_concern");
@@ -158,6 +237,13 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                         .expect("fallback has last failure"),
                 );
                 state.record_feedback(pass, "validation", &feedback);
+                state.accounting.repair(repair_kind(
+                    state
+                        .last_failure
+                        .as_ref()
+                        .expect("fallback has last failure")
+                        .reason,
+                ));
                 prompts::fallback_message(&state.initial, &feedback)
             } else {
                 state
@@ -165,7 +251,7 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                     .push(format!("shaper pass={pass} role={role} started"));
                 state.initial.clone()
             };
-            state.session = Some(state.provider.session(ShapeSessionSpec {
+            let session = state.provider.session(ShapeSessionSpec {
                 run_dir: &state.run_dir,
                 stage: role,
                 attempt: &format!("pass-{pass}"),
@@ -175,7 +261,15 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                 instructions: prompts::SHAPER_SYSTEM,
                 tools: true,
                 initial_user: first,
-            })?);
+            })?;
+            state.accounting.record_session(
+                session.conversation_id(),
+                role,
+                role,
+                session.effective_model(),
+                session.effective_effort(),
+            );
+            state.session = Some(session);
         } else {
             state
                 .progress
@@ -186,6 +280,13 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                 .map(prompts::validation_feedback)
             {
                 state.record_feedback(pass, "validation", &feedback);
+                state.accounting.repair(repair_kind(
+                    state
+                        .last_failure
+                        .as_ref()
+                        .expect("feedback has failure")
+                        .reason,
+                ));
                 state
                     .session
                     .as_mut()
@@ -199,14 +300,33 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         }
 
         let validation = loop {
-            let final_text = state.drive_shaper(role, &model, &effort, pass)?;
-            let result = validate_pass(
+            let final_text = match state.drive_shaper(role, &model, &effort, pass) {
+                Ok(final_text) => final_text,
+                Err(error) => {
+                    if pass <= 3 && error.reason == "shape_turn_limit" {
+                        let failure =
+                            primary_turn_limit_fallback(pass, &error, state.last_failure.take())
+                                .expect("primary turn-limit error starts fallback");
+                        state.last_failure = Some(failure);
+                        pass = 4;
+                        continue 'passes;
+                    }
+                    return Err(error);
+                }
+            };
+            let result = match validate_pass(
                 &mut state,
                 pass,
                 role,
                 final_text.as_str(),
                 conversation_style_repairs,
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    state.accounting.validation_pass();
+                    return Err(error);
+                }
+            };
             match result {
                 PassResult::StyleRepair(findings) => {
                     debug_assert!(conversation_style_repairs < 2);
@@ -215,6 +335,7 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                         .push(format!("shaper pass={pass} role={role} style_repair"));
                     let feedback = prompts::style_message(&findings);
                     state.record_feedback(pass, "style", &feedback);
+                    state.accounting.repair("style");
                     state
                         .session
                         .as_mut()
@@ -222,8 +343,14 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                         .append_user(feedback);
                     conversation_style_repairs += 1;
                 }
-                PassResult::Failure(failure) => break Err(failure),
-                PassResult::Complete => break Ok(()),
+                PassResult::Failure(failure) => {
+                    state.accounting.validation_pass();
+                    break Err(failure);
+                }
+                PassResult::Complete => {
+                    state.accounting.validation_pass();
+                    break Ok(());
+                }
             }
         };
         let turns = state.session.as_ref().map_or(0, ShapeSession::turn_count);
@@ -247,9 +374,14 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                 failure.reason
             ));
             if pass == 6 {
-                return Err(repair_limit_error(failure, pass, state.calls.len()));
+                return Err(repair_limit_error(
+                    failure,
+                    state.accounting.validation_passes(),
+                    state.calls.len(),
+                ));
             }
             state.last_failure = Some(failure);
+            pass += 1;
             continue;
         }
         state
@@ -296,11 +428,12 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         } else {
             "not checked".to_owned()
         };
+        let rounds = state.accounting.validation_passes();
         return Ok(ShapeReport {
             intent_path: state.intent_path,
             acceptance_path: state.acceptance_path,
             transcript_path: state.transcript_path,
-            rounds: pass,
+            rounds,
             feasibility,
             warnings: state.warnings,
             calls: state.calls,
@@ -310,7 +443,30 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
     unreachable!("the six-pass loop returns or errors")
 }
 
-pub(super) struct RunState {
+fn repair_kind(reason: &str) -> &'static str {
+    match reason {
+        "coverage_gap" => "coverage",
+        "audit_over_strict" => "test_audit",
+        "shape_turn_limit" => "turn_limit",
+        _ => "validation",
+    }
+}
+
+fn primary_turn_limit_fallback(
+    pass: usize,
+    error: &CoreError,
+    last_failure: Option<ValidationFailure>,
+) -> Option<ValidationFailure> {
+    if pass > 3 || error.reason != "shape_turn_limit" {
+        return None;
+    }
+    Some(last_failure.unwrap_or(ValidationFailure {
+        reason: "shape_turn_limit",
+        detail: error.detail.clone(),
+    }))
+}
+
+pub(super) struct RunState<'a> {
     pub(super) options: ShapeOptions,
     pub(super) checkout: PathBuf,
     pub(super) config: Option<crate::project::ProjectConfig>,
@@ -338,6 +494,7 @@ pub(super) struct RunState {
     pub(super) coverage_repaired: bool,
     pub(super) audit_repaired: bool,
     pub(super) concern_seen: BTreeSet<String>,
+    accounting: &'a mut ShapeAccounting,
 }
 
 pub(super) enum PassResult {
@@ -346,7 +503,7 @@ pub(super) enum PassResult {
     StyleRepair(Vec<String>),
 }
 
-impl RunState {
+impl RunState<'_> {
     fn record_feedback(&self, pass_index: usize, kind: &str, feedback: &str) {
         let value = super::super::journal::feedback_value(pass_index, kind, feedback);
         super::super::journal::append(&self.transcript_path, &value);
@@ -360,9 +517,35 @@ impl RunState {
         _pass: usize,
     ) -> Result<String, CoreError> {
         loop {
-            let turn = self
-                .provider
-                .turn(self.session.as_mut().expect("shaper session exists"))?;
+            let (conversation_id, turn_result) = {
+                let session = self.session.as_mut().expect("shaper session exists");
+                let conversation_id = session.conversation_id().to_owned();
+                (conversation_id, self.provider.turn(session))
+            };
+            let turn = match turn_result {
+                Ok(turn) => {
+                    self.accounting.record_success(
+                        &conversation_id,
+                        role,
+                        &turn.call.model,
+                        &turn.call.effort,
+                        turn.http_attempts,
+                        &turn.call.usage,
+                    );
+                    turn
+                }
+                Err(failure) => {
+                    self.accounting.record_failure(
+                        &conversation_id,
+                        role,
+                        model,
+                        effort,
+                        failure.http_attempts,
+                        failure.usage.as_ref(),
+                    );
+                    return Err(failure.error);
+                }
+            };
             self.record_call(&turn.call);
             if !turn.response.tool_calls.is_empty() {
                 let _lock = CheckoutLock::acquire(&self.options.home, &self.checkout)?;
@@ -385,6 +568,7 @@ impl RunState {
                 .into_iter()
                 .any(|path| fs::read(path).is_err());
             if missing {
+                self.accounting.finish_guard();
                 self.session
                     .as_mut()
                     .expect("shaper session exists")
@@ -417,7 +601,38 @@ impl RunState {
             tools: false,
             initial_user: message,
         })?;
-        let turn = self.provider.turn(&mut session)?;
+        let conversation_id = session.conversation_id().to_owned();
+        self.accounting.record_session(
+            &conversation_id,
+            "auditor",
+            "auditor",
+            session.effective_model(),
+            session.effective_effort(),
+        );
+        let turn = match self.provider.turn(&mut session) {
+            Ok(turn) => {
+                self.accounting.record_success(
+                    &conversation_id,
+                    "auditor",
+                    &turn.call.model,
+                    &turn.call.effort,
+                    turn.http_attempts,
+                    &turn.call.usage,
+                );
+                turn
+            }
+            Err(failure) => {
+                self.accounting.record_failure(
+                    &conversation_id,
+                    "auditor",
+                    session.effective_model(),
+                    session.effective_effort(),
+                    failure.http_attempts,
+                    failure.usage.as_ref(),
+                );
+                return Err(failure.error);
+            }
+        };
         self.record_call(&turn.call);
         Ok(turn.response.text)
     }
@@ -428,5 +643,91 @@ impl RunState {
         if let Ok(mut file) = OpenOptions::new().append(true).open(&self.transcript_path) {
             let _ = writeln!(file, "{}", value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{primary_turn_limit_fallback, run};
+    use crate::ExitCode;
+    use crate::error::{CoreError, ErrorClass};
+    use crate::intent::shaping::prompts;
+    use crate::intent::shaping::runner::ShapeOptions;
+    use crate::intent::shaping::validation::ValidationFailure;
+    use serde_json::Value;
+    use std::fs;
+
+    #[test]
+    fn primary_turn_limit_starts_fallback_and_keeps_the_last_validation_failure() {
+        let turn_limit = CoreError::new(
+            ErrorClass::Candidate,
+            "shape_turn_limit",
+            "Shaper exhausted its turn limit.",
+            ExitCode::Negative,
+        );
+        let last_failure = ValidationFailure {
+            reason: "undeclared_gate_path",
+            detail: "Remove `.kogen/project.yaml` from the change list.".to_owned(),
+        };
+        let fallback = primary_turn_limit_fallback(2, &turn_limit, Some(last_failure.clone()))
+            .expect("primary turn exhaustion starts fallback");
+        let message = prompts::fallback_message(
+            "initial shaping request",
+            &prompts::validation_feedback(&fallback),
+        );
+        assert!(message.contains("Last validation failure:"));
+        assert!(message.contains("candidate/undeclared_gate_path"));
+        assert!(message.contains(".kogen/project.yaml"));
+
+        let no_validation = primary_turn_limit_fallback(1, &turn_limit, None)
+            .expect("fallback receives a turn-limit failure when validation never completed");
+        assert_eq!(no_validation.reason, "shape_turn_limit");
+        assert_eq!(no_validation.detail, "Shaper exhausted its turn limit.");
+        assert!(primary_turn_limit_fallback(4, &turn_limit, None).is_none());
+
+        let provider_error = CoreError::new(
+            ErrorClass::Provider,
+            "overload",
+            "temporarily overloaded",
+            ExitCode::Provider,
+        );
+        assert!(primary_turn_limit_fallback(2, &provider_error, None).is_none());
+    }
+
+    #[test]
+    fn empty_request_failure_has_an_accounting_receipt() {
+        let home = std::env::temp_dir().join(format!(
+            "kogen-shape-exit-receipt-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let error = run(ShapeOptions {
+            cwd: home.clone(),
+            home: home.clone(),
+            project: None,
+            origin: None,
+            base: None,
+            slug: "receipt-test".to_owned(),
+            request: b" \n".to_vec(),
+        })
+        .expect_err("empty request is rejected");
+        assert_eq!(error.reason, "request_unavailable");
+
+        let run_dir = fs::read_dir(home.join(".kogen/runs/shaping/receipt-test"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(run_dir.join("shape-accounting.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["outcome"], "failure");
+        assert_eq!(receipt["terminal_reason"], "request_unavailable");
+        assert_eq!(
+            receipt["diagnostic"],
+            "intent/request_unavailable: request is empty"
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 }

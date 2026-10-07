@@ -5,12 +5,11 @@ use crate::error::{CoreError, ErrorClass};
 use crate::provider::auth;
 use crate::provider::http::retry::RetryReplay;
 use crate::provider::http::{
-    ApiMode, ProviderCallFailure, RequestContext, RequestPolicy, ReqwestPort, SystemClock,
-    WireConfig, respond,
+    ApiMode, RequestContext, RequestPolicy, ReqwestPort, SystemClock, WireConfig, respond,
 };
 use crate::provider::session::ConversationBinding;
 use crate::provider::tools::{self, ToolContext, ToolRole};
-use crate::provider::{ModelResponse, ModelToolCall, RunAccount};
+use crate::provider::{ModelResponse, ModelToolCall, ModelUsage, RunAccount};
 use crate::run::{ChildEnvironment, ProcessPort};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -61,18 +60,24 @@ impl ShapeProvider {
         })
     }
 
-    pub fn turn(&self, session: &mut ShapeSession) -> Result<ShapeTurn, CoreError> {
+    pub fn turn(&self, session: &mut ShapeSession) -> Result<ShapeTurn, Box<ShapeTurnFailure>> {
         if session.turns >= MAX_TURNS {
-            return Err(CoreError::new(
-                ErrorClass::Candidate,
-                "shape_turn_limit",
-                "Shaper exhausted its turn limit.",
-                crate::ExitCode::Negative,
-            ));
+            return Err(Box::new(ShapeTurnFailure {
+                error: CoreError::new(
+                    ErrorClass::Candidate,
+                    "shape_turn_limit",
+                    "Shaper exhausted its turn limit.",
+                    crate::ExitCode::Negative,
+                ),
+                http_attempts: 0,
+                usage: None,
+            }));
         }
-        let credential = auth::credential_for_request(&self.home, &self.account)?;
-        let config =
-            WireConfig::from_auth(&credential, ApiMode::Responses).map_err(provider_failure)?;
+        let credential = auth::credential_for_request(&self.home, &self.account)
+            .map_err(ShapeTurnFailure::without_attempts)?;
+        let config = WireConfig::from_auth(&credential, ApiMode::Responses)
+            .map_err(provider_failure)
+            .map_err(ShapeTurnFailure::without_attempts)?;
         let mut request_credential = credential;
         let mut retry = RetryReplay::default();
         let fallback_model = session.context.model.clone();
@@ -98,14 +103,23 @@ impl ShapeProvider {
             Some(&self.account.label),
         );
         let ended_at_ms = unix_ms().max(started_at_ms);
-        let call = result.map_err(call_failure)?;
+        let call = result.map_err(|failure| {
+            let http_attempts = failure.attempts.len();
+            let usage = failure.failure.usage.as_deref().cloned();
+            Box::new(ShapeTurnFailure {
+                error: provider_failure(*failure.failure),
+                http_attempts,
+                usage,
+            })
+        })?;
+        let http_attempts = call.attempts.len();
         let wire = call.attempts.last().ok_or_else(|| {
-            CoreError::new(
+            ShapeTurnFailure::without_attempts(CoreError::new(
                 ErrorClass::Provider,
                 "shape_request_unavailable",
                 "Shape provider returned no request metadata.",
                 crate::ExitCode::Provider,
-            )
+            ))
         })?;
         let request = super::journal::request_metadata(
             wire,
@@ -131,7 +145,11 @@ impl ShapeProvider {
             wall_ms: start.elapsed().as_millis() as u64,
             request,
         };
-        Ok(ShapeTurn { response, call })
+        Ok(ShapeTurn {
+            response,
+            call,
+            http_attempts,
+        })
     }
 }
 
@@ -155,6 +173,18 @@ pub(super) struct ShapeSession {
 }
 
 impl ShapeSession {
+    pub fn conversation_id(&self) -> &str {
+        &self.context.thread_id
+    }
+
+    pub fn effective_model(&self) -> &str {
+        &self.context.model
+    }
+
+    pub fn effective_effort(&self) -> &str {
+        &self.context.effort
+    }
+
     pub fn append_user(&mut self, text: impl Into<String>) {
         self.context.input.push(json!({
             "role": "user",
@@ -205,6 +235,23 @@ fn unix_ms() -> i64 {
 pub(super) struct ShapeTurn {
     pub response: ModelResponse,
     pub call: ShapeModelCall,
+    pub http_attempts: usize,
+}
+
+pub(super) struct ShapeTurnFailure {
+    pub error: CoreError,
+    pub http_attempts: usize,
+    pub usage: Option<ModelUsage>,
+}
+
+impl ShapeTurnFailure {
+    fn without_attempts(error: CoreError) -> Box<Self> {
+        Box::new(Self {
+            error,
+            http_attempts: 0,
+            usage: None,
+        })
+    }
 }
 
 pub(super) fn dispatch_shaper_tools(
@@ -251,10 +298,6 @@ fn provider_failure(failure: crate::provider::ProviderFailure) -> CoreError {
         failure.message,
         crate::ExitCode::Provider,
     )
-}
-
-fn call_failure(failure: ProviderCallFailure) -> CoreError {
-    provider_failure(*failure.failure)
 }
 
 fn provider_io_error(error: std::io::Error) -> CoreError {

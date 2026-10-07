@@ -89,6 +89,12 @@ pub(super) fn undeclared_gate_path(
         .cloned()
 }
 
+pub(super) fn undeclared_gate_path_detail(path: &str) -> String {
+    format!(
+        "Gate-path edit requires `changes_gate: true`; matched path {path}. Kogen configuration, acceptance sources, and effective gate files must not be edited unless the Intent declares `changes_gate: true` and the change is required. Remove `{path}` from the change list, or declare `changes_gate: true` if changing it is truly required."
+    )
+}
+
 pub(super) fn reclassify(
     slug: &str,
     bytes: &[u8],

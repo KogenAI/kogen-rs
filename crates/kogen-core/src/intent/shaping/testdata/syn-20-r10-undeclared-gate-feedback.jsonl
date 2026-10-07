@@ -1,0 +1,5 @@
+{"feedback":"candidate/undeclared_gate_path: Gate-path edit requires `changes_gate: true`; matched path .kogen/project.yaml.","feedback_kind":"validation","kind":"shape_feedback","pass_index":2}
+{"feedback":"candidate/undeclared_gate_path: Gate-path edit requires `changes_gate: true`; matched path .kogen/project.yaml.","feedback_kind":"validation","kind":"shape_feedback","pass_index":3}
+{"feedback":"candidate/undeclared_gate_path: Gate-path edit requires `changes_gate: true`; matched path .kogen/project.yaml.","feedback_kind":"validation","kind":"shape_feedback","pass_index":4}
+{"feedback":"candidate/undeclared_gate_path: Gate-path edit requires `changes_gate: true`; matched path .kogen/project.yaml.","feedback_kind":"validation","kind":"shape_feedback","pass_index":5}
+{"feedback":"candidate/undeclared_gate_path: Gate-path edit requires `changes_gate: true`; matched path .kogen/project.yaml.","feedback_kind":"validation","kind":"shape_feedback","pass_index":6}

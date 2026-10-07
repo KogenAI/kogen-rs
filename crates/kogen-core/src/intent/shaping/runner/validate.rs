@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs;
 
 pub(super) fn validate_pass(
-    state: &mut RunState,
+    state: &mut RunState<'_>,
     pass: usize,
     role: &str,
     final_text: &str,
@@ -58,7 +58,7 @@ pub(super) fn validate_pass(
     if let Some(path) = validation::undeclared_gate_path(&parsed.intent, &test, &state.gate_paths) {
         return Ok(PassResult::Failure(ValidationFailure {
             reason: "undeclared_gate_path",
-            detail: format!("Gate-path edit requires `changes_gate: true`; matched path {path}."),
+            detail: validation::undeclared_gate_path_detail(&path),
         }));
     }
     let formatter_unavailable = match state.commands.formatter(
