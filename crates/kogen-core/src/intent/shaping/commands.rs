@@ -244,7 +244,23 @@ impl ShapeCommands {
                 }
             })?
         };
-        let assessed = base::assess(&result, slug, &command_argv0);
+        let environment_failure = if self.acceptance.adapter == "exunit"
+            && !result.process.timed_out
+            && (result.process.unavailable
+                || result.process.exit_status.is_some_and(|status| status != 0))
+        {
+            crate::gate::adapters::exunit::process_environment_failure(&result.process, use_mise)
+        } else {
+            None
+        };
+        let assessed = if let Some(failure) = environment_failure {
+            Err(ValidationFailure {
+                reason: failure.reason,
+                detail: failure.detail,
+            })
+        } else {
+            base::assess(&result, slug, &command_argv0)
+        };
         super::journal::append(
             &self.runner_dir.join("transcript.jsonl"),
             &base::diagnostics(pass, slug, source_rel, &result, &assessed),
