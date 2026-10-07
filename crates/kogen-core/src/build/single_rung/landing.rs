@@ -40,6 +40,7 @@ pub(super) fn land_candidate(
         approved,
         options,
         store,
+        candidate,
         run_dir: store.directory().to_path_buf(),
         candidate_workspace: candidate.workspace().to_path_buf(),
         integrity,
@@ -82,6 +83,7 @@ struct Reverify<'a, 'p, 'build> {
     approved: &'a ApprovedBuild,
     options: &'a BuildOptions,
     store: &'a RunStore,
+    candidate: &'a LandingRepository,
     run_dir: PathBuf,
     candidate_workspace: PathBuf,
     integrity: &'a IntegritySnapshot,
@@ -137,7 +139,7 @@ impl IntegrationGate for Reverify<'_, '_, '_> {
                     self.verify_moved_base(&base, new_parent, &candidate_env, snapshot, &[])?;
                 if report.is_landable() {
                     let tree = report.verified_tree.clone();
-                    let _ = std::fs::remove_dir_all(base.workspace());
+                    let _ = base.cleanup_workspace();
                     return Ok(IntegrationResult {
                         rebase: RebaseKind::Green,
                         repairs: Vec::new(),
@@ -202,7 +204,7 @@ impl IntegrationGate for Reverify<'_, '_, '_> {
                     }
                     Err(_error) if Instant::now() >= deadline => break None,
                     Err(error) => {
-                        let _ = std::fs::remove_dir_all(base.workspace());
+                        let _ = base.cleanup_workspace();
                         return Err(landing_failure(core_error_text(error)));
                     }
                 }
@@ -216,11 +218,8 @@ impl IntegrationGate for Reverify<'_, '_, '_> {
                 break;
             }
 
-            let unresolved = stage_resolved_conflicts(
-                &self.candidate_workspace,
-                &conflict_paths,
-                &conflict_before,
-            )?;
+            let unresolved =
+                stage_resolved_conflicts(self.candidate, &conflict_paths, &conflict_before)?;
             let report =
                 self.verify_moved_base(&base, new_parent, &candidate_env, snapshot, &unresolved)?;
             if report.is_landable() && unresolved.is_empty() {
@@ -249,7 +248,7 @@ impl IntegrationGate for Reverify<'_, '_, '_> {
             };
         }
 
-        let _ = std::fs::remove_dir_all(base.workspace());
+        let _ = base.cleanup_workspace();
         Ok(IntegrationResult {
             rebase: rebase_kind,
             repairs,
@@ -429,11 +428,15 @@ fn conflict_path_state(workspace: &Path, relative: &str) -> Option<(u32, Vec<u8>
 }
 
 fn stage_resolved_conflicts(
-    workspace: &Path,
+    repository: &LandingRepository,
     conflict_paths: &[String],
     before: &BTreeMap<String, Option<(u32, Vec<u8>)>>,
 ) -> Result<Vec<String>, crate::git::landing::LandingError> {
-    let repo = crate::git::GitRepo::new(workspace);
+    repository
+        .reset_workspace_git_settings()
+        .map_err(landing_failure)?;
+    let workspace = repository.workspace();
+    let repo = crate::git::GitRepo::workspace(workspace);
     for path in conflict_paths {
         let current = conflict_path_state(workspace, path);
         if before.get(path) != Some(&current) {
@@ -477,4 +480,93 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::GitRepo;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn conflict_repair_clears_candidate_filter_config_before_staging() {
+        let root = test_dir();
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        git(
+            &root,
+            &["init", "--bare", "--initial-branch=main", path(&origin)],
+        );
+        git(&root, &["init", "--initial-branch=main", path(&seed)]);
+        kogen_test_support::set_identity(&seed, "Kogen Test", "test@kogen.invalid")
+            .expect("set fixture identity");
+        fs::write(seed.join("tracked.txt"), b"base\n").expect("write base file");
+        git(&seed, &["add", "tracked.txt"]);
+        git(&seed, &["commit", "--quiet", "-m", "base"]);
+        git(&seed, &["remote", "add", "origin", path(&origin)]);
+        git(&seed, &["push", "--quiet", "origin", "main"]);
+        let base = GitRepo::new(&origin)
+            .resolve_commit("refs/heads/main")
+            .expect("resolve base");
+        let repository =
+            LandingRepository::clone_fresh(&origin, &workspace, &base).expect("clone workspace");
+        let before = conflict_path_state(&workspace, "tracked.txt");
+        fs::write(workspace.join("tracked.txt"), b"repaired\n").expect("write repair");
+        fs::write(
+            workspace.join(".gitattributes"),
+            "tracked.txt filter=evil\n",
+        )
+        .expect("install candidate attribute");
+        let marker = root.join("filter-ran");
+        let filter = format!("sh -c 'touch \"{}\"; cat'", path(&marker));
+        git(&workspace, &["config", "filter.evil.clean", &filter]);
+        git(&workspace, &["config", "filter.evil.smudge", "cat"]);
+
+        let unresolved = stage_resolved_conflicts(
+            &repository,
+            &["tracked.txt".to_owned()],
+            &BTreeMap::from([("tracked.txt".to_owned(), before)]),
+        )
+        .expect("stage resolved repair without candidate Git controls");
+        assert!(unresolved.is_empty());
+        assert!(
+            !marker.exists(),
+            "candidate clean filter ran in the controller"
+        );
+        let staged = GitRepo::workspace(&workspace)
+            .output(&["show", ":tracked.txt"])
+            .expect("read staged repair blob");
+        assert_eq!(staged, b"repaired\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn git(directory: &Path, args: &[&str]) {
+        let output = kogen_test_support::git_command()
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .expect("run fixture Git command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn path(path: &Path) -> &str {
+        path.to_str().expect("temporary path is UTF-8")
+    }
+
+    fn test_dir() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "kogen-conflict-filter-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create fixture root");
+        root
+    }
 }

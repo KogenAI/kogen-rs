@@ -1,6 +1,5 @@
 use super::*;
 use std::collections::BTreeMap;
-use std::fs;
 
 pub fn run(
     project: &ProjectResolution,
@@ -40,9 +39,6 @@ pub fn run(
         .map_err(|error| environment_error("base_read_failed", error.to_string()))?;
     let started_ms = now_ms();
     let run_dir = project.state_root.join("runs").join(&run_id);
-    fs::create_dir_all(run_dir.join("logs"))
-        .and_then(|()| fs::create_dir_all(run_dir.join("tmp")))
-        .map_err(|error| environment_error("run_directory_unavailable", error.to_string()))?;
     let store = RunStore::new(&run_dir);
     let mut snapshot = RunSnapshot {
         schema: 2,
@@ -62,6 +58,10 @@ pub fn run(
     store
         .create(&snapshot)
         .map_err(|error| controller_error("run_journal_failed", error.to_string()))?;
+    for directory in ["logs", "tmp", "reports"] {
+        crate::safe_fs::ensure_dir(&run_dir, Path::new(directory))
+            .map_err(|error| environment_error("run_directory_unavailable", error.to_string()))?;
+    }
 
     let candidate_path = project.state_root.join(format!("{run_id}-R1"));
     let base_path = project.state_root.join(format!("{run_id}-base"));

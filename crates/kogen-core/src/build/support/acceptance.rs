@@ -35,7 +35,7 @@ pub(super) fn acceptance_request(
         candidate_path: candidate_path.to_path_buf(),
         workdir: workspace.to_path_buf(),
         run_dir: run_dir.to_path_buf(),
-        report_path: run_dir.join(report),
+        report_path: run_dir.join("reports").join(report),
         env: environment,
         timeout: options.acceptance_timeout,
         expected_items: approved

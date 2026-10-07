@@ -107,7 +107,7 @@ fn clean_against(path: &Path, expected_parent: &str) -> bool {
         None,
         &[],
     );
-    if !diff.is_ok_and(|output| output.status.success()) {
+    if !diff.is_ok_and(|output| output.success()) {
         return false;
     }
     git(

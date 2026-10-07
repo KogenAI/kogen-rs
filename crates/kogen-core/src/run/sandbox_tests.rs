@@ -151,6 +151,23 @@ fn build_policy_reads_only_documented_host_seams() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn build_policy_grants_only_scratch_and_report_write_access_in_the_run_tree() {
+    let root = test_dir("run-state-policy");
+    let run_dir = root.join("run");
+    let policy = SandboxPolicy::for_build(
+        true,
+        root.join("workspace"),
+        &run_dir,
+        &EnvironmentMap::new(),
+    );
+    assert!(!policy.writable_paths.contains(&run_dir));
+    for name in ["logs", "tmp", "reports", "mise-state", "mise-cache"] {
+        assert!(policy.writable_paths.contains(&run_dir.join(name)));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_profile_allows_workspace_writes_and_denies_secret_reads() {

@@ -17,6 +17,7 @@ pub use environment::{
     EnvironmentError, EnvironmentMap, EnvironmentRequest, build_child_environment, host_environment,
 };
 pub use persistence::{LandingRecord, RunEvent, RunPersistenceError, RunSnapshot, RunStore};
+pub(crate) use process::run_bounded_command;
 pub use process::{
     ChildEnvironment, DEFAULT_PROCESS_TIMEOUT, OUTPUT_TAIL_BYTES, ProcessError, ProcessPort,
     ProcessRequest, ProcessResult, ProcessSupervisor, SandboxObservation, SandboxStatus,

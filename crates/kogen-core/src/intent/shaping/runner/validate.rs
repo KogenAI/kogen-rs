@@ -26,7 +26,12 @@ pub(super) fn validate_pass(
         Ok(bytes) => bytes,
         Err(failure) => return Ok(PassResult::Failure(failure)),
     };
-    fs::write(&state.intent_path, &normalized)
+    let intent_rel = state
+        .intent_path
+        .strip_prefix(&state.checkout)
+        .map_err(|error| super::files::io_error("shape_output_unavailable", error))?;
+    crate::safe_fs::validate_write(&state.checkout, intent_rel)
+        .and_then(|()| crate::safe_fs::write_file(&state.checkout, intent_rel, &normalized))
         .map_err(|error| super::files::io_error("shape_output_unavailable", error))?;
     let mut parsed = match validation::parse_and_lint(&state.options.slug, &normalized) {
         Ok(parsed) => parsed,
@@ -96,7 +101,7 @@ pub(super) fn validate_pass(
         &state.checkout,
         &state.options.slug,
         &state.acceptance_rel,
-        &state.run_dir.join("base-acceptance.jsonl"),
+        &state.run_dir.join("reports/base-acceptance.jsonl"),
         item_ids.clone(),
     ) {
         Ok(results) => results,
@@ -118,7 +123,8 @@ pub(super) fn validate_pass(
             detail: "at least one test item must be fully red on the base".to_owned(),
         }));
     }
-    fs::write(&state.intent_path, &reclassified)
+    crate::safe_fs::validate_write(&state.checkout, intent_rel)
+        .and_then(|()| crate::safe_fs::write_file(&state.checkout, intent_rel, &reclassified))
         .map_err(|error| super::files::io_error("shape_output_unavailable", error))?;
     parsed = match validation::parse_and_lint(&state.options.slug, &reclassified) {
         Ok(parsed) => parsed,

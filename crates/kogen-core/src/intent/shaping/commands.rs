@@ -156,20 +156,19 @@ impl ShapeCommands {
                 ),
             });
         }
-        let parent = candidate.parent().ok_or_else(|| ValidationFailure {
+        let relative = Path::new(candidate_rel);
+        crate::safe_fs::validate_write(checkout, relative).map_err(|error| ValidationFailure {
             reason: "acceptance_check_path_conflict",
-            detail: format!("invalid candidate path {candidate_rel}"),
-        })?;
-        fs::create_dir_all(parent).map_err(|error| ValidationFailure {
-            reason: "acceptance_check_failed",
             detail: error.to_string(),
         })?;
-        fs::write(&candidate, source_bytes).map_err(|error| ValidationFailure {
-            reason: "acceptance_check_failed",
-            detail: error.to_string(),
+        crate::safe_fs::create_file(checkout, relative, source_bytes).map_err(|error| {
+            ValidationFailure {
+                reason: "acceptance_check_failed",
+                detail: error.to_string(),
+            }
         })?;
         let result = self.run_staged_checks(checkout, config, candidate_rel);
-        let restore = fs::remove_file(&candidate);
+        let restore = crate::safe_fs::remove_file(checkout, relative);
         if let Err(error) = restore
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -444,8 +443,10 @@ fn shape_acceptance(config: Option<&ProjectConfig>, checkout: &Path) -> ShapeAcc
 
 #[cfg(test)]
 mod tests {
-    use super::ShapeCommands;
+    use super::{ShapeAcceptance, ShapeCommands};
     use crate::project::ProjectConfig;
+    use crate::run::{ChildEnvironment, ProcessSupervisor};
+    use std::time::Duration;
 
     #[test]
     fn shape_paths_follow_builtin_and_command_acceptance_adapters() {
@@ -481,5 +482,46 @@ mod tests {
         );
 
         std::fs::remove_dir_all(checkout).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shape_staging_rejects_a_symlink_parent_before_writing() {
+        use std::os::unix::fs::symlink;
+
+        let checkout = std::env::temp_dir().join(format!(
+            "kogen-shape-staging-symlink-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let outside = checkout.with_extension("outside");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, checkout.join("test")).unwrap();
+        let commands = ShapeCommands {
+            process: ProcessSupervisor,
+            environment: ChildEnvironment::new(),
+            runner_dir: checkout.clone(),
+            acceptance: ShapeAcceptance {
+                adapter: "command".to_owned(),
+                extension: ".t.sh".to_owned(),
+                candidate_dir: "test/acceptance".to_owned(),
+                command: Vec::new(),
+                timeout: Duration::from_secs(1),
+            },
+        };
+
+        let failure = commands
+            .staged_acceptance_checks(
+                &checkout,
+                None,
+                "test/acceptance/greet.t.sh",
+                b"approved bytes",
+            )
+            .expect_err("staging must reject the symlinked parent");
+        assert_eq!(failure.reason, "acceptance_check_path_conflict");
+        assert!(!outside.join("acceptance/greet.t.sh").exists());
+        let _ = std::fs::remove_dir_all(checkout);
+        let _ = std::fs::remove_dir_all(outside);
     }
 }

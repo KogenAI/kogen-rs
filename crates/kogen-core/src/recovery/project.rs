@@ -7,6 +7,7 @@ use crate::git::GitRepo;
 use crate::project::ProjectResolution;
 use crate::run::{RunEvent, RunSnapshot, RunStore};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -41,10 +42,7 @@ pub fn reconcile(project: &ProjectResolution) -> Result<RecoveryReport, CoreErro
         Err(error) => return Err(recovery_error("run_directory_unavailable", error)),
     };
     let origin = GitRepo::new(&project.origin);
-    let base = origin
-        .resolve_commit(&project.base)
-        .map_err(|error| recovery_error("base_read_failed", error))?;
-    let reachable = reachable_commits(&origin, &base)?;
+    let mut reachability_by_branch: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
     let mut paths = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -60,7 +58,17 @@ pub fn reconcile(project: &ProjectResolution) -> Result<RecoveryReport, CoreErro
         let Ok(mut snapshot) = serde_json::from_slice::<RunSnapshot>(&bytes) else {
             continue;
         };
-        if snapshot.status != "running" || !valid_run_id(&snapshot.run_id) {
+        if !valid_run_id(&snapshot.run_id) {
+            continue;
+        }
+        let store = RunStore::new(&directory);
+        let cleanup_pending = store
+            .cleanup_pending(&snapshot.run_id)
+            .map_err(|error| recovery_error("cleanup_obligation_read_failed", error))?;
+        if snapshot.status != "running" {
+            if cleanup_pending {
+                retry_cleanup(&origin, &project.state_root, &store, &snapshot)?;
+            }
             continue;
         }
         let last_event = read_last_event(&directory).unwrap_or_default();
@@ -70,7 +78,26 @@ pub fn reconcile(project: &ProjectResolution) -> Result<RecoveryReport, CoreErro
             .as_ref()
             .map(|landing| landing.candidate_commit.as_str())
             .unwrap_or_default();
-        let on_base = !candidate.is_empty() && reachable.contains(candidate);
+        let reachable = if let Some(reachable) = reachability_by_branch.get(&snapshot.target_branch)
+        {
+            reachable.clone()
+        } else {
+            let tip = recorded_branch_tip(&origin, &snapshot.target_branch)?;
+            let reachable = tip
+                .as_deref()
+                .map(|tip| reachable_commits(&origin, tip))
+                .transpose()?
+                .map(|commits| commits.into_iter().collect::<BTreeSet<_>>());
+            reachability_by_branch.insert(snapshot.target_branch.clone(), reachable.clone());
+            reachable
+        };
+        // A deleted or unavailable recorded branch cannot prove publication.
+        // Treat it as not landed; the ordinary crashed/interrupted outcome
+        // remains retryable through the cleanup obligation below.
+        let on_base = !candidate.is_empty()
+            && reachable
+                .as_ref()
+                .is_some_and(|reachable| reachable.contains(candidate));
         let Some(decision) = recovery_decision("running", alive, on_base, &last_event) else {
             continue;
         };
@@ -83,12 +110,10 @@ pub fn reconcile(project: &ProjectResolution) -> Result<RecoveryReport, CoreErro
                 .with("status", json!(decision.status))
                 .with("reason", json!(decision.reason))
         };
-        RunStore::new(&directory)
+        store
             .record(&event, &snapshot)
             .map_err(|error| recovery_error("run_reconcile_failed", error))?;
-        release_claim_for_run(&origin, &snapshot.run_id)?;
-        remove_incoming(&origin, &snapshot.run_id)?;
-        remove_run_workspaces(&project.state_root, &snapshot.run_id)?;
+        retry_cleanup(&origin, &project.state_root, &store, &snapshot)?;
         report.reconciled.push(ReconciledRun {
             run_id: snapshot.run_id,
             slug: snapshot.slug,
@@ -97,6 +122,50 @@ pub fn reconcile(project: &ProjectResolution) -> Result<RecoveryReport, CoreErro
         });
     }
     Ok(report)
+}
+
+fn retry_cleanup(
+    origin: &GitRepo,
+    state_root: &Path,
+    store: &RunStore,
+    snapshot: &RunSnapshot,
+) -> Result<(), CoreError> {
+    let mut failures = Vec::new();
+    if let Err(error) = release_claim_for_run(origin, &snapshot.run_id) {
+        failures.push(("release origin claim", render_recovery_error(&error)));
+    }
+    if let Err(error) = remove_incoming(origin, &snapshot.run_id) {
+        failures.push(("delete incoming ref", render_recovery_error(&error)));
+    }
+    if let Err(error) = remove_run_workspaces(state_root, &snapshot.run_id) {
+        failures.push(("remove run workspaces", render_recovery_error(&error)));
+    }
+    if failures.is_empty() {
+        store
+            .clear_cleanup()
+            .map_err(|error| recovery_error("cleanup_obligation_clear_failed", error))?;
+        return Ok(());
+    }
+    for (operation, detail) in failures {
+        store
+            .record(
+                &RunEvent::new("cleanup_failure", now_ms())
+                    .with("operation", json!(operation))
+                    .with("detail", json!(detail)),
+                snapshot,
+            )
+            .map_err(|error| recovery_error("cleanup_failure_record_failed", error))?;
+    }
+    Ok(())
+}
+
+fn render_recovery_error(error: &CoreError) -> String {
+    format!(
+        "{}/{}: {}",
+        error.class.as_str(),
+        error.reason,
+        error.detail
+    )
 }
 
 fn read_last_event(directory: &Path) -> Option<String> {
@@ -123,6 +192,16 @@ fn reachable_commits(
         .filter(|commit| !commit.is_empty())
         .map(|commit| String::from_utf8_lossy(commit).into_owned())
         .collect())
+}
+
+fn recorded_branch_tip(origin: &GitRepo, branch: &str) -> Result<Option<String>, CoreError> {
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    if branch.is_empty() || branch.starts_with('-') || branch.contains(['\0', '\n', '\r']) {
+        return Ok(None);
+    }
+    origin
+        .ref_target(&format!("refs/heads/{branch}"))
+        .map_err(|error| recovery_error("recorded_base_read_failed", error))
 }
 
 fn release_claim_for_run(origin: &GitRepo, run_id: &str) -> Result<(), CoreError> {
@@ -164,10 +243,19 @@ fn remove_run_workspaces(state_root: &Path, run_id: &str) -> Result<(), CoreErro
         Err(error) => return Err(recovery_error("workspace_cleanup_failed", error)),
     };
     let prefix = format!("{run_id}-");
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        let entry = entry.map_err(|error| recovery_error("workspace_cleanup_failed", error))?;
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with(&prefix) && entry.path().is_dir() {
-            fs::remove_dir_all(entry.path())
+        let metadata = entry
+            .file_type()
+            .map_err(|error| recovery_error("workspace_cleanup_failed", error))?;
+        if name.to_string_lossy().starts_with(&prefix)
+            && metadata.is_dir()
+            && !metadata.is_symlink()
+        {
+            let workspace = entry.path();
+            crate::git::forget_workspace(&workspace);
+            fs::remove_dir_all(&workspace)
                 .map_err(|error| recovery_error("workspace_cleanup_failed", error))?;
         }
     }

@@ -41,6 +41,28 @@ impl TreeSnapshotPort for ScriptedTree {
     }
 }
 
+struct SymlinkReportRunner {
+    outside: PathBuf,
+}
+
+impl ProcessPort for SymlinkReportRunner {
+    fn run(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
+        let reports = request.run_dir.join("reports");
+        fs::remove_dir(&reports).expect("remove report directory");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&self.outside, &reports).expect("redirect report directory");
+        Ok(ProcessResult {
+            exit_status: Some(0),
+            timed_out: false,
+            unavailable: false,
+            output_tail: Vec::new(),
+            log_path: request.run_dir.join("logs/acceptance.log"),
+            duration_ms: 1,
+            sandbox: None,
+        })
+    }
+}
+
 #[test]
 fn absent_ledger_with_missing_runner_is_tool_missing() {
     let root = test_dir("absent");
@@ -53,6 +75,39 @@ fn absent_ledger_with_missing_runner_is_tool_missing() {
     let result = run_command_acceptance(&runner, &tree, request(&root)).expect("acceptance result");
     assert!(result.failures.contains(&AcceptanceFailure::ToolMissing));
     assert!(!result.failures.contains(&AcceptanceFailure::NoTaggedTests));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn acceptance_report_read_rejects_a_child_replaced_parent_symlink() {
+    let root = test_dir("report-symlink");
+    let outside = root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let row = LedgerRow {
+        tag: "greet/A1".to_owned(),
+        test: "external report must not be read".to_owned(),
+        status: LedgerStatus::Passed,
+    };
+    fs::write(
+        outside.join("ledger.jsonl"),
+        format!("{}\n", row.to_json_line().unwrap()),
+    )
+    .unwrap();
+    let runner = SymlinkReportRunner {
+        outside: outside.clone(),
+    };
+    let tree = ScriptedTree(Mutex::new(["base".to_owned(), "base".to_owned()].into()));
+    let result = run_command_acceptance(&runner, &tree, request(&root)).expect("acceptance result");
+    assert!(result.rows.is_empty());
+    assert!(result.failures.contains(&AcceptanceFailure::NoTaggedTests));
+    assert_eq!(
+        fs::read_to_string(outside.join("ledger.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -170,7 +225,7 @@ fn request(root: &Path) -> CommandAcceptanceRequest {
         candidate_path: workdir.join("greet.t.sh"),
         workdir,
         run_dir: run_dir.clone(),
-        report_path: run_dir.join("ledger.jsonl"),
+        report_path: run_dir.join("reports/ledger.jsonl"),
         env: ChildEnvironment::new(),
         timeout: Duration::from_secs(5),
         expected_items: BTreeSet::from(["A1".to_owned()]),

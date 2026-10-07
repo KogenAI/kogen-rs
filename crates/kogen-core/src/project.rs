@@ -301,9 +301,8 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
     command.args(args).current_dir(cwd);
     #[cfg(any(test, feature = "hermetic-git-tests"))]
     kogen_test_support::configure_git_command(&mut command);
-    let output = command.output().ok()?;
+    let output = crate::git::run_git_command(command, None).ok()?;
     output
-        .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }

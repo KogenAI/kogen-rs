@@ -2,7 +2,6 @@ use super::super::support::{check_error_line, environment_error, remove_empty_pa
 use super::*;
 use crate::ExitCode;
 use crate::error::CoreError;
-use std::fs;
 use std::path::Path;
 
 pub(crate) fn stage_and_check(
@@ -19,22 +18,27 @@ pub(crate) fn stage_and_check(
             ExitCode::Environment,
         )
     })?;
-    fs::create_dir_all(parent).map_err(|error| {
+    let relative_path = candidate.strip_prefix(&project.checkout).map_err(|error| {
         environment_error(
             "acceptance_check_path_conflict",
             error.to_string(),
             ExitCode::Environment,
         )
     })?;
-    fs::write(candidate, bytes).map_err(|error| {
-        environment_error(
-            "acceptance_check_path_conflict",
-            error.to_string(),
-            ExitCode::Environment,
-        )
-    })?;
+    let relative = Path::new(relative_path);
+    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    crate::safe_fs::ensure_dir(&project.checkout, relative_parent)
+        .and_then(|()| crate::safe_fs::validate_write(&project.checkout, relative))
+        .and_then(|()| crate::safe_fs::write_file(&project.checkout, relative, bytes))
+        .map_err(|error| {
+            environment_error(
+                "acceptance_check_path_conflict",
+                error.to_string(),
+                ExitCode::Environment,
+            )
+        })?;
     let result = run_acceptance_checks(project, candidate, &checks.run_dir, &checks.env);
-    let cleanup = fs::remove_file(candidate);
+    let cleanup = crate::safe_fs::remove_file(&project.checkout, relative);
     remove_empty_parents(parent, &project.checkout);
     if let Err(error) = cleanup
         && error.kind() != std::io::ErrorKind::NotFound

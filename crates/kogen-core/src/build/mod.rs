@@ -87,9 +87,6 @@ pub(crate) fn run_witness_build(
         .state_root
         .join("runs")
         .join(format!("{run_id}-witness"));
-    std::fs::create_dir_all(run_dir.join("logs"))
-        .and_then(|()| std::fs::create_dir_all(run_dir.join("tmp")))
-        .map_err(|error| environment_error("run_directory_unavailable", error.to_string()))?;
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -113,6 +110,10 @@ pub(crate) fn run_witness_build(
     store
         .create(&snapshot)
         .map_err(|error| controller_error("run_journal_failed", error.to_string()))?;
+    for directory in ["logs", "tmp", "reports"] {
+        crate::safe_fs::ensure_dir(&run_dir, std::path::Path::new(directory))
+            .map_err(|error| environment_error("run_directory_unavailable", error.to_string()))?;
+    }
     single_rung::run_witness_build(
         project,
         &approved,

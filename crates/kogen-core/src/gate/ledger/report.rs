@@ -60,8 +60,11 @@ pub fn read_ledger_report(path: &Path) -> Result<Vec<LedgerRow>, LedgerReadError
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(LedgerReadError::UnsafeReport(path.to_path_buf()));
     }
-    let bytes = fs::read(path).map_err(|source| LedgerReadError::Io(source.to_string()))?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| LedgerReadError::InvalidUtf8)?;
+    parse_ledger_report(&fs::read(path).map_err(|source| LedgerReadError::Io(source.to_string()))?)
+}
+
+pub fn parse_ledger_report(bytes: &[u8]) -> Result<Vec<LedgerRow>, LedgerReadError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| LedgerReadError::InvalidUtf8)?;
     let mut rows = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let row = serde_json::from_str(line).map_err(|error| LedgerReadError::MalformedLine {

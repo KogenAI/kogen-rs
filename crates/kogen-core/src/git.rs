@@ -2,13 +2,14 @@
 
 pub mod landing;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 static NEXT_INDEX: AtomicU64 = AtomicU64::new(0);
 
@@ -21,6 +22,152 @@ const WORKSPACE_SAFE_CONFIG: &[&str] = &[
     "core.attributesFile=/dev/null",
     "commit.gpgsign=false",
 ];
+
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+const GIT_STDOUT_LIMIT: usize = 64 * 1024 * 1024;
+static NEXT_GIT_RUN_DIR: AtomicU64 = AtomicU64::new(0);
+static WORKSPACE_BASE_PATHS: OnceLock<Mutex<BTreeMap<PathBuf, BTreeSet<PathBuf>>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug)]
+pub(crate) struct GitCommandOutput {
+    pub exit_status: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl GitCommandOutput {
+    pub fn success(&self) -> bool {
+        self.exit_status == Some(0)
+    }
+}
+
+/// All controller Git commands share this bounded process-group runner.
+pub(crate) fn run_git_command(
+    command: Command,
+    input: Option<&[u8]>,
+) -> Result<GitCommandOutput, GitError> {
+    run_git_command_with_limits(command, input, GIT_TIMEOUT, GIT_STDOUT_LIMIT)
+}
+
+fn run_git_command_with_limits(
+    command: Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<GitCommandOutput, GitError> {
+    let run_dir = GitRunDirectory::new().map_err(|error| GitError {
+        operation: "prepare supervised git".to_owned(),
+        detail: error.to_string(),
+    })?;
+    let result =
+        crate::run::run_bounded_command(command, &run_dir.path, input, timeout, stdout_limit)
+            .map_err(|error| GitError {
+                operation: "run supervised git".to_owned(),
+                detail: error.to_string(),
+            })?;
+    if result.timed_out {
+        return Err(GitError {
+            operation: "run supervised git".to_owned(),
+            detail: format!("timed out after {} ms", timeout.as_millis()),
+        });
+    }
+    if result.stdout_truncated {
+        return Err(GitError {
+            operation: "run supervised git".to_owned(),
+            detail: format!("stdout exceeded the {stdout_limit} byte capture limit"),
+        });
+    }
+    Ok(GitCommandOutput {
+        exit_status: result.exit_status,
+        stdout: result.stdout,
+        stderr: result.stderr_tail,
+    })
+}
+
+struct GitRunDirectory {
+    path: PathBuf,
+}
+
+impl GitRunDirectory {
+    fn new() -> std::io::Result<Self> {
+        for _ in 0..32 {
+            let id = NEXT_GIT_RUN_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("kogen-git-run-{}-{id}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+                    }
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a private Git process directory",
+        ))
+    }
+}
+
+impl Drop for GitRunDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+pub(crate) fn register_workspace_base(root: &Path, base_commit: &str) -> Result<(), GitError> {
+    let output =
+        GitRepo::workspace(root).output(&["ls-tree", "-r", "--name-only", "-z", base_commit])?;
+    let paths = output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(git_path_from_bytes)
+        .collect();
+    let root = std::fs::canonicalize(root).map_err(|error| GitError {
+        operation: "register workspace base".to_owned(),
+        detail: error.to_string(),
+    })?;
+    WORKSPACE_BASE_PATHS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|error| GitError {
+            operation: "register workspace base".to_owned(),
+            detail: error.to_string(),
+        })?
+        .insert(root, paths);
+    Ok(())
+}
+
+pub(crate) fn workspace_base_paths(root: &Path) -> Option<BTreeSet<PathBuf>> {
+    let root = std::fs::canonicalize(root).ok()?;
+    WORKSPACE_BASE_PATHS.get()?.lock().ok()?.get(&root).cloned()
+}
+
+pub(crate) fn forget_workspace(root: &Path) {
+    let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Some(workspaces) = WORKSPACE_BASE_PATHS.get()
+        && let Ok(mut workspaces) = workspaces.lock()
+    {
+        workspaces.remove(&key);
+    }
+}
+
+#[cfg(unix)]
+fn git_path_from_bytes(path: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn git_path_from_bytes(path: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(path).into_owned())
+}
 
 #[derive(Clone, Debug)]
 pub struct GitRepo {
@@ -84,33 +231,11 @@ impl GitRepo {
         self.configure_workspace_environment(&mut command);
         #[cfg(any(test, feature = "hermetic-git-tests"))]
         kogen_test_support::configure_git_command(&mut command);
-        if input.is_some() {
-            command.stdin(Stdio::piped());
-        }
-        let mut child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| GitError {
-                operation: format!("git {}", args.first().copied().unwrap_or("")),
-                detail: error.to_string(),
-            })?;
-        if let Some(bytes) = input {
-            child
-                .stdin
-                .take()
-                .expect("stdin was piped")
-                .write_all(bytes)
-                .map_err(|error| GitError {
-                    operation: format!("git {} input", args.first().copied().unwrap_or("")),
-                    detail: error.to_string(),
-                })?;
-        }
-        let output = child.wait_with_output().map_err(|error| GitError {
-            operation: format!("git {}", args.first().copied().unwrap_or("")),
-            detail: error.to_string(),
+        let output = run_git_command(command, input).map_err(|mut error| {
+            error.operation = format!("git {}", args.first().copied().unwrap_or(""));
+            error
         })?;
-        if !output.status.success() {
+        if !output.success() {
             return Err(GitError {
                 operation: format!("git {}", args.first().copied().unwrap_or("")),
                 detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -390,4 +515,27 @@ impl Drop for PrivateIndex {
 #[allow(dead_code)]
 fn _git_env_key() -> OsString {
     OsString::from("GIT_INDEX_FILE")
+}
+
+#[cfg(test)]
+mod supervised_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_git_effects_kill_hanging_helpers_and_cap_stdout() {
+        let started = std::time::Instant::now();
+        let mut hanging = Command::new("/bin/sh");
+        hanging.args(["-c", "sleep 10"]);
+        let error = run_git_command_with_limits(hanging, None, Duration::from_millis(40), 1024)
+            .expect_err("the hanging helper must hit the process deadline");
+        assert!(error.detail.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let mut noisy = Command::new("/usr/bin/head");
+        noisy.args(["-c", "4096", "/dev/zero"]);
+        let error = run_git_command_with_limits(noisy, None, Duration::from_secs(2), 1024)
+            .expect_err("oversized output must be rejected");
+        assert!(error.detail.contains("capture limit"));
+    }
 }

@@ -155,6 +155,15 @@ pub fn install_approved_acceptance(
     {
         return Err(ProtectionError::InvalidPath(candidate_path.to_owned()));
     }
+    crate::safe_fs::validate_write(root, Path::new(source_path))
+        .and_then(|()| crate::safe_fs::validate_write(root, Path::new(candidate_path)))
+        .map_err(|source| {
+            io_error(
+                "validate approved acceptance installation",
+                &safe_join(root, candidate_path).unwrap_or_else(|_| root.join(candidate_path)),
+                source,
+            )
+        })?;
     write_path(root, candidate_path, bytes)?;
     remove_path(root, source_path)
 }
@@ -208,9 +217,12 @@ fn parent_blocks(root: &Path, relative: &str) -> Result<bool, ProtectionError> {
 
 fn write_path(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), ProtectionError> {
     let path = safe_join(root, relative)?;
-    create_safe_parents(root, relative)?;
-    remove_entry(&path)?;
-    fs::write(&path, bytes).map_err(|source| io_error("restore protected file", &path, source))
+    let relative_path = Path::new(relative);
+    let parents = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    crate::safe_fs::ensure_dir_replacing_non_dirs(root, parents)
+        .and_then(|()| crate::safe_fs::validate_write(root, relative_path))
+        .and_then(|()| crate::safe_fs::write_file(root, Path::new(relative), bytes))
+        .map_err(|source| io_error("restore protected file", &path, source))
 }
 
 fn remove_path(root: &Path, relative: &str) -> Result<(), ProtectionError> {
@@ -237,28 +249,6 @@ fn remove_path(root: &Path, relative: &str) -> Result<(), ProtectionError> {
         }
     }
     remove_entry(&path)
-}
-
-fn create_safe_parents(root: &Path, relative: &str) -> Result<(), ProtectionError> {
-    let mut current = root.to_path_buf();
-    let components = relative.split('/').collect::<Vec<_>>();
-    for component in components.iter().take(components.len().saturating_sub(1)) {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                remove_entry(&current)?;
-                fs::create_dir(&current)
-                    .map_err(|source| io_error("create protected parent", &current, source))?;
-            }
-            Ok(_) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&current)
-                    .map_err(|source| io_error("create protected parent", &current, source))?;
-            }
-            Err(source) => return Err(io_error("inspect protected parent", &current, source)),
-        }
-    }
-    Ok(())
 }
 
 fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, ProtectionError> {

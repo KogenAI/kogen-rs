@@ -15,7 +15,9 @@ use std::time::Duration;
 
 mod report;
 
-pub use report::{LedgerReadError, LedgerRow, LedgerStatus, read_ledger_report};
+pub use report::{
+    LedgerReadError, LedgerRow, LedgerStatus, parse_ledger_report, read_ledger_report,
+};
 
 #[cfg(not(unix))]
 use std::ffi::OsStr;
@@ -103,13 +105,15 @@ pub fn run_command_acceptance(
     if request.command.is_empty() || request.command[0].is_empty() {
         return Err(AcceptanceRunError::InvalidCommand);
     }
-    request.report_path = validated_report_path(&request.run_dir, &request.report_path)?;
+    let (report_root, report_relative, report_path) =
+        validated_report_path(&request.run_dir, &request.report_path)?;
+    request.report_path = report_path;
     match fs::symlink_metadata(&request.report_path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(AcceptanceRunError::InvalidReportPath(request.report_path));
             }
-            fs::remove_file(&request.report_path).map_err(|source| {
+            crate::safe_fs::remove_file(&report_root, &report_relative).map_err(|source| {
                 AcceptanceRunError::ReportSetup {
                     path: request.report_path.clone(),
                     source,
@@ -158,7 +162,9 @@ pub fn run_command_acceptance(
                 detail,
             })?;
     let process = process.map_err(AcceptanceRunError::Process)?;
-    let report = read_ledger_report(&request.report_path);
+    let report = crate::safe_fs::read_file(&report_root, &report_relative)
+        .map_err(|source| LedgerReadError::Io(source.to_string()))
+        .and_then(|bytes| parse_ledger_report(&bytes));
     Ok(assess_command_result(
         request.slug,
         request.expected_items,
@@ -172,35 +178,49 @@ pub fn run_command_acceptance(
 fn validated_report_path(
     run_dir: &Path,
     report_path: &Path,
-) -> Result<PathBuf, AcceptanceRunError> {
+) -> Result<(PathBuf, PathBuf, PathBuf), AcceptanceRunError> {
     if !report_path.is_absolute() {
         return Err(AcceptanceRunError::InvalidReportPath(
             report_path.to_path_buf(),
         ));
     }
+    let root_metadata =
+        fs::symlink_metadata(run_dir).map_err(|source| AcceptanceRunError::ReportSetup {
+            path: run_dir.to_path_buf(),
+            source,
+        })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(AcceptanceRunError::InvalidReportPath(run_dir.to_path_buf()));
+    }
     let run_root = fs::canonicalize(run_dir).map_err(|source| AcceptanceRunError::ReportSetup {
         path: run_dir.to_path_buf(),
         source,
     })?;
-    let parent = report_path
-        .parent()
-        .ok_or_else(|| AcceptanceRunError::InvalidReportPath(report_path.to_path_buf()))?;
-    let canonical_parent =
-        fs::canonicalize(parent).map_err(|source| AcceptanceRunError::ReportSetup {
-            path: parent.to_path_buf(),
+    // Keep the caller's path spelling for the containment check. On macOS,
+    // temp_dir() commonly uses /var while canonical paths use /private/var.
+    let report_relative = report_path
+        .strip_prefix(run_dir)
+        .map_err(|_| AcceptanceRunError::InvalidReportPath(report_path.to_path_buf()))?
+        .to_path_buf();
+    let parent_relative = report_relative.parent().unwrap_or_else(|| Path::new(""));
+    crate::safe_fs::ensure_dir(&run_root, parent_relative).map_err(|source| {
+        AcceptanceRunError::ReportSetup {
+            path: run_root.join(parent_relative),
             source,
-        })?;
-    let Some(name) = report_path.file_name() else {
-        return Err(AcceptanceRunError::InvalidReportPath(
-            report_path.to_path_buf(),
-        ));
-    };
-    if !canonical_parent.starts_with(&run_root) {
+        }
+    })?;
+    crate::safe_fs::validate_write(&run_root, &report_relative)
+        .map_err(|_| AcceptanceRunError::InvalidReportPath(report_path.to_path_buf()))?;
+    if report_relative.file_name().is_none() {
         return Err(AcceptanceRunError::InvalidReportPath(
             report_path.to_path_buf(),
         ));
     }
-    Ok(canonical_parent.join(name))
+    Ok((
+        run_root.clone(),
+        report_relative.clone(),
+        run_root.join(report_relative),
+    ))
 }
 
 fn assess_command_result(

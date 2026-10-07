@@ -300,6 +300,9 @@ mod tests {
             started_ms: 0,
             fields: BTreeMap::new(),
         };
+        store
+            .create(&snapshot)
+            .expect("create provider run journal");
         let call = ProviderCall {
             response: ModelResponse {
                 id: "response".to_owned(),

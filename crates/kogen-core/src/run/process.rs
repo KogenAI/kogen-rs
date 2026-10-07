@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -109,6 +109,138 @@ pub trait ProcessPort: Send + Sync {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessSupervisor;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedCommandOutput {
+    pub exit_status: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: Vec<u8>,
+    pub stderr_tail: Vec<u8>,
+    pub stdout_truncated: bool,
+}
+
+/// Run a controller command in a supervised process group while retaining only
+/// bounded stdout and stderr. Git commands use this path instead of output().
+/// Run a bounded controller effect without a separate parent-death watcher.
+/// The process group is still terminated on exit or timeout.
+pub(crate) fn run_bounded_command(
+    mut command: Command,
+    run_dir: &std::path::Path,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<CapturedCommandOutput, ProcessError> {
+    if timeout.is_zero() {
+        return Err(ProcessError::InvalidTimeout);
+    }
+    ensure_private_dir(run_dir)?;
+    let start = Instant::now();
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().map_err(|source| ProcessError::Io {
+        operation: "spawn supervised controller command",
+        source,
+    })?;
+    let group = child.id();
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdin = input.map(|_| child.stdin.take().expect("stdin was piped"));
+
+    let output = std::thread::scope(|scope| {
+        let stdout_reader = scope.spawn(move || read_bounded(stdout, stdout_limit, false));
+        let stderr_reader = scope.spawn(move || read_bounded(stderr, OUTPUT_TAIL_BYTES, true));
+        let stdin_writer = stdin.map(|mut stdin| {
+            let input = input.expect("stdin exists only when input is present");
+            scope.spawn(move || stdin.write_all(input))
+        });
+        let wait = wait_until_deadline(&mut child, start + timeout, Duration::from_millis(2));
+        let (status, timed_out) = match wait {
+            Ok(result) => result,
+            Err(error) => {
+                stop_group(group, true);
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        stop_group(group, timed_out);
+        let status = match status {
+            Some(status) => status,
+            None => child
+                .wait()
+                .map_err(|source| io_error("wait for command", source))?,
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| io_error("read command stdout", io::Error::other("reader panicked")))?
+            .map_err(|source| io_error("read command stdout", source))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| io_error("read command stderr", io::Error::other("reader panicked")))?
+            .map_err(|source| io_error("read command stderr", source))?;
+        if let Some(writer) = stdin_writer {
+            writer
+                .join()
+                .map_err(|_| io_error("write command stdin", io::Error::other("writer panicked")))?
+                .map_err(|source| io_error("write command stdin", source))?;
+        }
+        Ok((status, timed_out, stdout, stderr))
+    });
+    let (status, timed_out, (stdout, stdout_truncated), (stderr_tail, _)) = output?;
+    Ok(CapturedCommandOutput {
+        exit_status: status_code(status),
+        timed_out,
+        stdout,
+        stderr_tail,
+        stdout_truncated,
+    })
+}
+
+fn read_bounded<R: Read>(
+    mut reader: R,
+    limit: usize,
+    keep_tail: bool,
+) -> io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(OUTPUT_TAIL_BYTES));
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok((retained, truncated));
+        }
+        let chunk = &buffer[..count];
+        if keep_tail {
+            if chunk.len() >= limit {
+                retained.clear();
+                retained.extend_from_slice(&chunk[chunk.len() - limit..]);
+                truncated = true;
+            } else {
+                let excess = retained
+                    .len()
+                    .saturating_add(chunk.len())
+                    .saturating_sub(limit);
+                if excess > 0 {
+                    retained.drain(..excess);
+                    truncated = true;
+                }
+                retained.extend_from_slice(chunk);
+            }
+        } else {
+            let room = limit.saturating_sub(retained.len());
+            retained.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            if count > room {
+                truncated = true;
+            }
+        }
+    }
+}
 
 impl ProcessPort for ProcessSupervisor {
     fn run(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
@@ -297,7 +429,7 @@ fn run_unix(request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
     };
 
     let deadline = start + request.timeout;
-    let (status, timed_out) = match wait_until_deadline(&mut child, deadline) {
+    let (status, timed_out) = match wait_until_deadline(&mut child, deadline, POLL_INTERVAL) {
         Ok(result) => result,
         Err(error) => {
             stop_group(target_group, true);
@@ -322,6 +454,7 @@ fn run_unix(request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
 fn wait_until_deadline(
     child: &mut Child,
     deadline: Instant,
+    poll_interval: Duration,
 ) -> Result<(Option<ExitStatus>, bool), ProcessError> {
     loop {
         if let Some(status) = child
@@ -334,7 +467,7 @@ fn wait_until_deadline(
         if now >= deadline {
             return Ok((None, true));
         }
-        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
     }
 }
 

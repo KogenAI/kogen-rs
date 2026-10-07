@@ -138,6 +138,40 @@ fn missing_executable_is_reported_as_unavailable_127() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn process_log_read_rejects_a_child_replaced_log_symlink() {
+    let root = test_dir("log-symlink");
+    let run_dir = root.join("run");
+    let logs = run_dir.join("logs");
+    fs::create_dir_all(&logs).expect("create child-writable logs directory");
+    let outside = root.join("outside");
+    fs::write(&outside, b"must not be read as process output").unwrap();
+
+    let mut request = ProcessRequest::new("/bin/sh", &root, &run_dir);
+    request.log_name = "replace-log".to_owned();
+    request.args = vec![
+        "-c".into(),
+        format!(
+            "for f in '{}/replace-log-{}-'*.log; do /bin/rm -f \"$f\"; /bin/ln -s '{}' \"$f\"; done",
+            logs.display(),
+            std::process::id(),
+            outside.display()
+        )
+        .into(),
+    ];
+    let result = ProcessSupervisor.run(request);
+    assert!(
+        result.is_err(),
+        "controller must not read a child-created symlink"
+    );
+    assert_eq!(
+        fs::read(&outside).unwrap(),
+        b"must not be read as process output"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 fn test_dir(label: &str) -> std::path::PathBuf {
     static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(

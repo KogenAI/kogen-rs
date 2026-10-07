@@ -53,7 +53,23 @@ impl SandboxPolicy {
         let workspace = workspace.into();
         let run_dir = run_dir.into();
         let home = host.get(OsStr::new("HOME")).map(PathBuf::from);
-        let mut policy = Self::new(enabled, workspace, run_dir);
+        let mut policy = Self {
+            enabled,
+            already_sandboxed: false,
+            forced_unavailable: None,
+            verify_integrity: false,
+            writable_paths: vec![
+                workspace,
+                run_dir.join("logs"),
+                run_dir.join("tmp"),
+                run_dir.join("reports"),
+                run_dir.join("mise-state"),
+                run_dir.join("mise-cache"),
+                PathBuf::from("/tmp"),
+            ],
+            write_denied_paths: Vec::new(),
+            protected_paths: Vec::new(),
+        };
         policy.verify_integrity = true;
         if let Some(home) = home {
             policy.add_default_paths(&home);

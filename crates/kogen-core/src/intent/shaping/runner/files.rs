@@ -85,7 +85,11 @@ pub(super) fn remove_stale(path: &Path) -> Result<(), CoreError> {
 pub(super) fn write_json(path: &Path, value: &Value) -> Result<(), CoreError> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| io_error("shape_output_unavailable", error))?;
-    fs::write(path, [bytes.as_slice(), b"\n"].concat())
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| io_error("shape_output_unavailable", "output path has no file name"))?;
+    crate::safe_fs::write_file(parent, Path::new(name), &[bytes.as_slice(), b"\n"].concat())
         .map_err(|error| io_error("shape_output_unavailable", error))
 }
 

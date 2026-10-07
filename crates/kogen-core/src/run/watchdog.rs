@@ -69,26 +69,47 @@ pub(super) fn stop_watcher(mut watcher: ParentWatcher) {
 
 #[cfg(unix)]
 pub(super) fn stop_group(group: u32, force_grace: bool) {
-    if group <= 1 || (!force_grace && !group_exists(group)) {
+    let Ok(group) = i32::try_from(group) else {
+        return;
+    };
+    let Some(group) = rustix::process::Pid::from_raw(group) else {
+        return;
+    };
+    if group.as_raw_pid() <= 1 || (!force_grace && !group_exists(group)) {
         return;
     }
-    let _ = signal_group("TERM", group);
-    thread::sleep(TERM_GRACE);
-    let _ = signal_group("KILL", group);
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::TERM);
+    let deadline = std::time::Instant::now() + TERM_GRACE;
+    while group_exists(group) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if group_exists(group) {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
 }
 
 #[cfg(unix)]
-fn group_exists(group: u32) -> bool {
-    Command::new("/usr/bin/pkill")
-        .args(["-0", "-g", &group.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
+fn group_exists(group: rustix::process::Pid) -> bool {
+    rustix::process::test_kill_process_group(group).is_ok()
 }
 
 #[cfg(unix)]
 fn signal_group(signal: &str, group: u32) -> io::Result<()> {
-    let _ = Command::new("/usr/bin/pkill")
-        .args([format!("-{signal}"), "-g".to_owned(), group.to_string()])
-        .status()?;
-    Ok(())
+    let Ok(group) = i32::try_from(group) else {
+        return Ok(());
+    };
+    let Some(group) = rustix::process::Pid::from_raw(group) else {
+        return Ok(());
+    };
+    let signal = match signal {
+        "TERM" => rustix::process::Signal::TERM,
+        "KILL" => rustix::process::Signal::KILL,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported signal",
+            ));
+        }
+    };
+    rustix::process::kill_process_group(group, signal).map_err(io::Error::from)
 }

@@ -2,9 +2,8 @@ use super::ledger::TreeSnapshotPort;
 use super::workspace::{WorkspaceError, WorkspaceTree};
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_INDEX: AtomicU64 = AtomicU64::new(0);
@@ -138,6 +137,7 @@ fn git(
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>, TreeSnapshotError> {
     let mut command = Command::new("git");
+    let operation = args.first().copied().unwrap_or("git");
     command
         .args([
             "-c",
@@ -157,45 +157,18 @@ fn git(
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("GIT_OPTIONAL_LOCKS", "0");
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
     #[cfg(any(test, feature = "hermetic-git-tests"))]
     kogen_test_support::configure_git_command(&mut command);
-    let mut child = command.spawn().map_err(|error| TreeSnapshotError {
-        operation: "start git",
-        detail: error.to_string(),
-    })?;
-    if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .expect("stdin is piped for commands with input")
-            .write_all(input)
-            .map_err(|error| TreeSnapshotError {
-                operation: "write git input",
-                detail: error.to_string(),
-            })?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| TreeSnapshotError {
-            operation: "wait for git",
+    let output =
+        crate::git::run_git_command(command, input).map_err(|error| TreeSnapshotError {
+            operation: "run supervised git",
             detail: error.to_string(),
         })?;
-    success(args.first().copied().unwrap_or("git"), output)
-}
-
-fn success(operation: &str, output: Output) -> Result<Vec<u8>, TreeSnapshotError> {
-    if output.status.success() {
+    if output.success() {
         return Ok(output.stdout);
     }
     Err(TreeSnapshotError {

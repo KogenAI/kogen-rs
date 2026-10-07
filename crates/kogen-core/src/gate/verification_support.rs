@@ -21,7 +21,7 @@ pub(super) fn run_acceptance(
             .join(&request.acceptance.candidate_path),
         workdir: request.candidate_workspace.clone(),
         run_dir: request.run_dir.clone(),
-        report_path: request.run_dir.join("ledger.jsonl"),
+        report_path: request.run_dir.join("reports/ledger.jsonl"),
         env: request.environment.clone(),
         timeout: request.acceptance.timeout,
         expected_items: request.acceptance.expected_items.clone(),
@@ -62,7 +62,7 @@ pub(super) fn validate_request(request: &GateRequest) -> Result<(), GateError> {
 }
 
 pub(super) fn ensure_private_run_dir(path: &Path) -> Result<(), GateError> {
-    fs::create_dir_all(path).map_err(|source| GateError::Io {
+    crate::safe_fs::ensure_directory_path(path).map_err(|source| GateError::Io {
         operation: "create run directory",
         path: path.to_path_buf(),
         source,

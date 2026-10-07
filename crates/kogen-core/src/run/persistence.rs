@@ -4,13 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct RunSnapshot {
@@ -42,7 +39,7 @@ pub struct LandingRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunSnapshot, RunStore};
+    use super::{RunEvent, RunSnapshot, RunStore};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,6 +103,61 @@ mod tests {
         .expect("parse run.json");
         assert_eq!(loaded, value);
         std::fs::remove_dir_all(directory).expect("remove snapshot fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_store_rejects_symlinked_journal_and_snapshot_outputs() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "kogen-run-store-symlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let outside = directory.with_extension("outside");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&outside, b"untouched\n").unwrap();
+        let snapshot = RunSnapshot {
+            schema: 2,
+            run_id: "a".repeat(32),
+            slug: "greet".to_owned(),
+            approval_sha256: "b".repeat(64),
+            approval_commit: "c".repeat(40),
+            target_branch: "main".to_owned(),
+            status: "running".to_owned(),
+            landing: None,
+            owner_pid: 7,
+            owner_started_ms: 1,
+            started_ms: 2,
+            fields: BTreeMap::new(),
+        };
+        let store = RunStore::new(&directory);
+        store.create(&snapshot).unwrap();
+        symlink(&outside, directory.join("events.jsonl")).unwrap();
+        assert!(store.record(&RunEvent::new("test", 3), &snapshot).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched\n");
+
+        std::fs::remove_file(directory.join("events.jsonl")).unwrap();
+        std::fs::remove_file(directory.join("run.json")).unwrap();
+        symlink(&outside, directory.join("run.json")).unwrap();
+        assert!(store.write_snapshot(&snapshot).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"untouched\n");
+
+        let outside_directory = directory.with_extension("outside-dir");
+        std::fs::create_dir_all(&outside_directory).unwrap();
+        let linked_run = directory.with_extension("linked-run");
+        symlink(&outside_directory, &linked_run).unwrap();
+        assert!(RunStore::new(&linked_run).create(&snapshot).is_err());
+        assert!(!outside_directory.join("run.json").exists());
+
+        let _ = std::fs::remove_dir_all(&directory);
+        let _ = std::fs::remove_file(&linked_run);
+        let _ = std::fs::remove_dir_all(outside_directory);
+        let _ = std::fs::remove_file(outside);
     }
 }
 
@@ -176,8 +228,10 @@ impl RunStore {
     }
 
     pub fn create(&self, snapshot: &RunSnapshot) -> Result<(), RunPersistenceError> {
-        fs::create_dir_all(&self.directory)
+        crate::safe_fs::ensure_directory_path(&self.directory)
             .map_err(|error| persistence_error("create run directory", &self.directory, error))?;
+        ensure_real_directory(&self.directory)
+            .map_err(|error| persistence_error("validate run directory", &self.directory, error))?;
         set_private_dir(&self.directory)
             .map_err(|error| persistence_error("protect run directory", &self.directory, error))?;
         self.write_snapshot(snapshot)
@@ -194,11 +248,15 @@ impl RunStore {
             .append_lock
             .lock()
             .map_err(|error| persistence_error("lock run journal", &path, error))?;
-        fs::create_dir_all(&self.directory)
-            .map_err(|error| persistence_error("create run directory", &self.directory, error))?;
+        ensure_real_directory(&self.directory)
+            .map_err(|error| persistence_error("validate run directory", &self.directory, error))?;
         set_private_dir(&self.directory)
             .map_err(|error| persistence_error("protect run directory", &self.directory, error))?;
-        let mut file = private_append(&path)
+        if matches!(event.event.as_str(), "finished" | "reconciled") && snapshot.status != "running"
+        {
+            self.prepare_cleanup(snapshot)?;
+        }
+        let mut file = crate::safe_fs::append_file(&self.directory, Path::new("events.jsonl"))
             .map_err(|error| persistence_error("append run event", &path, error))?;
         serde_json::to_writer(&mut file, event)
             .map_err(|error| persistence_error("append run event", &path, error))?;
@@ -218,11 +276,11 @@ impl RunStore {
             .append_lock
             .lock()
             .map_err(|error| persistence_error("lock run transcript", &path, error))?;
-        fs::create_dir_all(&self.directory)
-            .map_err(|error| persistence_error("create run directory", &self.directory, error))?;
+        ensure_real_directory(&self.directory)
+            .map_err(|error| persistence_error("validate run directory", &self.directory, error))?;
         set_private_dir(&self.directory)
             .map_err(|error| persistence_error("protect run directory", &self.directory, error))?;
-        let mut file = private_append(&path)
+        let mut file = crate::safe_fs::append_file(&self.directory, Path::new("transcript.jsonl"))
             .map_err(|error| persistence_error("append run transcript", &path, error))?;
         serde_json::to_writer(&mut file, row)
             .map_err(|error| persistence_error("append run transcript", &path, error))?;
@@ -235,18 +293,67 @@ impl RunStore {
         let path = self.directory.join("run.json");
         let bytes = serde_json::to_vec(snapshot)
             .map_err(|error| persistence_error("encode run snapshot", &path, error))?;
-        atomic_replace(&path, &bytes)
+        crate::safe_fs::atomic_replace(&self.directory, Path::new("run.json"), &bytes)
             .map_err(|error| persistence_error("publish run snapshot", &path, error))
     }
 
+    /// Durably records that the run's claim, incoming ref, and workspaces must
+    /// be cleaned. Recovery removes this marker only after every operation is
+    /// complete, so a crash at any later point leaves a retryable obligation.
+    pub fn prepare_cleanup(&self, snapshot: &RunSnapshot) -> Result<(), RunPersistenceError> {
+        let path = self.directory.join("cleanup.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({ "run_id": snapshot.run_id }))
+            .map_err(|error| persistence_error("encode cleanup obligation", &path, error))?;
+        crate::safe_fs::atomic_replace(&self.directory, Path::new("cleanup.json"), &bytes)
+            .map_err(|error| persistence_error("publish cleanup obligation", &path, error))
+    }
+
+    pub fn cleanup_pending(&self, run_id: &str) -> Result<bool, RunPersistenceError> {
+        let path = self.directory.join("cleanup.json");
+        match crate::safe_fs::read_file(&self.directory, Path::new("cleanup.json")) {
+            Ok(bytes) => {
+                let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    persistence_error("decode cleanup obligation", &path, error)
+                })?;
+                match value.get("run_id").and_then(Value::as_str) {
+                    Some(obligation_run_id) if obligation_run_id == run_id => Ok(true),
+                    _ => Err(persistence_error(
+                        "validate cleanup obligation",
+                        &path,
+                        "run id does not match its directory",
+                    )),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(persistence_error("read cleanup obligation", &path, error)),
+        }
+    }
+
+    pub fn clear_cleanup(&self) -> Result<(), RunPersistenceError> {
+        crate::safe_fs::remove_file(&self.directory, Path::new("cleanup.json")).map_err(|error| {
+            persistence_error(
+                "clear cleanup obligation",
+                &self.directory.join("cleanup.json"),
+                error,
+            )
+        })
+    }
+
     pub fn read_snapshot(&self) -> Result<RunSnapshot, RunPersistenceError> {
-        read_json(&self.directory.join("run.json"), "read run snapshot")
+        let path = Path::new("run.json");
+        let bytes = crate::safe_fs::read_file(&self.directory, path).map_err(|error| {
+            persistence_error("read run snapshot", &self.directory.join(path), error)
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            persistence_error("decode run snapshot", &self.directory.join(path), error)
+        })
     }
 
     pub fn read_events(&self) -> Result<Vec<RunEvent>, RunPersistenceError> {
         let path = self.directory.join("events.jsonl");
-        let file = File::open(&path)
+        let bytes = crate::safe_fs::read_file(&self.directory, Path::new("events.jsonl"))
             .map_err(|error| persistence_error("read run journal", &path, error))?;
+        let file = std::io::Cursor::new(bytes);
         BufReader::new(file)
             .lines()
             .enumerate()
@@ -265,59 +372,15 @@ impl RunStore {
     }
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(
-    path: &Path,
-    operation: &'static str,
-) -> Result<T, RunPersistenceError> {
-    let bytes = fs::read(path).map_err(|error| persistence_error(operation, path, error))?;
-    serde_json::from_slice(&bytes).map_err(|error| persistence_error(operation, path, error))
-}
-
-fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let index = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("run"),
-        std::process::id(),
-        index
-    ));
-    let mut file = private_create(&temporary)?;
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "run directory is not a real directory",
+        ));
     }
-    drop(file);
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    File::open(parent)?.sync_all()
-}
-
-fn private_create(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
-fn private_append(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.append(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options.open(path)
+    Ok(())
 }
 
 fn set_private_dir(path: &Path) -> std::io::Result<()> {

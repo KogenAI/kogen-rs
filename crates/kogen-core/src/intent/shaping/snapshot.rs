@@ -52,10 +52,9 @@ fn git_bytes(workdir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     command.args(args).current_dir(workdir);
     #[cfg(any(test, feature = "hermetic-git-tests"))]
     kogen_test_support::configure_git_command(&mut command);
-    let output = command
-        .output()
+    let output = crate::git::run_git_command(command, None)
         .map_err(|error| format!("run git {}: {error}", args.join(" ")))?;
-    if !output.status.success() {
+    if !output.success() {
         return Err(format!("git {} failed", args.join(" ")));
     }
     Ok(output.stdout)

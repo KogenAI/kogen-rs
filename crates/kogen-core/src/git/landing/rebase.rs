@@ -2,7 +2,7 @@ use super::error::LandingError;
 use super::gitops::{arg, args, git, git_output};
 use super::refs::{base_ref, check_commit};
 use super::repository::{CandidateCommit, LandingRepository, RebaseAttempt};
-use crate::git::GitRepo;
+use crate::git::{GitCommandOutput, GitRepo, run_git_command};
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -16,6 +16,7 @@ pub(super) fn rebase_candidate(
     new_parent: &str,
 ) -> Result<RebaseAttempt, LandingError> {
     check_commit(new_parent)?;
+    repository.reset_workspace_git_settings()?;
     let reference = base_ref(branch)?;
     let repo = GitRepo::workspace(repository.workspace());
     git(
@@ -42,8 +43,8 @@ pub(super) fn rebase_candidate(
         None,
         &[],
     )?;
-    if !parent_is_ancestor.status.success() {
-        if parent_is_ancestor.status.code() == Some(1) {
+    if !parent_is_ancestor.success() {
+        if parent_is_ancestor.exit_status == Some(1) {
             return Ok(RebaseAttempt::Impossible {
                 detail: "new base is not a descendant of the expected parent".to_owned(),
             });
@@ -58,7 +59,7 @@ pub(super) fn rebase_candidate(
     let (identity, config) = rebase_identity(repository.origin())?;
     let rebase_args = args(&["rebase", "--onto", new_parent, &candidate.parent]);
     let output = git_with_identity(repository.workspace(), &rebase_args, &identity, &config)?;
-    if output.status.success() {
+    if output.success() {
         Ok(RebaseAttempt::Clean)
     } else {
         let unmerged = repo.output(&["ls-files", "-u", "-z"])?;
@@ -81,8 +82,7 @@ pub(super) fn finish_rebase(repository: &LandingRepository) -> Result<(), Landin
         None,
         &[],
     )?;
-    if output.status.success()
-        || String::from_utf8_lossy(&output.stderr).contains("no rebase in progress")
+    if output.success() || String::from_utf8_lossy(&output.stderr).contains("no rebase in progress")
     {
         Ok(())
     } else {
@@ -95,7 +95,7 @@ fn git_with_identity(
     args: &[OsString],
     identity: &[(OsString, OsString)],
     config: &[OsString],
-) -> Result<std::process::Output, LandingError> {
+) -> Result<GitCommandOutput, LandingError> {
     let mut command = std::process::Command::new("git");
     command
         .args([
@@ -121,18 +121,10 @@ fn git_with_identity(
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .envs(identity.iter().map(|(key, value)| (key, value)))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .envs(identity.iter().map(|(key, value)| (key, value)));
     #[cfg(any(test, feature = "hermetic-git-tests"))]
     kogen_test_support::configure_git_command(&mut command);
-    command.output().map_err(|error| {
-        LandingError::from(crate::git::GitError {
-            operation: "start git rebase".to_owned(),
-            detail: error.to_string(),
-        })
-    })
+    run_git_command(command, None).map_err(Into::into)
 }
 
 fn rebase_identity(origin: &Path) -> Result<(IdentityEnvironment, GitConfig), LandingError> {

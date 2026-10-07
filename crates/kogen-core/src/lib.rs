@@ -14,6 +14,8 @@ pub mod recovery;
 pub mod run;
 pub mod status;
 
+mod safe_fs;
+
 /// The public CLI's exit classes, from spec/01-cli.md §1.5.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]

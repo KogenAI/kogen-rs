@@ -404,11 +404,8 @@ pub(super) fn base_acceptance(
 ) -> Result<crate::gate::CommandAcceptanceResult, CoreError> {
     let relative = candidate_path(options, &approved.slug);
     let path = workspace.join(&relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| environment_error("workspace_write_failed", error))?;
-    }
-    std::fs::write(&path, &approved.acceptance_bytes)
+    crate::safe_fs::validate_write(workspace, &relative)
+        .and_then(|()| crate::safe_fs::write_file(workspace, &relative, &approved.acceptance_bytes))
         .map_err(|error| environment_error("workspace_write_failed", error))?;
     let request = acceptance_request(
         options,
@@ -429,7 +426,7 @@ pub(super) fn base_acceptance(
         crate::gate::run_command_acceptance(runner, &tree, request)
             .map_err(|error| environment_error("acceptance_runner_failed", error))?
     };
-    std::fs::remove_file(path)
+    crate::safe_fs::remove_file(workspace, &relative)
         .map_err(|error| environment_error("workspace_cleanup_failed", error))?;
     Ok(result)
 }

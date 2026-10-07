@@ -1,6 +1,6 @@
 use super::*;
 use std::fs;
-use std::io::Write as _;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[allow(clippy::too_many_arguments)]
@@ -38,17 +38,29 @@ pub(super) fn install_approved(
     approved: &ApprovedBuild,
     options: &BuildOptions,
 ) -> Result<(), CoreError> {
-    let intent = workspace.join(format!(".kogen/intents/{}/intent.md", approved.slug));
-    let acceptance = workspace.join(support::candidate_path(options, &approved.slug));
-    for path in [&intent, &acceptance] {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| environment_error("workspace_write_failed", error.to_string()))?;
-        }
-    }
-    fs::write(intent, &approved.intent_bytes)
-        .and_then(|()| fs::write(acceptance, &approved.acceptance_bytes))
-        .map_err(|error| environment_error("workspace_write_failed", error.to_string()))
+    let intent = PathBuf::from(format!(".kogen/intents/{}/intent.md", approved.slug));
+    let acceptance = support::candidate_path(options, &approved.slug);
+    install_approved_bytes(
+        workspace,
+        &intent,
+        &acceptance,
+        &approved.intent_bytes,
+        &approved.acceptance_bytes,
+    )
+    .map_err(|error| environment_error("workspace_write_failed", error.to_string()))
+}
+
+fn install_approved_bytes(
+    workspace: &Path,
+    intent: &Path,
+    acceptance: &Path,
+    intent_bytes: &[u8],
+    acceptance_bytes: &[u8],
+) -> std::io::Result<()> {
+    crate::safe_fs::validate_write(workspace, intent)?;
+    crate::safe_fs::validate_write(workspace, acceptance)?;
+    crate::safe_fs::write_file(workspace, intent, intent_bytes)?;
+    crate::safe_fs::write_file(workspace, acceptance, acceptance_bytes)
 }
 
 pub(super) fn record_started(
@@ -327,17 +339,14 @@ pub(super) fn publish_candidate(
 }
 
 pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|error| environment_error("candidate_diff_write_failed", error.to_string()))?;
-    file.write_all(bytes)
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        environment_error(
+            "candidate_diff_write_failed",
+            "output path has no file name",
+        )
+    })?;
+    crate::safe_fs::write_file(parent, Path::new(name), bytes)
         .map_err(|error| environment_error("candidate_diff_write_failed", error.to_string()))
 }
 
@@ -536,7 +545,52 @@ pub(super) fn red_count(
 }
 
 pub(super) fn cleanup_path(path: &Path) {
-    let _ = fs::remove_dir_all(path);
+    crate::git::forget_workspace(path);
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => record_cleanup_failure(path, &error),
+    }
+}
+
+fn record_cleanup_failure(path: &Path, error: &std::io::Error) {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        eprintln!("kogen: cleanup_failure {}: {error}", path.display());
+        return;
+    };
+    let Some((run_id, _)) = name.split_once('-') else {
+        eprintln!("kogen: cleanup_failure {}: {error}", path.display());
+        return;
+    };
+    if run_id.len() != 32
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        eprintln!("kogen: cleanup_failure {}: {error}", path.display());
+        return;
+    }
+    let Some(state_root) = path.parent() else {
+        eprintln!("kogen: cleanup_failure {}: {error}", path.display());
+        return;
+    };
+    let store = RunStore::new(state_root.join("runs").join(run_id));
+    let record_result = store.read_snapshot().and_then(|snapshot| {
+        store.prepare_cleanup(&snapshot)?;
+        store.record(
+            &RunEvent::new("cleanup_failure", now_ms())
+                .with("operation", json!("remove workspace"))
+                .with("path", json!(path.to_string_lossy()))
+                .with("detail", json!(error.to_string())),
+            &snapshot,
+        )
+    });
+    if let Err(record_error) = record_result {
+        eprintln!(
+            "kogen: cleanup_failure {}: {error}; recording obligation failed: {record_error}",
+            path.display()
+        );
+    }
 }
 
 pub(super) fn now_ms() -> i64 {
@@ -636,6 +690,72 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn candidate_diff_output_rejects_symlink_redirection() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_dir();
+        let run_dir = root.join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        let outside = root.join("outside");
+        fs::write(&outside, b"untouched\n").unwrap();
+        symlink(&outside, run_dir.join("candidate.diff")).unwrap();
+        assert!(write_private(&run_dir.join("candidate.diff"), b"controller bytes").is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched\n");
+        cleanup_path(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_path_records_a_retryable_obligation_when_workspace_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_root = test_dir();
+        let run_id = "0123456789abcdef0123456789abcdef";
+        let run_dir = state_root.join("runs").join(run_id);
+        let workspace = state_root.join(format!("{run_id}-R1"));
+        fs::create_dir_all(&workspace).expect("create workspace to clean");
+        fs::write(workspace.join("file"), b"candidate").expect("write workspace file");
+        let snapshot = RunSnapshot {
+            schema: 2,
+            run_id: run_id.to_owned(),
+            slug: "alpha".to_owned(),
+            approval_sha256: "approval-hash".to_owned(),
+            approval_commit: "approval-commit".to_owned(),
+            target_branch: "main".to_owned(),
+            status: "running".to_owned(),
+            landing: None,
+            owner_pid: 1,
+            owner_started_ms: 1,
+            started_ms: 1,
+            fields: Default::default(),
+        };
+        let store = RunStore::new(&run_dir);
+        store.create(&snapshot).expect("create run state");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o500))
+            .expect("make workspace parent non-writable");
+
+        cleanup_path(&workspace);
+
+        assert!(workspace.exists());
+        assert!(store.cleanup_pending(run_id).unwrap());
+        assert!(
+            store
+                .read_events()
+                .unwrap()
+                .iter()
+                .any(|event| event.event == "cleanup_failure")
+        );
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+            .expect("restore writable state root");
+        cleanup_path(&workspace);
+        store
+            .clear_cleanup()
+            .expect("clear completed fixture obligation");
+        cleanup_path(&state_root);
+    }
+
     #[test]
     fn candidate_diff_ignores_workspace_filter_and_exclude_controls() {
         let root = test_dir();
@@ -688,6 +808,45 @@ mod tests {
         assert!(!marker.exists(), "workspace clean filter ran");
         assert!(!workspace.join(".git/info/attributes").exists());
         assert!(!workspace.join(".git/info/exclude").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_install_rejects_symlink_components_before_any_write() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_dir();
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        symlink(&outside, workspace.join("test")).expect("install setup-created symlink");
+
+        let intent = PathBuf::from(".kogen/intents/greet/intent.md");
+        let acceptance = PathBuf::from("test/acceptance/greet_test.exs");
+        let result = install_approved_bytes(&workspace, &intent, &acceptance, b"intent", b"test");
+        assert!(result.is_err());
+        assert!(!workspace.join(&intent).exists());
+        assert!(!outside.join("acceptance/greet_test.exs").exists());
+
+        fs::remove_file(workspace.join("test")).expect("remove parent symlink");
+        fs::create_dir_all(workspace.join(".kogen/intents/greet"))
+            .expect("create approved Intent parent");
+        symlink(
+            outside.join("intent.md"),
+            workspace.join(".kogen/intents/greet/intent.md"),
+        )
+        .expect("install repository-provided final symlink");
+        let result = install_approved_bytes(
+            &workspace,
+            &intent,
+            &PathBuf::from("test.greet"),
+            b"new intent",
+            b"test",
+        );
+        assert!(result.is_err());
+        assert!(!outside.join("intent.md").exists());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -123,7 +123,7 @@ pub(crate) fn create_private_file(
 
 #[cfg(unix)]
 fn ensure_private_dir(path: &Path) -> Result<PathBuf, ScriptError> {
-    fs::create_dir_all(path)
+    crate::safe_fs::ensure_directory_path(path)
         .map_err(|source| script_io("create private script directory", source))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| script_io("inspect private script directory", source))?;

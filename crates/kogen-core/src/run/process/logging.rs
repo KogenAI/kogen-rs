@@ -1,16 +1,17 @@
 use super::{OUTPUT_TAIL_BYTES, ProcessError, ProcessResult};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 static NEXT_LOG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(in crate::run) fn ensure_private_dir(path: &Path) -> Result<PathBuf, ProcessError> {
-    fs::create_dir_all(path).map_err(|source| io_error("create private directory", source))?;
+    crate::safe_fs::ensure_directory_path(path)
+        .map_err(|source| io_error("create private directory", source))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| io_error("inspect private directory", source))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -25,13 +26,11 @@ pub(super) fn unique_log_path(directory: &Path, label: &str) -> Result<PathBuf, 
     for _ in 0..100 {
         let nonce = NEXT_LOG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = directory.join(format!("{label}-{}-{nonce}.log", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(_) => return Ok(path),
+        let name = path
+            .file_name()
+            .expect("generated log path has a file name");
+        match crate::safe_fs::create_file(directory, Path::new(name), &[]) {
+            Ok(()) => return Ok(path),
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => return Err(io_error("create private log", source)),
         }
@@ -43,9 +42,11 @@ pub(super) fn unique_log_path(directory: &Path, label: &str) -> Result<PathBuf, 
 }
 
 pub(super) fn private_file(path: &Path) -> Result<File, ProcessError> {
-    OpenOptions::new()
-        .append(true)
-        .open(path)
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .expect("created private log path has a file name");
+    crate::safe_fs::append_file(directory, Path::new(name))
         .map_err(|source| io_error("open private log", source))
 }
 
@@ -56,7 +57,12 @@ pub(super) fn result_from_log(
     unavailable: bool,
     start: Instant,
 ) -> Result<ProcessResult, ProcessError> {
-    let mut file = File::open(path).map_err(|source| io_error("read process log", source))?;
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .expect("created private log path has a file name");
+    let mut file = crate::safe_fs::open_read_file(directory, Path::new(name))
+        .map_err(|source| io_error("read process log", source))?;
     let length = file
         .metadata()
         .map_err(|source| io_error("inspect process log", source))?

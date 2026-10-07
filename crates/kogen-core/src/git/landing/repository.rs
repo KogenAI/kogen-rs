@@ -99,6 +99,11 @@ impl LandingRepository {
             let _ = fs::remove_dir_all(&repo.workspace);
             return Err(error);
         }
+        if let Err(error) = crate::git::register_workspace_base(&repo.workspace, base_commit) {
+            crate::git::forget_workspace(&repo.workspace);
+            let _ = fs::remove_dir_all(&repo.workspace);
+            return Err(error.into());
+        }
         Ok(repo)
     }
 
@@ -381,6 +386,7 @@ impl LandingRepository {
     }
 
     pub fn cleanup_workspace(&self) -> Result<(), LandingError> {
+        crate::git::forget_workspace(&self.workspace);
         fs::remove_dir_all(&self.workspace)
             .map_err(|error| LandingError::io("remove landing workspace", &self.workspace, error))
     }

@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_IGNORE_GIT_DIR: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TreeEntry {
@@ -32,6 +35,7 @@ impl WorkspaceTree {
         }
         let mut entries = BTreeMap::new();
         visit(&root, &root, &mut entries, excluded_paths)?;
+        apply_gitignore(&root, &mut entries)?;
         Ok(Self {
             root,
             entries,
@@ -72,6 +76,7 @@ impl WorkspaceTree {
 pub enum WorkspaceError {
     NotDirectory(PathBuf),
     UnsupportedFile(PathBuf),
+    Git(String),
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -94,6 +99,7 @@ impl std::fmt::Display for WorkspaceError {
                 "workspace contains a non-file entry: {}",
                 path.display()
             ),
+            Self::Git(detail) => write!(formatter, "read Git ignore state: {detail}"),
             Self::Io {
                 operation,
                 path,
@@ -104,6 +110,143 @@ impl std::fmt::Display for WorkspaceError {
 }
 
 impl std::error::Error for WorkspaceError {}
+
+fn apply_gitignore(
+    root: &Path,
+    entries: &mut BTreeMap<PathBuf, TreeEntry>,
+) -> Result<(), WorkspaceError> {
+    let git_dir = root.join(".git");
+    match fs::symlink_metadata(&git_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(WorkspaceError::Git(
+                "workspace .git entry is not a real directory".to_owned(),
+            ));
+        }
+        Err(error) => return Err(io_error("inspect workspace Git directory", &git_dir, error)),
+    }
+
+    let tracked = match crate::git::workspace_base_paths(root) {
+        Some(paths) => paths,
+        None => crate::git::GitRepo::workspace(root)
+            .output(&["ls-files", "--cached", "-z"])
+            .map_err(|error| WorkspaceError::Git(error.to_string()))?
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(path_from_bytes)
+            .collect::<std::collections::BTreeSet<_>>(),
+    };
+    let mut input = Vec::new();
+    for path in entries.keys() {
+        input.extend_from_slice(path_bytes(path.as_os_str()));
+        input.push(0);
+    }
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    let private_git_dir = PrivateIgnoreGitDir::new(root)?;
+    let git_dir = private_git_dir.path.as_os_str();
+    let work_tree = root.as_os_str();
+    let environment = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", work_tree)];
+    let ignored = match crate::git::GitRepo::workspace(root).output_with_env(
+        &["check-ignore", "--no-index", "-z", "--stdin"],
+        &environment,
+        Some(&input),
+    ) {
+        Ok(paths) => paths,
+        Err(error) if error.detail.is_empty() => Vec::new(),
+        Err(error) => return Err(WorkspaceError::Git(error.to_string())),
+    }
+    .split(|byte| *byte == 0)
+    .filter(|path| !path.is_empty())
+    .map(path_from_bytes)
+    .collect::<std::collections::BTreeSet<_>>();
+
+    entries.retain(|path, _| tracked.contains(path) || !ignored.contains(path));
+    Ok(())
+}
+
+struct PrivateIgnoreGitDir {
+    path: PathBuf,
+}
+
+impl PrivateIgnoreGitDir {
+    fn new(root: &Path) -> Result<Self, WorkspaceError> {
+        for _ in 0..32 {
+            let id = NEXT_IGNORE_GIT_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("kogen-ignore-gitdir-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(
+                            |error| io_error("protect private Git directory", &path, error),
+                        )?;
+                    }
+                    let init = crate::git::GitRepo::workspace(root).output(&[
+                        "init",
+                        "--bare",
+                        "--quiet",
+                        "--template=",
+                        path.to_str().ok_or_else(|| {
+                            WorkspaceError::Git("temporary Git directory is not UTF-8".to_owned())
+                        })?,
+                    ]);
+                    if let Err(error) = init {
+                        let _ = fs::remove_dir_all(&path);
+                        return Err(WorkspaceError::Git(error.to_string()));
+                    }
+                    let exclude = path.join("info/exclude");
+                    match fs::remove_file(&exclude) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(io_error("disable private Git excludes", &exclude, error));
+                        }
+                    }
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(io_error("create private Git directory", &path, error)),
+            }
+        }
+        Err(WorkspaceError::Git(
+            "could not allocate an isolated Git directory".to_owned(),
+        ))
+    }
+}
+
+impl Drop for PrivateIgnoreGitDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &std::ffi::OsStr) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_bytes()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &std::ffi::OsStr) -> &[u8] {
+    path.to_str().unwrap_or_default().as_bytes()
+}
+
+#[cfg(unix)]
+fn path_from_bytes(path: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(path: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(path).into_owned())
+}
 
 fn visit(
     root: &Path,
