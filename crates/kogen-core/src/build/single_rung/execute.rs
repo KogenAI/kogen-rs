@@ -571,6 +571,7 @@ fn run_rung(
         crate::gate::snapshot_tree_excluding(candidate.workspace(), &excluded_paths)
             .map_err(|error| environment_error("candidate_snapshot_failed", error.to_string()))?;
     let base_acceptance = support::base_acceptance(
+        project,
         &base_runner,
         options,
         approved,
@@ -1654,6 +1655,7 @@ pub(super) fn run_witness_build(
         crate::gate::snapshot_tree_excluding(candidate.workspace(), &excluded_paths)
             .map_err(|error| environment_error("candidate_snapshot_failed", error.to_string()))?;
     let base_acceptance = support::base_acceptance(
+        project,
         &base_runner,
         options,
         approved,

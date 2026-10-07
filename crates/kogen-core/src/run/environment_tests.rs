@@ -139,6 +139,35 @@ fn project_path_is_used_verbatim_after_mise() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn mise_only_on_a_controller_path_removed_from_child_path_is_not_selected() {
+    let root = test_dir();
+    let bin = root.join("controller-bin");
+    fs::create_dir_all(&bin).expect("create controller bin");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(bin.join("mise"))
+        .expect("create mise stub");
+
+    let base = EnvironmentMap::from([(
+        "PATH".into(),
+        std::env::join_paths([&bin]).expect("join controller PATH"),
+    )]);
+    let mut request = EnvironmentRequest::new(base, root.join("run"), &root, &root);
+    request.kogen_runtime_paths.push(bin.clone());
+    let runner = MiseStubRunner {
+        requests: Mutex::new(Vec::new()),
+    };
+
+    let child = build_child_environment(&runner, request).expect("child environment");
+    assert!(find_executable("mise", &child).is_none());
+    assert!(runner.requests.lock().unwrap().is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
 fn test_dir() -> PathBuf {
     static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(

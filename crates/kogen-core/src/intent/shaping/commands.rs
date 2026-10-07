@@ -188,8 +188,10 @@ impl ShapeCommands {
         item_ids: impl IntoIterator<Item = String>,
         pass: usize,
     ) -> Result<BTreeSet<String>, ValidationFailure> {
-        let use_mise = std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("mise").is_file()));
+        let use_mise = self
+            .sandbox_policy(checkout)
+            .find_executable("mise", &self.environment)
+            .is_some();
         let command_argv0 = match self.acceptance.adapter.as_str() {
             "exunit" if use_mise => "mise".to_owned(),
             "exunit" => "elixir".to_owned(),
@@ -355,10 +357,13 @@ impl ShapeCommands {
         request.env = self.environment.clone();
         request.timeout = timeout;
         request.log_name = log_name.to_owned();
-        let policy = SandboxPolicy::for_build(true, cwd, &self.runner_dir, &host_environment())
-            .with_integrity_check(false);
+        let policy = self.sandbox_policy(cwd).with_integrity_check(false);
         let sandbox = SandboxedProcessPort::new(&self.process, policy, None);
         sandbox.run(request).map_err(|error| error.to_string())
+    }
+
+    fn sandbox_policy(&self, cwd: &Path) -> SandboxPolicy {
+        SandboxPolicy::for_build(true, cwd, &self.runner_dir, &host_environment())
     }
 }
 

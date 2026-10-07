@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 mod acceptance;
 pub(super) use acceptance::candidate_path;
-use acceptance::{acceptance_request, baseline};
+use acceptance::{AcceptanceContext, acceptance_request, baseline};
 
 pub(super) fn gate_feedback(
     approved: &ApprovedBuild,
@@ -269,10 +269,7 @@ pub(super) fn sandboxed<'a>(
     process: &'a ProcessSupervisor,
     integrity: &'a IntegritySnapshot,
 ) -> SandboxedProcessPort<'a> {
-    let host = crate::run::host_environment();
-    let mut policy = SandboxPolicy::for_build(options.sandbox, workspace, run_dir, &host);
-    policy.deny_write(project.checkout.clone());
-    policy.deny_write(project.origin.clone());
+    let policy = workspace_policy(project, options, workspace, run_dir);
     SandboxedProcessPort::new(process, policy, Some(integrity))
 }
 
@@ -285,12 +282,33 @@ pub(super) fn sandboxed_pair<'a>(
     process: &'a ProcessSupervisor,
     integrity: &'a IntegritySnapshot,
 ) -> SandboxedProcessPort<'a> {
+    let policy = pair_policy(project, options, candidate, base, run_dir);
+    SandboxedProcessPort::new(process, policy, Some(integrity))
+}
+
+fn workspace_policy(
+    project: &ProjectResolution,
+    options: &BuildOptions,
+    workspace: &Path,
+    run_dir: &Path,
+) -> SandboxPolicy {
     let host = crate::run::host_environment();
-    let mut policy = SandboxPolicy::for_build(options.sandbox, candidate, run_dir, &host);
-    policy.allow_write(base.to_path_buf());
+    let mut policy = SandboxPolicy::for_build(options.sandbox, workspace, run_dir, &host);
     policy.deny_write(project.checkout.clone());
     policy.deny_write(project.origin.clone());
-    SandboxedProcessPort::new(process, policy, Some(integrity))
+    policy
+}
+
+fn pair_policy(
+    project: &ProjectResolution,
+    options: &BuildOptions,
+    candidate: &Path,
+    base: &Path,
+    run_dir: &Path,
+) -> SandboxPolicy {
+    let mut policy = workspace_policy(project, options, candidate, run_dir);
+    policy.allow_write(base.to_path_buf());
+    policy
 }
 
 pub(super) fn child_environment(
@@ -395,6 +413,7 @@ pub(super) fn run_setup_cached(
 }
 
 pub(super) fn base_acceptance(
+    project: &ProjectResolution,
     runner: &dyn ProcessPort,
     options: &BuildOptions,
     approved: &ApprovedBuild,
@@ -407,20 +426,26 @@ pub(super) fn base_acceptance(
     crate::safe_fs::validate_write(workspace, &relative)
         .and_then(|()| crate::safe_fs::write_file(workspace, &relative, &approved.acceptance_bytes))
         .map_err(|error| environment_error("workspace_write_failed", error))?;
+    let use_mise = workspace_policy(project, options, workspace, run_dir)
+        .find_executable("mise", environment)
+        .is_some();
     let request = acceptance_request(
         options,
         approved,
-        &path,
-        workspace,
-        run_dir,
-        environment.clone(),
-        "ledger-base.jsonl",
+        AcceptanceContext {
+            candidate_path: &path,
+            workspace,
+            run_dir,
+            environment: environment.clone(),
+            report: "ledger-base.jsonl",
+            use_mise,
+        },
     );
     let tree = crate::gate::GitTreeSnapshotWithExclusions::new(
         options.setup_outputs.iter().map(PathBuf::from).collect(),
     );
     let result = if options.adapter == "exunit" {
-        crate::gate::adapters::exunit::run_acceptance(runner, &tree, request, true)
+        crate::gate::adapters::exunit::run_acceptance(runner, &tree, request, use_mise)
             .map_err(|error| environment_error("acceptance_runner_failed", error))?
     } else {
         crate::gate::run_command_acceptance(runner, &tree, request)
@@ -530,8 +555,15 @@ pub(super) fn gate_request(
     if options.adapter == "exunit" {
         let formatter = crate::gate::adapters::exunit::write_formatter(run_dir)
             .map_err(|error| environment_error("acceptance_runner_failed", error))?;
-        let use_mise = std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("mise").is_file()));
+        let use_mise = pair_policy(
+            project,
+            options,
+            candidate_workspace,
+            base_workspace,
+            run_dir,
+        )
+        .find_executable("mise", &environment)
+        .is_some();
         command = crate::gate::adapters::exunit::runner_command(&formatter, use_mise)
             .map_err(|error| environment_error("acceptance_runner_failed", error))?;
     }

@@ -127,6 +127,16 @@ impl SandboxPolicy {
         self.write_denied_paths.push(path.into());
     }
 
+    pub(crate) fn find_executable(
+        &self,
+        program: &str,
+        environment: &EnvironmentMap,
+    ) -> Option<PathBuf> {
+        super::environment::find_executable_if(program, environment, |executable| {
+            platform::executable_visible(executable, self)
+        })
+    }
+
     #[must_use]
     pub fn verifies_integrity(&self) -> bool {
         self.verify_integrity

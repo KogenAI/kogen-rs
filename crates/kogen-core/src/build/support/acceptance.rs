@@ -11,18 +11,25 @@ pub fn candidate_path(options: &BuildOptions, slug: &str) -> PathBuf {
         .join(format!("{slug}{}", options.acceptance_extension))
 }
 
+pub(super) struct AcceptanceContext<'a> {
+    pub candidate_path: &'a Path,
+    pub workspace: &'a Path,
+    pub run_dir: &'a Path,
+    pub environment: ChildEnvironment,
+    pub report: &'a str,
+    pub use_mise: bool,
+}
+
 pub(super) fn acceptance_request(
     options: &BuildOptions,
     approved: &ApprovedBuild,
-    candidate_path: &Path,
-    workspace: &Path,
-    run_dir: &Path,
-    environment: ChildEnvironment,
-    report: &str,
+    context: AcceptanceContext<'_>,
 ) -> crate::gate::CommandAcceptanceRequest {
     let command = if options.adapter == "exunit" {
-        crate::gate::adapters::exunit::write_formatter(run_dir)
-            .and_then(|formatter| crate::gate::adapters::exunit::runner_command(&formatter, true))
+        crate::gate::adapters::exunit::write_formatter(context.run_dir)
+            .and_then(|formatter| {
+                crate::gate::adapters::exunit::runner_command(&formatter, context.use_mise)
+            })
             .unwrap_or_else(|_| options.acceptance_run.clone())
     } else if options.adapter == "rails" {
         crate::gate::adapters::rails::runner_command()
@@ -32,11 +39,11 @@ pub(super) fn acceptance_request(
     crate::gate::CommandAcceptanceRequest {
         slug: approved.slug.clone(),
         command,
-        candidate_path: candidate_path.to_path_buf(),
-        workdir: workspace.to_path_buf(),
-        run_dir: run_dir.to_path_buf(),
-        report_path: run_dir.join("reports").join(report),
-        env: environment,
+        candidate_path: context.candidate_path.to_path_buf(),
+        workdir: context.workspace.to_path_buf(),
+        run_dir: context.run_dir.to_path_buf(),
+        report_path: context.run_dir.join("reports").join(context.report),
+        env: context.environment,
         timeout: options.acceptance_timeout,
         expected_items: approved
             .intent

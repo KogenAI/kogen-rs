@@ -99,7 +99,7 @@ pub fn build_child_environment(
     ensure_private_dir(&tmp_dir)?;
     child.insert(OsString::from("TMPDIR"), tmp_dir.as_os_str().to_owned());
 
-    if let Some(mise) = find_executable("mise", &request.base) {
+    if let Some(mise) = find_executable("mise", &child) {
         merge_mise_environment(runner, &request, &mise, &mut child)?;
     }
 
@@ -265,10 +265,18 @@ fn trusted_paths(
 }
 
 fn find_executable(program: &str, base: &EnvironmentMap) -> Option<PathBuf> {
+    find_executable_if(program, base, |_| true)
+}
+
+pub(crate) fn find_executable_if(
+    program: &str,
+    base: &EnvironmentMap,
+    is_available: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let path = base.get(OsStr::new("PATH"))?;
     for directory in std::env::split_paths(path) {
         let candidate = directory.join(program);
-        if candidate.is_file() && is_executable(&candidate) {
+        if candidate.is_file() && is_executable(&candidate) && is_available(&candidate) {
             return Some(candidate);
         }
     }
