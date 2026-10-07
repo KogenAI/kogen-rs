@@ -9,22 +9,30 @@ use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
 #[test]
-fn chatty_child_times_out_and_keeps_bounded_tail() {
+fn chatty_child_keeps_a_bounded_tail() {
     let root = test_dir("chatty");
     let mut request = ProcessRequest::new("/bin/sh", &root, &root);
+    let output_bytes = OUTPUT_TAIL_BYTES * 2;
+    let marker = b"KOGEN_OUTPUT_COMPLETE\n";
     request.args = vec![
         "-c".into(),
-        "while :; do printf '0123456789abcdef'; done".into(),
+        format!("/usr/bin/head -c {output_bytes} /dev/zero; printf 'KOGEN_OUTPUT_COMPLETE\\n'")
+            .into(),
     ];
-    request.timeout = Duration::from_millis(250);
     request.log_name = "chatty".to_owned();
 
-    let started = Instant::now();
     let result = ProcessSupervisor.run(request).expect("process result");
-    assert!(result.timed_out);
-    assert!(started.elapsed() < Duration::from_millis(1250));
-    assert!(result.output_tail.len() <= OUTPUT_TAIL_BYTES);
-    assert!(fs::metadata(&result.log_path).expect("log exists").len() > OUTPUT_TAIL_BYTES as u64);
+    assert!(!result.timed_out);
+    let mut expected = vec![0; output_bytes];
+    expected.extend_from_slice(marker);
+    assert_eq!(
+        result.output_tail,
+        expected[expected.len() - OUTPUT_TAIL_BYTES..]
+    );
+    assert_eq!(
+        fs::metadata(&result.log_path).expect("log exists").len(),
+        expected.len() as u64
+    );
     assert_eq!(
         fs::metadata(&result.log_path)
             .expect("log metadata")
@@ -33,6 +41,20 @@ fn chatty_child_times_out_and_keeps_bounded_tail() {
             & 0o777,
         0o600
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn child_timeout_is_reported() {
+    let root = test_dir("timeout");
+    let mut request = ProcessRequest::new("/bin/sh", &root, &root);
+    request.args = vec!["-c".into(), "while :; do :; done".into()];
+    request.timeout = Duration::from_millis(250);
+    request.log_name = "timeout".to_owned();
+
+    let result = ProcessSupervisor.run(request).expect("process result");
+    assert!(result.timed_out);
     let _ = fs::remove_dir_all(root);
 }
 

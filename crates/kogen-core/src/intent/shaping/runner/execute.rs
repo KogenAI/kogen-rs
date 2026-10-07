@@ -6,7 +6,6 @@ use super::super::provider::{
     ShapeProvider, ShapeSession, ShapeSessionSpec, dispatch_shaper_tools,
 };
 use super::super::validation::ValidationFailure;
-use super::checkout_lock::CheckoutLock;
 use super::config::{domains, gate_paths, role_config, selected_account};
 use super::files::{
     create_run_dir, io_error, project_error, remove_stale, repair_limit_error, request_is_empty,
@@ -15,7 +14,9 @@ use super::files::{
 use super::validate::validate_pass;
 use super::{ShapeOptions, ShapeReport};
 use crate::error::{CoreError, ErrorClass};
-use crate::project::{ProjectOptions as CoreProjectOptions, ProjectResolution, valid_slug};
+use crate::project::{
+    CheckoutLock, ProjectOptions as CoreProjectOptions, ProjectResolution, valid_slug,
+};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -99,9 +100,11 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         .unwrap_or(2_000);
 
     let request = options.request.clone();
+    let state_root = project.state_root.clone();
     let mut state = RunState {
         options,
         checkout: project.checkout,
+        state_root,
         config: project.config,
         run_dir,
         transcript_path,
@@ -313,6 +316,7 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
 pub(super) struct RunState {
     pub(super) options: ShapeOptions,
     pub(super) checkout: PathBuf,
+    pub(super) state_root: PathBuf,
     pub(super) config: Option<crate::project::ProjectConfig>,
     pub(super) run_dir: PathBuf,
     pub(super) transcript_path: PathBuf,
@@ -367,7 +371,7 @@ impl RunState {
                 .turn(self.session.as_mut().expect("shaper session exists"))?;
             self.record_call(&turn.call);
             if !turn.response.tool_calls.is_empty() {
-                let _lock = CheckoutLock::acquire(&self.options.home, &self.checkout)?;
+                let _lock = CheckoutLock::acquire(&self.state_root, &self.checkout)?;
                 let outputs = dispatch_shaper_tools(
                     &turn,
                     &self.checkout,
