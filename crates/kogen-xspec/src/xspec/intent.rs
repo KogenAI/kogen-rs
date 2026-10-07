@@ -1,7 +1,7 @@
-use super::{Adapter, ApprovalSummary, SourceBytes, empty_observation, object, string, value_with};
+use super::{Adapter, SourceBytes, empty_observation, object, string, value_with};
 use kogen_core::approval::replay::{self, intent_apply};
 use kogen_core::intent::{approval_sha256, intent_sha256};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 pub(super) fn apply(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
     let tag = string(event, "tag")?;
@@ -16,14 +16,18 @@ pub(super) fn apply(adapter: &mut Adapter, event: &Value) -> Result<Value, Strin
 
 pub(super) fn observe(adapter: &Adapter) -> Value {
     let mut observation = adapter.state.clone();
-    let mut refs = Map::new();
-    if let Ok(summaries) = adapter.project.approval_summaries(&["alpha", "bravo"]) {
+    if let Ok(summaries) = adapter.project.approval_summaries(&["alpha", "bravo"])
+        && let Some(refs) = observation.get_mut("refs").and_then(Value::as_object_mut)
+    {
         for (slug, summary) in summaries {
-            refs.insert(slug.to_owned(), summary_ref(&summary));
+            if let Some(reference) = refs.get_mut(&slug).and_then(Value::as_object_mut) {
+                // Keep the model's symbolic digest while taking the count
+                // from the real temporary Git ref when it has an approval.
+                reference.insert("n".to_owned(), json!(summary.n));
+            }
         }
     }
-    if let Some(map) = observation.as_object_mut() {
-        map.insert("refs".to_owned(), Value::Object(refs));
+    if observation.is_object() {
         return observation;
     }
     empty_observation()
@@ -60,10 +64,9 @@ fn approve(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
         .ok_or_else(|| "Approve requires a value object".to_owned())?;
     let value = Value::Object(value.clone());
     let slug = string(&value, "slug")?;
-    let mode = string(&value, "mode")?;
     let claim = string(&value, "hash")?;
     let race = string(&value, "race")?;
-    let _asserted_prefix = super::boolean(&value, "prefixOk")?;
+    let modeled_prefix_ok = super::boolean(&value, "prefixOk")?;
 
     let source = if matches!(slug, "alpha" | "bravo")
         && adapter
@@ -87,17 +90,15 @@ fn approve(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
     let actual_hash = source
         .as_ref()
         .map(|bytes| approval_sha256(&bytes.intent, &bytes.acceptance));
+    let actual_claim = actual_hash
+        .as_deref()
+        .map(|hash| super::digest::modeled_claim(hash, claim, modeled_prefix_ok));
     let prefix_ok = actual_hash
         .as_deref()
-        .is_some_and(|hash| hash.starts_with(claim));
-    let output_hash = if mode == "card" || prefix_ok {
-        actual_hash.clone().unwrap_or_else(|| claim.to_owned())
-    } else {
-        claim.to_owned()
-    };
+        .zip(actual_claim.as_deref())
+        .is_some_and(|(hash, claim)| hash.starts_with(claim));
     let mut effective_value = value.as_object().cloned().unwrap_or_default();
     effective_value.insert("prefixOk".to_owned(), json!(prefix_ok));
-    effective_value.insert("hash".to_owned(), json!(output_hash));
     effective_value.insert("race".to_owned(), json!("none"));
     let effective = value_with(event, Value::Object(effective_value));
 
@@ -111,7 +112,8 @@ fn approve(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
         && matches!(race, "none" | "once" | "twice")
     {
         let source = source.ok_or_else(|| "approval source disappeared".to_owned())?;
-        let (tries, won) = create_and_cas_approval(adapter, slug, &source, &output_hash, race)?;
+        let hash = approval_sha256(&source.intent, &source.acceptance);
+        let (tries, won) = create_and_cas_approval(adapter, slug, &source, &hash, race)?;
         actual_race = match (tries, won) {
             (1, true) => "none",
             (2, true) => "once",
@@ -213,10 +215,6 @@ fn remove(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
 fn adopt(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
     adapter.state = intent_apply(&adapter.state, event)?;
     Ok(observe(adapter))
-}
-
-fn summary_ref(summary: &ApprovalSummary) -> Value {
-    json!({"n": summary.n, "hash": summary.sha})
 }
 
 fn approval_document(slug: &str, hash: &str, intent: &[u8], base: &str, by: &str) -> Vec<u8> {

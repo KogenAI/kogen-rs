@@ -4,11 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug)]
 pub(in crate::xspec) struct ApprovalSummary {
     pub n: u64,
-    pub sha: String,
     pub by: String,
-    pub base: String,
     pub feasibility: String,
-    pub commit: String,
 }
 
 impl TempProject {
@@ -75,17 +72,10 @@ impl TempProject {
             .map_err(|error| format!("approval blob is not JSON: {error}"))?;
         Ok(Some(ApprovalSummary {
             n: count,
-            sha: get_string(&document, "approval_sha256")
-                .unwrap_or_default()
-                .to_owned(),
             by: get_string(&document, "by").unwrap_or_default().to_owned(),
-            base: get_string(&document, "base_sha")
-                .unwrap_or_default()
-                .to_owned(),
             feasibility: get_string(&document, "feasibility")
                 .unwrap_or("not checked")
                 .to_owned(),
-            commit: tip.to_owned(),
         }))
     }
 }

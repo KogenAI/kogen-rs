@@ -298,6 +298,13 @@ pub(super) fn lint_invalid_intent(slug: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+pub(super) fn lint_warning_intent(slug: &str) -> Vec<u8> {
+    format!(
+        "---\ntitle: {slug}\nsize: small\ndomains:\n  - platform\n---\nA concise intent fixture.\n\n## Acceptance\n- A1: This acceptance statement contains a deliberately long sequence of plain words so the lint engine reports a style warning for this otherwise valid fixture with enough words here today.\n\n## Verify\n- A1: test\n"
+    )
+    .into_bytes()
+}
+
 pub(super) fn is_valid_slug(slug: &str) -> bool {
     kogen_core::project::valid_slug(slug)
 }

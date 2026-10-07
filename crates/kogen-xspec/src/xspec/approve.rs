@@ -1,6 +1,5 @@
 use super::{Adapter, ApprovalSummary, SourceBytes, object, string, value_with};
 use kogen_core::approval::replay::{self, approve_apply, approve_observe};
-use kogen_core::git::GitRepo;
 use kogen_core::intent::{Intent, LintSeverity, approval_sha256, intent_sha256};
 use serde_json::{Map, Value, json};
 
@@ -12,7 +11,7 @@ pub(super) fn apply(adapter: &mut Adapter, event: &Value) -> Result<Value, Strin
         ));
     }
     let input = Value::Object(object(event, "value")?.clone());
-    let derived = derive_event(adapter, event, &input)?;
+    let derived = derive_event(adapter, &input)?;
     let mut final_value = derived.value.clone();
     let hashed = !string(&input, "given")?.is_empty();
     let preview = approve_apply(
@@ -35,16 +34,37 @@ pub(super) fn apply(adapter: &mut Adapter, event: &Value) -> Result<Value, Strin
                 .and_then(|approval| approval.get("n"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+    let mut late_read_probe = final_value.clone();
+    late_read_probe.insert("stableBeforeCas".to_owned(), json!(false));
+    let late_read_preview = approve_apply(
+        &adapter.state,
+        &value_with(event, Value::Object(late_read_probe)),
+    )?;
+    let reaches_late_read = hashed
+        && super::boolean(&Value::Object(final_value.clone()), "prefixOk")?
+        && late_read_preview.get("last").and_then(Value::as_str) == Some("intent/hash_mismatch")
+        && late_read_preview.get("sha8").and_then(Value::as_str)
+            == Some(string(&input, "newSha8")?);
 
-    if hashed && would_approve {
+    if reaches_late_read {
         let slug = string(&input, "slug")?;
         let source = derived
             .source
             .as_ref()
             .ok_or_else(|| "approval source disappeared before commit".to_owned())?;
-        let hash = string(&Value::Object(final_value.clone()), "sha")?.to_owned();
-        let commit = create_approval(adapter, slug, source, &hash, &final_value)?;
-        final_value.insert("commit".to_owned(), json!(commit));
+        let hash = approval_sha256(&source.intent, &source.acceptance);
+        let commit = if would_approve {
+            Some(create_approval(
+                adapter,
+                slug,
+                source,
+                &hash,
+                &derived.actual_base,
+                &final_value,
+            )?)
+        } else {
+            None
+        };
 
         // A false hand-event stability flag injects a late source mutation; the
         // transition receives only the result of rereading those actual bytes.
@@ -61,24 +81,10 @@ pub(super) fn apply(adapter: &mut Adapter, event: &Value) -> Result<Value, Strin
             .map(|bytes| approval_sha256(&bytes.intent, &bytes.acceptance));
         let stable = late_hash.as_deref() == Some(hash.as_str())
             && late.as_ref().is_some_and(|bytes| {
-                replay::prefix_matches(
-                    &bytes.intent,
-                    &bytes.acceptance,
-                    string(&input, "given").unwrap_or_default(),
-                )
+                replay::prefix_matches(&bytes.intent, &bytes.acceptance, &derived.actual_given)
             });
         final_value.insert("stableBeforeCas".to_owned(), json!(stable));
-        final_value.insert(
-            "newSha8".to_owned(),
-            json!(
-                late_hash
-                    .as_deref()
-                    .unwrap_or_default()
-                    .get(..8)
-                    .unwrap_or_default()
-            ),
-        );
-        if stable {
+        if stable && let Some(commit) = commit {
             cas_approval(adapter, slug, &commit)?;
         }
     }
@@ -92,10 +98,17 @@ pub(super) fn apply(adapter: &mut Adapter, event: &Value) -> Result<Value, Strin
 
 pub(super) fn observe(adapter: &Adapter) -> Value {
     let mut observation = approve_observe(&adapter.state);
-    let mut approvals = Map::new();
+    let mut approvals = observation
+        .get("approvals")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     if let Ok(summaries) = adapter.project.approval_summaries(&["alpha", "bravo"]) {
         for (slug, summary) in summaries {
-            approvals.insert(slug.to_owned(), summary_approval(&summary));
+            if let Some(model_approval) = approvals.get(&slug) {
+                let projected = summary_approval(&summary, model_approval);
+                approvals.insert(slug, projected);
+            }
         }
     }
     if let Some(map) = observation.as_object_mut() {
@@ -108,14 +121,17 @@ pub(super) fn observe(adapter: &Adapter) -> Value {
 struct DerivedEvent {
     value: Map<String, Value>,
     source: Option<SourceBytes>,
+    actual_given: String,
+    actual_base: String,
 }
 
-fn derive_event(adapter: &Adapter, event: &Value, input: &Value) -> Result<DerivedEvent, String> {
+fn derive_event(adapter: &Adapter, input: &Value) -> Result<DerivedEvent, String> {
     let slug = string(input, "slug")?;
     let given = string(input, "given")?;
+    let model_sha = string(input, "sha")?;
     let parse_error_input = super::boolean(input, "parseErr")?;
     let lint_error_input = super::boolean(input, "lintErr")?;
-    let _asserted_lint_warning = super::boolean(input, "lintWarn")?;
+    let lint_warning_input = super::boolean(input, "lintWarn")?;
     let missing_input = super::boolean(input, "missing")?;
     let _asserted_prefix = super::boolean(input, "prefixOk")?;
     let by_bad_input = super::boolean(input, "byBad")?;
@@ -127,6 +143,8 @@ fn derive_event(adapter: &Adapter, event: &Value, input: &Value) -> Result<Deriv
         bytes.intent = super::temp::malformed_intent();
     } else if lint_error_input && input.get("intentBytes").is_none() {
         bytes.intent = super::temp::lint_invalid_intent(slug);
+    } else if lint_warning_input && input.get("intentBytes").is_none() {
+        bytes.intent = super::temp::lint_warning_intent(slug);
     }
     if let Some(intent) = input.get("intentBytes") {
         bytes.intent = bytes_value(intent, "intentBytes")?;
@@ -167,7 +185,8 @@ fn derive_event(adapter: &Adapter, event: &Value, input: &Value) -> Result<Deriv
             .unwrap_or(bytes.acceptance.clone())
     };
     let actual_hash = approval_sha256(&actual_intent, &actual_acceptance);
-    let prefix_ok = given.is_empty() || (!missing && actual_hash.starts_with(given));
+    let actual_given = super::digest::model_prefix(&actual_hash, model_sha, given);
+    let prefix_ok = !missing && actual_hash.starts_with(&actual_given);
     let parsed = Intent::parse(slug, &actual_intent);
     let parse_error = parsed.is_err();
     let lint = parsed.map(|intent| intent.lint()).unwrap_or_default();
@@ -177,18 +196,12 @@ fn derive_event(adapter: &Adapter, event: &Value, input: &Value) -> Result<Deriv
     let lint_warning = lint
         .iter()
         .any(|issue| issue.severity == LintSeverity::Style);
-    let identity = GitRepo::new(adapter.project.checkout_repo.path())
-        .author_identity()
-        .map_err(|error| error.to_string())?;
-    let base = adapter
+    let actual_base = adapter
         .project
         .base_commit()
         .map_err(|error| error.to_string())?;
     let mut value = input.as_object().cloned().unwrap_or_default();
     value.insert("prefixOk".to_owned(), json!(prefix_ok));
-    value.insert("sha".to_owned(), json!(actual_hash));
-    value.insert("sha8".to_owned(), json!(&actual_hash[..8]));
-    value.insert("newSha8".to_owned(), json!(&actual_hash[..8]));
     value.insert("parseErr".to_owned(), json!(parse_error));
     value.insert("lintErr".to_owned(), json!(lint_error));
     value.insert("lintWarn".to_owned(), json!(lint_warning));
@@ -197,13 +210,10 @@ fn derive_event(adapter: &Adapter, event: &Value, input: &Value) -> Result<Deriv
         "byBad".to_owned(),
         json!(by_bad_input || by.contains(['\n', '\r'])),
     );
-    value.insert("ident".to_owned(), json!(identity));
     // The initial snapshot has not yet been compared with the second source
     // read. The adapter always performs that read before CAS and records its
     // result from the actual bytes below.
     value.insert("stableBeforeCas".to_owned(), json!(true));
-    value.insert("baseSha".to_owned(), json!(base));
-    value.insert("commit".to_owned(), json!(""));
     let source = if missing {
         None
     } else {
@@ -212,8 +222,12 @@ fn derive_event(adapter: &Adapter, event: &Value, input: &Value) -> Result<Deriv
             acceptance: actual_acceptance,
         })
     };
-    let _ = event;
-    Ok(DerivedEvent { value, source })
+    Ok(DerivedEvent {
+        value,
+        source,
+        actual_given,
+        actual_base,
+    })
 }
 
 fn create_approval(
@@ -221,6 +235,7 @@ fn create_approval(
     slug: &str,
     source: &SourceBytes,
     hash: &str,
+    base: &str,
     value: &Map<String, Value>,
 ) -> Result<String, String> {
     let value = Value::Object(value.clone());
@@ -230,7 +245,6 @@ fn create_approval(
     } else {
         given_by
     };
-    let base = string(&value, "baseSha")?;
     let feasibility = string(&value, "feas")?;
     let bytes = approval_document(slug, hash, &source.intent, base, by, feasibility);
     let parent = adapter
@@ -344,13 +358,10 @@ fn approval_document(
     .unwrap_or_default()
 }
 
-fn summary_approval(summary: &ApprovalSummary) -> Value {
-    json!({
-        "n": summary.n,
-        "sha": summary.sha,
-        "by": summary.by,
-        "commit": summary.commit,
-        "base": summary.base,
-        "feas": summary.feasibility
-    })
+fn summary_approval(summary: &ApprovalSummary, model_approval: &Value) -> Value {
+    let mut approval = model_approval.as_object().cloned().unwrap_or_default();
+    approval.insert("n".to_owned(), json!(summary.n));
+    approval.insert("by".to_owned(), json!(summary.by));
+    approval.insert("feas".to_owned(), json!(summary.feasibility));
+    Value::Object(approval)
 }
