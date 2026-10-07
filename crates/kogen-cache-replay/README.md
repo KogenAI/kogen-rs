@@ -73,9 +73,11 @@ clear that blocker without a versioned endpoint contract and a bounded
 admission result.
 
 The optional `--auth-path` is explicit Kogen injected auth via
-`kogen_core::provider::auth::read_injected`. Ambient `KOGEN_AUTH_PATH` and
-`KOGEN_PROVIDER_URL` are rejected. Without `--auth-path`, every attempt uses
-Kogen's normal selected Owned ChatGPT account and refresh path. Outputs must
-be outside the repository. `attempts.jsonl` is flushed after every scheduled
-slot; raw usage and HTTP status are retained, while auth headers, response
-text, provider response IDs, and turn-state values are not written.
+`kogen_core::provider::auth::credential_for_request_with_injected_path`.
+`KOGEN_PROVIDER_URL` is always rejected. Ambient `KOGEN_AUTH_PATH` is rejected
+unless `--auth-path` explicitly supplies the injected credential source. Without
+`--auth-path`, every attempt uses Kogen's normal selected Owned ChatGPT account
+and refresh path. Outputs must be outside the repository. `attempts.jsonl` is
+flushed after every scheduled slot; raw usage and HTTP status are retained,
+while auth headers, response text, provider response IDs, and turn-state values
+are not written.
