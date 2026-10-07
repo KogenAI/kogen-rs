@@ -2,7 +2,7 @@ use super::{
     RequestContext, ResponseMode, WireConfig, build_wire_request, validate_generation_cap,
 };
 use crate::provider::ProviderErrorKind;
-use crate::provider::auth::{InjectedCredential, RequestCredential};
+use crate::provider::auth::{Credential, InjectedCredential, RequestCredential};
 use crate::provider::session::ConversationBinding;
 use serde_json::{Value, json};
 use url::Url;
@@ -37,6 +37,61 @@ fn generation_cap_validation_reports_lite_and_noncanonical_endpoint_errors() {
         endpoint_error.message,
         "Model-generation cap is unsupported on this endpoint/adapter."
     );
+}
+
+#[test]
+fn originator_is_limited_to_chatgpt_backend_requests() {
+    let root = std::env::temp_dir().join(format!(
+        "kogen-wire-originator-test-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let binding = ConversationBinding::new(&root, "develop");
+    let context = RequestContext::for_conversation(
+        &binding,
+        "gpt-6-luna",
+        "max",
+        "instructions",
+        vec![user_item("request")],
+    )
+    .unwrap();
+    let endpoint = Some(Url::parse("https://example.invalid/v1/responses").unwrap());
+    let owned_auth = RequestCredential::Owned(Credential {
+        client_id: "client".to_owned(),
+        access_token: "owned-token".to_owned(),
+        refresh_token: "refresh-token".to_owned(),
+        id_token: String::new(),
+        expires_at: i64::MAX,
+        scopes: Vec::new(),
+        subject: "subject".to_owned(),
+        email: None,
+        host_id: "host".to_owned(),
+    });
+    let owned_config = WireConfig {
+        endpoint_override: endpoint.clone(),
+        mode: ResponseMode::Owned,
+        supports_generation_cap: false,
+        user_agent_version: "test".to_owned(),
+    };
+    let owned = build_wire_request(&context, &owned_auth, &owned_config).unwrap();
+    assert_eq!(owned.header("originator"), None);
+
+    let injected_auth = RequestCredential::Injected(InjectedCredential {
+        access_token: "injected-token".to_owned(),
+        account_id: "injected-account".to_owned(),
+        expires_at: i64::MAX,
+    });
+    let injected_config = WireConfig {
+        endpoint_override: endpoint,
+        mode: ResponseMode::Injected,
+        supports_generation_cap: false,
+        user_agent_version: "test".to_owned(),
+    };
+    let injected = build_wire_request(&context, &injected_auth, &injected_config).unwrap();
+    assert_eq!(injected.header("originator"), Some("kogen"));
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

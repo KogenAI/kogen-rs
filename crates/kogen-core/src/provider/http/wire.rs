@@ -320,7 +320,9 @@ pub fn build_wire_request(
             "responses=experimental".to_owned(),
         ));
     }
-    headers.push(("originator".to_owned(), "kogen".to_owned()));
+    if matches!(config.mode, ResponseMode::Injected | ResponseMode::Lite) {
+        headers.push(("originator".to_owned(), "kogen".to_owned()));
+    }
     headers.push(("x-client-request-id".to_owned(), request.thread_id.clone()));
     headers.push(("session-id".to_owned(), request.cache_key.clone()));
     headers.push(("thread-id".to_owned(), request.thread_id.clone()));

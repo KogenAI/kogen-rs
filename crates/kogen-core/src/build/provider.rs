@@ -27,6 +27,7 @@ pub(super) struct BuildProvider<'a> {
     rung_sessions: BTreeMap<String, BuilderSession>,
     shared_tools: Vec<Value>,
     usage_paused_ms: u64,
+    stage_error_can_resume: bool,
     build_started: Instant,
     home: std::path::PathBuf,
     account: RunAccount,
@@ -46,8 +47,15 @@ struct BuilderSession {
 
 const PROTECTED_RESTORE_LIMIT: u8 = 4;
 
-fn retry_after_provider_error(reason: &str, credential_source: &str) -> bool {
-    reason == "usage_limit" || (reason == "login" && credential_source != "injected")
+// Usage-limit waits and missing owned-login errors can resume a stage. A login
+// error after sending a provider request has already had its forced refresh.
+fn should_retry_stage_provider_error(
+    reason: &str,
+    attempts: usize,
+    credential_source: &str,
+) -> bool {
+    reason == "usage_limit"
+        || (reason == "login" && attempts == 0 && credential_source != "injected")
 }
 
 fn protected_restore_limit_reached(restores: u8) -> bool {
@@ -92,6 +100,7 @@ impl<'a> BuildProvider<'a> {
             builder_session: None,
             rung_sessions: BTreeMap::new(),
             usage_paused_ms: 0,
+            stage_error_can_resume: false,
             build_started: Instant::now(),
             home,
             account,
@@ -116,6 +125,7 @@ impl<'a> BuildProvider<'a> {
             rung_sessions: BTreeMap::new(),
             shared_tools: self.shared_tools.clone(),
             usage_paused_ms: self.usage_paused_ms,
+            stage_error_can_resume: false,
             build_started: self.build_started,
             home: self.home.clone(),
             account: self.account.clone(),
@@ -161,10 +171,7 @@ impl<'a> BuildProvider<'a> {
                 Ok(call) => break (call, before.elapsed().as_millis() as u64),
                 Err(error)
                     if error.class == crate::error::ErrorClass::Provider
-                        && retry_after_provider_error(
-                            &error.reason,
-                            self.account.credential_source,
-                        )
+                        && self.stage_error_can_resume
                         && self.usage_paused_ms < 86_400_000 =>
                 {
                     self.usage_paused_ms =
@@ -566,10 +573,7 @@ impl<'a> BuildProvider<'a> {
                     Ok(call) => break call,
                     Err(error)
                         if error.class == crate::error::ErrorClass::Provider
-                            && retry_after_provider_error(
-                                &error.reason,
-                                self.account.credential_source,
-                            )
+                            && self.stage_error_can_resume
                             && self.usage_paused_ms < 86_400_000 =>
                     {
                         self.usage_paused_ms =
@@ -824,7 +828,19 @@ impl<'a> BuildProvider<'a> {
         mode: &str,
         wall_budget_ms: Option<u64>,
     ) -> Result<ProviderCall, CoreError> {
-        let mut credential = auth::credential_for_request(&self.home, &self.account)?;
+        self.stage_error_can_resume = false;
+        let mut credential = match auth::credential_for_request(&self.home, &self.account) {
+            Ok(credential) => credential,
+            Err(error) => {
+                self.stage_error_can_resume = error.class == crate::error::ErrorClass::Provider
+                    && should_retry_stage_provider_error(
+                        &error.reason,
+                        0,
+                        self.account.credential_source,
+                    );
+                return Err(error);
+            }
+        };
         let mut wire = WireConfig::from_auth(&credential, ApiMode::Responses)
             .map_err(|failure| provider_error(failure.kind, failure.message))?;
         if let Ok(endpoint) = std::env::var("KOGEN_PROVIDER_URL") {
@@ -857,6 +873,11 @@ impl<'a> BuildProvider<'a> {
         match result {
             Ok(call) => Ok(call),
             Err(failure) => {
+                self.stage_error_can_resume = should_retry_stage_provider_error(
+                    failure.failure.kind.as_str(),
+                    failure.attempts.len(),
+                    self.account.credential_source,
+                );
                 self.record_provider_events(snapshot, mode, &failure.events)?;
                 let detail = failure.failure.message.clone();
                 Err(provider_error(failure.failure.kind, detail))
@@ -959,7 +980,8 @@ fn audit_request_context(
 mod tests {
     use super::{
         append_tool_batch_history, audit_request_context, configure_build_tools,
-        protected_restore_limit_reached, retry_after_provider_error, shared_build_tool_schemas,
+        protected_restore_limit_reached, shared_build_tool_schemas,
+        should_retry_stage_provider_error,
     };
     use crate::build::config::BuildOptions;
     use crate::project::{ProjectConfig, ProjectResolution};
@@ -1002,10 +1024,16 @@ mod tests {
     }
 
     #[test]
-    fn injected_login_stops_while_owned_login_and_usage_limit_can_resume() {
-        assert!(!retry_after_provider_error("login", "injected"));
-        assert!(retry_after_provider_error("login", "owned"));
-        assert!(retry_after_provider_error("usage_limit", "injected"));
+    fn stage_retries_waitable_errors_but_not_a_provider_rejected_login() {
+        assert!(should_retry_stage_provider_error(
+            "usage_limit",
+            1,
+            "injected"
+        ));
+        assert!(should_retry_stage_provider_error("login", 0, "owned"));
+        assert!(!should_retry_stage_provider_error("login", 0, "injected"));
+        assert!(!should_retry_stage_provider_error("login", 2, "owned"));
+        assert!(!should_retry_stage_provider_error("timeout", 1, "owned"));
     }
 
     #[test]

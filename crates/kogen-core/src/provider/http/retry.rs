@@ -351,6 +351,34 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn login_gets_one_forced_refresh_before_the_request_pauses() {
+        let mut replay = RetryReplay::default();
+        replay.apply(
+            "Open",
+            Some(&json!({
+                "role":"builder",
+                "model":"luna",
+                "mode":"build",
+                "fallbackOn":false,
+                "refreshable":true,
+                "bounded":true,
+                "wall":100_000
+            })),
+        );
+
+        replay.apply("Result", Some(&json!({"kind":"login"})));
+        assert_eq!(replay.decision, "refresh");
+        assert!(replay.refreshed);
+        assert_eq!(replay.phase, "open");
+
+        replay.apply("Result", Some(&json!({"kind":"login"})));
+        assert_eq!(replay.decision, "pause");
+        assert_eq!(replay.delay, 300_000);
+        assert_eq!(replay.waited, 300_000);
+        assert_eq!(replay.phase, "idle");
+    }
+
+    #[test]
     fn usage_limit_pauses_even_when_credentials_cannot_be_refreshed() {
         let mut replay = RetryReplay::default();
         replay.apply(
