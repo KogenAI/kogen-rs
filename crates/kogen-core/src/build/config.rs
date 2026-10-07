@@ -16,6 +16,8 @@ pub(super) struct BuildOptions {
     pub land_policy: String,
     pub planner_model: String,
     pub planner_effort: String,
+    pub auditor_model: String,
+    pub auditor_effort: String,
     pub builder_model: String,
     pub builder_effort: String,
     pub rung2_model: String,
@@ -42,10 +44,18 @@ pub(super) struct BuildOptions {
 impl BuildOptions {
     pub fn load(project: &ProjectResolution) -> Result<Self, CoreError> {
         let machine = machine_build_config()?;
-        let planner = role(project, &machine, "planner", "gpt-6.1-sol", "high");
-        let builder = role(project, &machine, "builder", "gpt-6-luna", "max");
-        let rung2 = role(project, &machine, "rung2", "gpt-6.1-sol", "medium");
-        let rung3 = role(project, &machine, "rung3", "gpt-6.1-sol", "high");
+        Self::load_with_machine(project, &machine)
+    }
+
+    pub(super) fn load_with_machine(
+        project: &ProjectResolution,
+        machine: &Option<Value>,
+    ) -> Result<Self, CoreError> {
+        let planner = role(project, machine, "planner", "gpt-6.1-sol", "high");
+        let auditor = role(project, machine, "auditor", "gpt-6.1-sol", "high");
+        let builder = role(project, machine, "builder", "gpt-6-luna", "max");
+        let rung2 = role(project, machine, "rung2", "gpt-6.1-sol", "medium");
+        let rung3 = role(project, machine, "rung3", "gpt-6.1-sol", "high");
         let raw = project.config.as_ref().map(|config| &config.raw);
         let recipe = mapping_value(mapping_value(raw, "build"), "recipe")
             .and_then(Value::as_str)
@@ -64,12 +74,12 @@ impl BuildOptions {
             .and_then(Value::as_str)
             .unwrap_or("green-or-advisory")
             .to_owned();
-        let fallback_on = bool_value(project, &machine, "model_fallback").unwrap_or(true);
-        let wall_ms = integer_value(project, &machine, "budget_ms")
-            .or_else(|| integer_value(project, &machine, "wall_minutes").map(|m| m * 60_000))
+        let fallback_on = bool_value(project, machine, "model_fallback").unwrap_or(true);
+        let wall_ms = integer_value(project, machine, "budget_ms")
+            .or_else(|| integer_value(project, machine, "wall_minutes").map(|m| m * 60_000))
             .unwrap_or(3_600_000);
-        let tool_tokens = integer_value(project, &machine, "tool_result_tokens").unwrap_or(2_000);
-        let model_generation_tokens = integer_value(project, &machine, "model_generation_tokens");
+        let tool_tokens = integer_value(project, machine, "tool_result_tokens").unwrap_or(2_000);
+        let model_generation_tokens = integer_value(project, machine, "model_generation_tokens");
         let sandbox = mapping_value(raw, "sandbox")
             .and_then(Value::as_bool)
             .unwrap_or(true);
@@ -99,6 +109,8 @@ impl BuildOptions {
             land_policy,
             planner_model: planner.0,
             planner_effort: planner.1,
+            auditor_model: auditor.0,
+            auditor_effort: auditor.1,
             builder_model: builder.0,
             builder_effort: builder.1,
             rung2_model: rung2.0,

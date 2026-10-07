@@ -256,19 +256,15 @@ impl<'a> BuildProvider<'a> {
         instructions: String,
         request: &crate::run::orchestration::BuildAuditRequest,
     ) -> Result<String, CoreError> {
-        let mut context = self.request_context(
+        let mut context = audit_request_context(
+            self.options,
+            &self.shared_tools,
             run_dir,
             stage,
-            "test-auditor",
             rung,
-            "gpt-6.1-sol",
-            "high",
             instructions,
             vec![user_item(&request.user_message())],
-            Vec::new(),
-            false,
         )?;
-        context.tool_choice = "none".to_owned();
         let before = Instant::now();
         let call = self.call(
             snapshot,
@@ -934,16 +930,44 @@ fn configure_build_tools(
     context.callable_tools = callable_tools;
 }
 
+fn audit_request_context(
+    options: &BuildOptions,
+    shared_tools: &[Value],
+    run_dir: &Path,
+    stage: &str,
+    rung: &str,
+    instructions: String,
+    input: Vec<Value>,
+) -> Result<RequestContext, CoreError> {
+    let mut binding = ConversationBinding::new(run_dir, stage);
+    binding.attempt = "test-auditor".to_owned();
+    binding.rung = rung.to_owned();
+    let mut context = RequestContext::for_conversation(
+        &binding,
+        &options.auditor_model,
+        &options.auditor_effort,
+        instructions,
+        input,
+    )
+    .map_err(|error| super::environment_error("conversation_identity_failed", error.to_string()))?;
+    configure_build_tools(&mut context, shared_tools, Vec::new());
+    context.tool_choice = "none".to_owned();
+    Ok(context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        append_tool_batch_history, configure_build_tools, protected_restore_limit_reached,
-        retry_after_provider_error, shared_build_tool_schemas,
+        append_tool_batch_history, audit_request_context, configure_build_tools,
+        protected_restore_limit_reached, retry_after_provider_error, shared_build_tool_schemas,
     };
+    use crate::build::config::BuildOptions;
+    use crate::project::{ProjectConfig, ProjectResolution};
     use crate::provider::auth::{InjectedCredential, RequestCredential};
     use crate::provider::http::{RequestContext, ResponseMode, WireConfig, build_wire_request};
     use crate::provider::session::ConversationBinding;
     use serde_json::{Value, json};
+    use serde_yaml::Value as YamlValue;
     use url::Url;
 
     #[test]
@@ -1028,6 +1052,70 @@ mod tests {
         assert_eq!(body["tool_choice"], "none");
         assert_eq!(body["tools"], json!(expected));
         assert_eq!(expected_names, ["finish", "shell", "tool_output"]);
+        std::fs::remove_dir_all(root).expect("remove conversation root");
+    }
+
+    #[test]
+    fn audit_request_uses_the_configured_auditor_model_and_effort() {
+        let root = std::env::temp_dir().join(format!(
+            "kogen-build-auditor-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).expect("create conversation root");
+        let project = ProjectResolution {
+            checkout: root.clone(),
+            origin: root.clone(),
+            base: "main".to_owned(),
+            state_root: root.clone(),
+            config: Some(ProjectConfig {
+                name: "fixture".to_owned(),
+                base: None,
+                raw: serde_yaml::from_str(
+                    "build:\n  roles:\n    auditor:\n      model: gpt-6-luna\n      effort: medium\n",
+                )
+                .expect("parse project config"),
+            }),
+        };
+        let machine: Option<YamlValue> = Some(
+            serde_yaml::from_str("roles:\n  auditor:\n    model: machine-model\n    effort: low\n")
+                .expect("parse machine config"),
+        );
+        let options =
+            BuildOptions::load_with_machine(&project, &machine).expect("load build options");
+        let expected = shared_build_tool_schemas(crate::provider::tools::ToolRole::BuilderShell);
+        let context = audit_request_context(
+            &options,
+            &expected,
+            &root,
+            "audit",
+            "R1",
+            "instructions".to_owned(),
+            vec![json!({"role":"user","content":[{"type":"input_text","text":"audit"}]})],
+        )
+        .expect("create audit request context");
+
+        let auth = RequestCredential::Injected(InjectedCredential {
+            access_token: "fake-token".to_owned(),
+            account_id: "fake-account".to_owned(),
+            expires_at: i64::MAX,
+        });
+        let config = WireConfig {
+            endpoint_override: Some(Url::parse("https://example.invalid/v1/responses").unwrap()),
+            mode: ResponseMode::Injected,
+            supports_generation_cap: false,
+            user_agent_version: "test".to_owned(),
+        };
+        let wire = build_wire_request(&context, &auth, &config).expect("encode audit request");
+        let body: Value = serde_json::from_slice(&wire.body).expect("parse request body");
+
+        assert_eq!(options.auditor_model, "gpt-6-luna");
+        assert_eq!(options.auditor_effort, "medium");
+        assert_eq!(body["model"], "gpt-6-luna");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["tool_choice"], "none");
+        assert_eq!(context.tools, expected);
+        assert!(context.callable_tools.is_empty());
         std::fs::remove_dir_all(root).expect("remove conversation root");
     }
 }
