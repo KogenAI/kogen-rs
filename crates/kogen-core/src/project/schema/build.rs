@@ -21,6 +21,7 @@ pub(super) fn validate(value: &Value, issues: &mut Vec<String>) {
         "land",
         "budget_ms",
         "fallback",
+        "context_packet",
     ];
     unknown_keys(map, &allowed, "build", issues);
     if let Some(recipe) = get(map, "recipe") {
@@ -46,7 +47,7 @@ pub(super) fn validate(value: &Value, issues: &mut Vec<String>) {
     {
         issues.push("plan_max_words must be an integer from 300 to 2000".to_owned());
     }
-    for field in ["edge_tests", "model_fallback"] {
+    for field in ["edge_tests", "model_fallback", "context_packet"] {
         if let Some(value) = get(map, field)
             && !matches!(value, Value::Bool(_))
         {

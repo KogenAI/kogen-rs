@@ -40,6 +40,7 @@ sandbox: true
 acceptance: {adapter: command, ext: .t.sh, candidate_dir: test/acceptance, run: [sh, run.sh, "{path}"], timeout_ms: 600000}
 shaping: {proof: none}
 build:
+  context_packet: true
   recipe: ladder
   roles:
     builder: {model: gpt-6-luna, effort: max}
