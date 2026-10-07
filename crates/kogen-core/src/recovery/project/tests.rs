@@ -299,84 +299,101 @@ fn recovery_uses_the_snapshot_target_branch_when_the_configured_base_changes() {
 fn terminal_cleanup_obligation_retries_after_crash_and_deletion_failure() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = TestDirectory::new();
-    let origin = temp.0.join("origin.git");
-    git(
-        &temp.0,
-        &["init", "--bare", "--initial-branch=main", path(&origin)],
-    );
-    let state_root = temp.0.join("state");
-    let run_dir = state_root.join("runs").join(RUN_ID);
-    let workspace = state_root.join(format!("{RUN_ID}-R1"));
-    fs::create_dir_all(&workspace).expect("create leftover workspace");
-    git(&workspace, &["init", "--initial-branch=main"]);
-    kogen_test_support::set_identity(&workspace, "Recovery fixture", "fixture@example.test")
-        .unwrap();
-    fs::write(workspace.join("README"), b"base\n").unwrap();
-    git(&workspace, &["add", "README"]);
-    git(&workspace, &["commit", "-m", "base"]);
-    git(&workspace, &["push", path(&origin), "main"]);
-    fs::write(workspace.join("candidate"), b"left behind").expect("write leftover file");
-    let mut snapshot = RunSnapshot {
-        schema: 2,
-        run_id: RUN_ID.to_owned(),
-        slug: "alpha".to_owned(),
-        approval_sha256: "approval-hash".to_owned(),
-        approval_commit: "approval-commit".to_owned(),
-        target_branch: "main".to_owned(),
-        status: "failed".to_owned(),
-        landing: None,
-        owner_pid: 0,
-        owner_started_ms: 0,
-        started_ms: 1,
-        recovery: Vec::new(),
-        cleanup_pending: false,
-        fields: BTreeMap::new(),
-    };
-    let store = RunStore::new(&run_dir);
-    snapshot.status = "running".to_owned();
-    store.create(&snapshot).expect("create run state");
-    snapshot.status = "failed".to_owned();
-    store
-        .record(
-            &RunEvent::new("finished", 2)
-                .with("status", json!("failed"))
-                .with("reason", json!("crashed")),
-            &snapshot,
-        )
-        .expect("publish terminal snapshot and cleanup obligation before simulated crash");
-    assert!(store.cleanup_pending(RUN_ID).unwrap());
+    for archive_only in [false, true] {
+        let temp = TestDirectory::new();
+        let origin = temp.0.join("origin.git");
+        git(
+            &temp.0,
+            &["init", "--bare", "--initial-branch=main", path(&origin)],
+        );
+        let state_root = temp.0.join("state");
+        let run_dir = state_root.join("runs").join(RUN_ID);
+        let workspace = state_root.join(format!("{RUN_ID}-R1"));
+        fs::create_dir_all(&workspace).expect("create leftover workspace");
+        git(&workspace, &["init", "--initial-branch=main"]);
+        kogen_test_support::set_identity(&workspace, "Recovery fixture", "fixture@example.test")
+            .unwrap();
+        fs::write(workspace.join("README"), b"base\n").unwrap();
+        git(&workspace, &["add", "README"]);
+        git(&workspace, &["commit", "-m", "base"]);
+        git(&workspace, &["push", path(&origin), "main"]);
+        fs::write(workspace.join("candidate"), b"left behind").expect("write leftover file");
+        if archive_only {
+            fs::create_dir_all(origin.join("refs/kogen")).unwrap();
+            fs::write(
+                origin.join("refs/kogen/candidates"),
+                format!("{}\n", git_text(&workspace, &["rev-parse", "HEAD"])),
+            )
+            .unwrap();
+        }
 
-    // Make the first cleanup attempt fail at the state-root boundary. The
-    // run journal remains writable so the failure can be durably recorded.
-    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o500))
-        .expect("make workspace parent non-writable");
-    let project = ProjectResolution {
-        checkout: temp.0.clone(),
-        origin,
-        base: "main".to_owned(),
-        state_root: state_root.clone(),
-        config: None,
-    };
-    reconcile(&project).expect("cleanup failure leaves run available for another recovery pass");
-    assert!(
-        workspace.exists(),
-        "failed deletion leaves workspace for retry"
-    );
-    assert!(store.cleanup_pending(RUN_ID).unwrap());
-    assert!(
+        let mut snapshot = RunSnapshot {
+            schema: 2,
+            run_id: RUN_ID.to_owned(),
+            slug: "alpha".to_owned(),
+            approval_sha256: "approval-hash".to_owned(),
+            approval_commit: "approval-commit".to_owned(),
+            target_branch: "main".to_owned(),
+            status: "failed".to_owned(),
+            landing: None,
+            owner_pid: 0,
+            owner_started_ms: 0,
+            started_ms: 1,
+            recovery: Vec::new(),
+            cleanup_pending: false,
+            fields: BTreeMap::new(),
+        };
+        let store = RunStore::new(&run_dir);
+        snapshot.status = "running".to_owned();
+        store.create(&snapshot).expect("create run state");
+        snapshot.status = "failed".to_owned();
         store
-            .read_events()
-            .unwrap()
-            .iter()
-            .any(|event| event.event == "cleanup_failure")
-    );
+            .record(
+                &RunEvent::new("finished", 2)
+                    .with("status", json!("failed"))
+                    .with("reason", json!("crashed")),
+                &snapshot,
+            )
+            .expect("publish terminal snapshot and cleanup obligation before simulated crash");
+        assert!(store.cleanup_pending(RUN_ID).unwrap());
 
-    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
-        .expect("restore writable state root");
-    reconcile(&project).expect("retry terminal cleanup");
-    assert!(!workspace.exists(), "{:?}", store.read_events().unwrap());
-    assert!(!store.cleanup_pending(RUN_ID).unwrap());
+        // Make the first cleanup attempt fail at the state-root boundary. The
+        // run journal remains writable so the failure can be durably recorded.
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o500))
+            .expect("make workspace parent non-writable");
+        let project = ProjectResolution {
+            checkout: temp.0.clone(),
+            origin,
+            base: "main".to_owned(),
+            state_root: state_root.clone(),
+            config: None,
+        };
+        reconcile(&project)
+            .expect("cleanup failure leaves run available for another recovery pass");
+        assert!(
+            workspace.exists(),
+            "failed deletion leaves workspace for retry"
+        );
+        assert!(store.cleanup_pending(RUN_ID).unwrap());
+        assert!(
+            store
+                .read_events()
+                .unwrap()
+                .iter()
+                .any(|event| event.event == "cleanup_failure")
+        );
+
+        let preserved = store.read_snapshot().unwrap().recovery;
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0]["archive"].is_object(), archive_only);
+
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+            .expect("restore writable state root");
+        reconcile(&project).expect("retry terminal cleanup");
+        assert!(!workspace.exists(), "{:?}", store.read_events().unwrap());
+        assert!(!store.cleanup_pending(RUN_ID).unwrap());
+        assert_eq!(store.read_snapshot().unwrap().recovery, preserved);
+    }
 }
 
 fn git(directory: &Path, args: &[&str]) {

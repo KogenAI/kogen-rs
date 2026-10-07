@@ -162,3 +162,72 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
     let _ = fs::remove_file(temporary);
     result
 }
+
+/// Confirm surviving bytes after a partial deletion against a durable archive
+/// plus its base. The original archive remains retained throughout the retry.
+pub(super) fn covers_cleanup_remnant(
+    origin: &GitRepo,
+    record: &Value,
+    remaining: &crate::gate::workspace::WorkspaceTree,
+) -> bool {
+    let archive = &record["archive"];
+    let (Some(path), Some(manifest), Some(base), Some(hash)) = (
+        archive["path"].as_str(),
+        archive["manifest"].as_str(),
+        record["base"].as_str(),
+        archive["sha256"].as_str(),
+    ) else {
+        return false;
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if format!("{:x}", Sha256::digest(bytes)) != hash {
+        return false;
+    }
+    let Some(saved) = fs::read(manifest)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return false;
+    };
+    if saved["base"] != base || saved["sha256"] != hash {
+        return false;
+    }
+    remaining.entries.iter().all(|(path, entry)| {
+        let Some(path) = path.to_str() else {
+            return false;
+        };
+        if let Some(file) = saved["files"]
+            .get(path)
+            .or_else(|| saved["reviewed_files"].get(path))
+        {
+            if file.is_null() {
+                return false;
+            }
+            let mode = file["mode"]
+                .as_str()
+                .map_or(Some(0o100644), |mode| u32::from_str_radix(mode, 8).ok());
+            let bytes = file["text"]
+                .as_str()
+                .map(|text| text.as_bytes().to_vec())
+                .or_else(|| {
+                    file["bytes_base64"].as_str().and_then(|text| {
+                        base64::engine::general_purpose::STANDARD.decode(text).ok()
+                    })
+                });
+            mode == Some(entry.mode) && bytes.as_deref() == Some(entry.bytes.as_slice())
+        } else {
+            let listing = origin
+                .text(&["ls-tree", base, "--", path])
+                .unwrap_or_default();
+            let mode = listing
+                .split_whitespace()
+                .next()
+                .and_then(|mode| u32::from_str_radix(mode, 8).ok());
+            mode == Some(entry.mode)
+                && origin.blob_at(base, path).ok().flatten().as_deref()
+                    == Some(entry.bytes.as_slice())
+        }
+    })
+}

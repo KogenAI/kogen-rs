@@ -240,6 +240,11 @@ fn covered_cleanup_remnant(
             .as_str()
             .is_some_and(|path| Path::new(path) == workspace)
     }) {
+        if record["archive"].is_object()
+            && archive::covers_cleanup_remnant(origin, record, &remaining)
+        {
+            return Ok(true);
+        }
         let (Some(reference), Some(tree), Some(base)) = (
             record["ref"].as_str(),
             record["tree"].as_str(),
