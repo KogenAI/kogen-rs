@@ -20,8 +20,15 @@ pub(super) fn apply(replay: &mut RecoveryModel, event: &Value) -> Result<Value, 
                 queued: boolean_field(value, "queued")?,
                 claim: boolean_field(value, "claim")?,
                 reason: string_field(value, "reason")?.to_owned(),
+                work: boolean_field(value, "work")?,
+                preserved: boolean_field(value, "preserved")?,
+                preserve_ok: boolean_field(value, "preserveOk")?,
             })
         }
+        "PreservationResult" => RecoveryEvent::PreservationResult {
+            id: string_field(object(event, "value")?, "id")?.to_owned(),
+            ok: boolean_field(object(event, "value")?, "ok")?,
+        },
         "Recover" => RecoveryEvent::Recover,
         "Reapprove" => {
             RecoveryEvent::Reapprove(string_field(object(event, "value")?, "id")?.to_owned())

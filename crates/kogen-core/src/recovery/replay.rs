@@ -13,6 +13,10 @@ pub struct RecoveryRun {
     pub incoming: bool,
     pub queued: bool,
     pub reason: String,
+    pub work: bool,
+    pub preserved: bool,
+    pub preserve_ok: bool,
+    pub cleanup_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -26,6 +30,9 @@ pub struct RecoveryFact {
     pub queued: bool,
     pub claim: bool,
     pub reason: String,
+    pub work: bool,
+    pub preserved: bool,
+    pub preserve_ok: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +74,7 @@ pub fn recovery_decision(
 pub enum RecoveryEvent {
     Put(RecoveryFact),
     Recover,
+    PreservationResult { id: String, ok: bool },
     Reapprove(String),
 }
 
@@ -99,6 +107,13 @@ impl RecoveryModel {
         match event {
             RecoveryEvent::Put(fact) => self.put(fact),
             RecoveryEvent::Recover => self.recover(),
+            RecoveryEvent::PreservationResult { id, ok } => {
+                if let Some(run) = self.runs.get_mut(&id) {
+                    run.preserve_ok = ok;
+                } else {
+                    self.error("unknown_run");
+                }
+            }
             RecoveryEvent::Reapprove(id) => self.reapprove(&id),
         }
         self.observe()
@@ -160,6 +175,10 @@ impl RecoveryModel {
                 incoming: fact.incoming,
                 queued: fact.queued,
                 reason: fact.reason,
+                work: fact.work,
+                preserved: fact.preserved,
+                preserve_ok: fact.preserve_ok,
+                cleanup_pending: false,
             },
         );
         if fact.claim {
@@ -177,13 +196,18 @@ impl RecoveryModel {
             let Some(run) = self.runs.get(id).cloned() else {
                 continue;
             };
-            if let Some(decision) =
+            if run.cleanup_pending {
+                self.finish(id, &run.status, &run.reason);
+            } else if let Some(decision) =
                 recovery_decision(&run.status, run.alive, run.on_base, &run.last_event)
             {
                 self.finish(id, decision.status, decision.reason);
             }
         }
-        if self.line == before.line && self.claim == before.claim {
+        if self.runs.values().any(|run| run.cleanup_pending) {
+            self.last = "ok".to_owned();
+            self.line = "cleanup_failure".to_owned();
+        } else if self.runs == before.runs && self.claim == before.claim {
             self.last = "ok".to_owned();
             self.line = "unchanged".to_owned();
         }
@@ -193,14 +217,24 @@ impl RecoveryModel {
         if let Some(run) = self.runs.get_mut(id) {
             run.status = status.to_owned();
             run.reason = reason.to_owned();
-            run.incoming = false;
+            run.preserved |= run.work && run.preserve_ok;
+            run.cleanup_pending = run.work && !run.preserved;
+            run.work = run.cleanup_pending;
+            if !run.cleanup_pending {
+                run.incoming = false;
+            }
             run.queued = false;
         }
         if self.claim == id {
             self.claim.clear();
         }
         self.last = "ok".to_owned();
-        self.line = reason.to_owned();
+        self.line = if self.runs.get(id).is_some_and(|run| run.cleanup_pending) {
+            "cleanup_failure"
+        } else {
+            reason
+        }
+        .to_owned();
     }
 
     fn reapprove(&mut self, id: &str) {
@@ -209,6 +243,10 @@ impl RecoveryModel {
             return;
         }
         let run = self.runs.get(id).cloned().unwrap_or_default();
+        if run.cleanup_pending {
+            self.error("cleanup_pending");
+            return;
+        }
         if run.status == "landed" {
             self.error("already_landed");
             return;

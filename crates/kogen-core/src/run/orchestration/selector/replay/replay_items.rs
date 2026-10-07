@@ -52,16 +52,12 @@ impl GateReplay {
     pub(super) fn demote(&mut self, value: &Value) -> Result<(), String> {
         let id = string(value, "id")?;
         let verdict = string(value, "verdict")?;
-        let Some(item) = self.items.get_mut(id) else {
+        let Some(_item) = self.items.get(id) else {
             return self.error("unknown_item");
         };
         if !matches!(verdict, "valid" | "over_strict" | "contradicts" | "garbled") {
             return self.error("bad_verdict");
         }
-        if verdict == "over_strict" || verdict == "contradicts" {
-            item.demoted = true;
-        }
-        self.invalidate();
         Ok(())
     }
 

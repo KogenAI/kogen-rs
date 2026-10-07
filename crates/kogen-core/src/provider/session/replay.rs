@@ -14,6 +14,8 @@ pub struct SessionReplay {
     pub epoch_class: String,
     pub model: String,
     pub run_name: String,
+    pub shared_affinity: bool,
+    pub prefixes: std::collections::BTreeMap<String, String>,
     pub affinity_changed: bool,
     pub previous: bool,
     pub key_changed: bool,
@@ -32,6 +34,8 @@ impl Default for SessionReplay {
             epoch_class: String::new(),
             model: String::new(),
             run_name: "run-1".to_owned(),
+            shared_affinity: false,
+            prefixes: Default::default(),
             affinity_changed: false,
             previous: false,
             key_changed: false,
@@ -61,6 +65,19 @@ impl SessionReplay {
                 self.last = "ok".to_owned();
             }
             "NewRun" => self.new_run(value),
+            "AffinityScope" => {
+                if self.is_bound() {
+                    self.last = "already_bound".to_owned();
+                } else {
+                    self.shared_affinity = value
+                        .and_then(|value| value.get("shared"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    self.affinity_changed = false;
+                    self.last = "ok".to_owned();
+                }
+            }
+            "Prefix" => self.prefix(value),
             _ => self.last = "bad_event".to_owned(),
         }
     }
@@ -232,9 +249,35 @@ impl SessionReplay {
         }
         *self = Self {
             run_name: name.to_owned(),
-            affinity_changed: true,
+            affinity_changed: !self.shared_affinity,
+            shared_affinity: self.shared_affinity,
+            prefixes: self.prefixes.clone(),
             ..Self::default()
         };
+    }
+
+    fn prefix(&mut self, value: Option<&Value>) {
+        let value = value.unwrap_or(&Value::Null);
+        let fields = ["provider", "model", "adapter", "prompt", "bytes"]
+            .map(|key| string_field(value, key).unwrap_or_default());
+        if fields.iter().any(|field| field.is_empty()) {
+            self.last = "bad_prefix".to_owned();
+            return;
+        }
+        let namespace = format!(
+            "['{}', '{}', '{}', '{}']",
+            fields[0], fields[1], fields[2], fields[3]
+        );
+        if self
+            .prefixes
+            .get(&namespace)
+            .is_some_and(|bytes| bytes != fields[4])
+        {
+            self.last = "static_prefix_changed".to_owned();
+            return;
+        }
+        self.prefixes.insert(namespace, fields[4].to_owned());
+        self.last = "ok".to_owned();
     }
 
     fn is_bound(&self) -> bool {

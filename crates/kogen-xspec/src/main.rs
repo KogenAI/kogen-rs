@@ -85,6 +85,8 @@ impl Transition for SessionReplay {
                 | "Previous"
                 | "Lite"
                 | "NewRun"
+                | "AffinityScope"
+                | "Prefix"
         )
     }
 }

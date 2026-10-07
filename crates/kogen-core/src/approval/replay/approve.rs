@@ -2,7 +2,7 @@ use serde_json::{Map, Value, json};
 
 pub fn approve_initial() -> Value {
     json!({
-        "approvals": {}, "cache": "", "checkRuns": 0, "last": "ok", "exit": 0,
+        "approvals": {}, "cache": ["", ""], "checkRuns": 0, "last": "ok", "exit": 0,
         "sha8": "", "approver": "", "feas": "", "bwarn": false,
         "lwarn": false, "ran": false, "_cacheStatus": ""
     })
@@ -78,7 +78,8 @@ pub fn approve_apply(state: &Value, event: &Value) -> Result<Value, String> {
         return Ok(stop(state, "environment/setup_failed", false));
     }
 
-    let hit = text_or_empty(state, "cache") == cache_key;
+    let identity = json!([text(value, "baseTree")?, cache_key]);
+    let hit = state.get("cache") == Some(&identity);
     let baseline_status = if hit {
         text_or_empty(state, "_cacheStatus")
     } else {
@@ -86,7 +87,7 @@ pub fn approve_apply(state: &Value, event: &Value) -> Result<Value, String> {
     };
     let ran = !hit;
     let mut checked = state.clone();
-    set(&mut checked, "cache", json!(cache_key));
+    set(&mut checked, "cache", identity);
     if !hit {
         let count = state.get("checkRuns").and_then(Value::as_u64).unwrap_or(0);
         set(&mut checked, "checkRuns", json!(count + 1));
