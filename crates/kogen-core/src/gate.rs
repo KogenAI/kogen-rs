@@ -4,7 +4,7 @@ mod checks;
 mod protection;
 mod tree;
 mod verification;
-mod workspace;
+pub(crate) mod workspace;
 
 pub mod adapters;
 

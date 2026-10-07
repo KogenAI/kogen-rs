@@ -105,6 +105,8 @@ impl Fixture {
             owner_pid: 0,
             owner_started_ms: 0,
             started_ms: 1,
+            recovery: Vec::new(),
+            cleanup_pending: false,
             fields: BTreeMap::new(),
         };
         store.create(&snapshot).expect("write initial run snapshot");

@@ -62,10 +62,14 @@ fn crash_after_base_cas_before_cleanup_recovers_as_landed() {
     assert_eq!(report.reconciled.len(), 1);
     assert_eq!(report.reconciled[0].status, "landed");
     assert_eq!(fixture.store.read_snapshot().unwrap().status, "landed");
-    assert_eq!(
-        fixture.store.read_events().unwrap().last().unwrap().event,
-        "reconciled"
+    let events = fixture.store.read_events().unwrap();
+    assert!(events.iter().any(|event| event.event == "reconciled"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event == "recovery_preserved")
     );
+    assert!(!fixture.store.read_snapshot().unwrap().recovery.is_empty());
     assert_eq!(origin.ref_target("refs/kogen/claim").unwrap(), None);
     assert_eq!(
         origin

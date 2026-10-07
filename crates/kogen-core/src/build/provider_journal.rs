@@ -298,6 +298,8 @@ mod tests {
             owner_pid: std::process::id(),
             owner_started_ms: 0,
             started_ms: 0,
+            recovery: Vec::new(),
+            cleanup_pending: false,
             fields: BTreeMap::new(),
         };
         store

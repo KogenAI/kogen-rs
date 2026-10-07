@@ -98,6 +98,8 @@ fn crash_after_base_cas_before_incoming_cleanup_reconciles_as_landed() {
         owner_pid: 0,
         owner_started_ms: 0,
         started_ms: 1,
+        recovery: Vec::new(),
+        cleanup_pending: false,
         fields: BTreeMap::new(),
     };
     let store = RunStore::new(&run_dir);
@@ -218,6 +220,8 @@ fn recovery_uses_the_snapshot_target_branch_when_the_configured_base_changes() {
         owner_pid: 0,
         owner_started_ms: 0,
         started_ms: 1,
+        recovery: Vec::new(),
+        cleanup_pending: false,
         fields: BTreeMap::new(),
     };
     let store = RunStore::new(&run_dir);
@@ -305,6 +309,13 @@ fn terminal_cleanup_obligation_retries_after_crash_and_deletion_failure() {
     let run_dir = state_root.join("runs").join(RUN_ID);
     let workspace = state_root.join(format!("{RUN_ID}-R1"));
     fs::create_dir_all(&workspace).expect("create leftover workspace");
+    git(&workspace, &["init", "--initial-branch=main"]);
+    kogen_test_support::set_identity(&workspace, "Recovery fixture", "fixture@example.test")
+        .unwrap();
+    fs::write(workspace.join("README"), b"base\n").unwrap();
+    git(&workspace, &["add", "README"]);
+    git(&workspace, &["commit", "-m", "base"]);
+    git(&workspace, &["push", path(&origin), "main"]);
     fs::write(workspace.join("candidate"), b"left behind").expect("write leftover file");
     let mut snapshot = RunSnapshot {
         schema: 2,
@@ -318,6 +329,8 @@ fn terminal_cleanup_obligation_retries_after_crash_and_deletion_failure() {
         owner_pid: 0,
         owner_started_ms: 0,
         started_ms: 1,
+        recovery: Vec::new(),
+        cleanup_pending: false,
         fields: BTreeMap::new(),
     };
     let store = RunStore::new(&run_dir);
@@ -362,7 +375,7 @@ fn terminal_cleanup_obligation_retries_after_crash_and_deletion_failure() {
     fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
         .expect("restore writable state root");
     reconcile(&project).expect("retry terminal cleanup");
-    assert!(!workspace.exists());
+    assert!(!workspace.exists(), "{:?}", store.read_events().unwrap());
     assert!(!store.cleanup_pending(RUN_ID).unwrap());
 }
 

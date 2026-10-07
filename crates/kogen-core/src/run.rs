@@ -12,6 +12,7 @@ mod sandbox;
 mod script;
 pub mod setup_cache;
 mod watchdog;
+pub(crate) use watchdog::stop_recovery_writers;
 
 pub use environment::{
     EnvironmentError, EnvironmentMap, EnvironmentRequest, build_child_environment, host_environment,

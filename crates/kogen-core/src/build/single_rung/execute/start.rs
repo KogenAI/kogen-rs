@@ -53,6 +53,8 @@ pub fn run(
         owner_started_ms: crate::recovery::process_started_ms(std::process::id())
             .unwrap_or(started_ms / 1000 * 1000),
         started_ms,
+        recovery: Vec::new(),
+        cleanup_pending: false,
         fields: BTreeMap::new(),
     };
     store
