@@ -97,11 +97,20 @@ fn drain(project: &ProjectResolution) -> Result<CliOutput, CoreError> {
                 stderr.push_str(&build.stderr);
                 match build.status {
                     BuildStatus::Landed => {
-                        emit_line(&format!(
-                            "~landed {slug} {} (Build {})\n",
-                            short(&build.commit),
-                            short(&build.run_id),
-                        ));
+                        if build.advisory_items.is_empty() {
+                            emit_line(&format!(
+                                "~landed {slug} {} (Build {})\n",
+                                short(&build.commit),
+                                short(&build.run_id),
+                            ));
+                        } else {
+                            emit_line(&format!(
+                                "~landed {slug} {} (advisory: {}) (Build {})\n",
+                                short(&build.commit),
+                                build.advisory_items.join(", "),
+                                short(&build.run_id),
+                            ));
+                        }
                         observation = scheduler.apply(QueueEvent::Outcome(DrainOutcome::Landed));
                     }
                     BuildStatus::Failed => {

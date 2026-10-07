@@ -26,6 +26,7 @@ pub struct ShapeReport {
     pub acceptance_path: PathBuf,
     pub transcript_path: PathBuf,
     pub rounds: usize,
+    pub feasibility: String,
     pub warnings: Vec<ShapeWarning>,
     pub calls: Vec<super::ShapeModelCall>,
     pub progress: Vec<String>,

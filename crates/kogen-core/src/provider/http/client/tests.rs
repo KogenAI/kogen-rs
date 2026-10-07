@@ -301,7 +301,7 @@ fn partial_stream_continuation_appends_received_items_and_returns_combined_text(
 }
 
 #[test]
-fn usage_limit_honors_retry_after_outside_the_build_budget() {
+fn usage_limit_uses_the_fixed_build_pause_outside_the_build_budget() {
     let (root, mut request, mut auth, config) = setup("gpt-6-luna", "max");
     let mut failure = ProviderFailure::new(
         ProviderErrorKind::UsageLimit,
@@ -328,12 +328,13 @@ fn usage_limit_honors_retry_after_outside_the_build_budget() {
         failure.events[0],
         RequestEvent::Wait {
             reason: "provider/usage_limit".to_owned(),
-            wait_ms: 30_000,
+            wait_ms: 300_000,
+            paused_ms: 300_000,
             budget_paused: true,
         }
     );
-    assert_eq!(policy.waited, 30_000);
-    assert_eq!(clock.now_ms(), 30_000);
+    assert_eq!(policy.waited, 300_000);
+    assert_eq!(clock.now_ms(), 300_000);
     std::fs::remove_dir_all(root).unwrap();
 }
 

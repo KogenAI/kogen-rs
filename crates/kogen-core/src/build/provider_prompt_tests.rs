@@ -2,10 +2,12 @@ use super::workspace_changed;
 use crate::gate::commit_tree_id;
 use crate::git::GitRepo;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+static NEXT_REPO: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn finish_guard_ignores_acceptance_copy_and_detects_builder_commit() {
@@ -51,4 +53,73 @@ fn finish_guard_ignores_acceptance_copy_and_detects_builder_commit() {
     );
 
     fs::remove_dir_all(workspace).expect("remove temporary repository");
+}
+
+#[test]
+fn approved_intent_test_and_setup_outputs_are_not_implementation_changes() {
+    let root = temporary_repository();
+    fs::create_dir_all(root.join("lib")).unwrap();
+    fs::write(root.join("lib/greet.txt"), "Hello!\n").unwrap();
+    git(&root, &["add", "lib/greet.txt"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Kogen Test",
+            "-c",
+            "user.email=test@kogen.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+    );
+    let base = crate::gate::commit_tree_id(&root, "HEAD").unwrap();
+
+    fs::create_dir_all(root.join(".kogen/intents/greet")).unwrap();
+    fs::create_dir_all(root.join(".kogen/acceptance")).unwrap();
+    fs::create_dir_all(root.join("test/acceptance")).unwrap();
+    fs::write(
+        root.join(".kogen/intents/greet/intent.md"),
+        "approved intent\n",
+    )
+    .unwrap();
+    fs::write(root.join(".kogen/acceptance/greet.t.sh"), "approved test\n").unwrap();
+    fs::write(root.join("test/acceptance/greet.t.sh"), "installed test\n").unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    fs::write(root.join("build/ready"), "setup output\n").unwrap();
+
+    let excluded = [
+        PathBuf::from(".kogen/intents/greet/intent.md"),
+        PathBuf::from(".kogen/acceptance/greet.t.sh"),
+        PathBuf::from("test/acceptance/greet.t.sh"),
+        PathBuf::from("build"),
+    ];
+    assert!(!workspace_changed(&root, &base, &excluded).unwrap());
+
+    fs::write(root.join("lib/greet.txt"), "Hello, Almir!\n").unwrap();
+    assert!(workspace_changed(&root, &base, &excluded).unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn temporary_repository() -> PathBuf {
+    let id = NEXT_REPO.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "kogen-workspace-changed-{}-{id}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    root
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .expect("git is available");
+    assert!(status.success(), "git {args:?} succeeded");
 }

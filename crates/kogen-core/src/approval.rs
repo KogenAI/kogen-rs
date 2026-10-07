@@ -25,6 +25,25 @@ use support::*;
 
 const NEXT_LINE: &str = "Next: kogen queue start (does nothing if the queue is already running)";
 
+pub(crate) fn witness_build_manifest(
+    project: &ProjectResolution,
+    base_sha: &str,
+    intent: &Intent,
+    intent_bytes: &[u8],
+    acceptance_path: &str,
+    acceptance_bytes: &[u8],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    protected_manifest(
+        project,
+        base_sha,
+        intent,
+        intent_bytes,
+        acceptance_path,
+        acceptance_bytes,
+    )
+    .map(|manifest| manifest.hashes)
+}
+
 /// Run the public `intent approve` command against the resolved project.
 pub fn approve(
     project: &ProjectResolution,

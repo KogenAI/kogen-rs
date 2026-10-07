@@ -168,7 +168,11 @@ impl RetryReplay {
             self.exit = 0;
             self.last = "ok".to_owned();
         } else {
-            let wait = retry_after_ms.unwrap_or(PAUSE_MS);
+            let wait = if self.mode == "build" {
+                PAUSE_MS
+            } else {
+                retry_after_ms.unwrap_or(PAUSE_MS)
+            };
             if self.mode == "shape" || self.waited.saturating_add(wait) > PAUSE_CAP_MS {
                 self.halt(&reason, 4);
             } else {

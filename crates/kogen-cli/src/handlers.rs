@@ -198,10 +198,11 @@ fn shape_output(result: Result<kogen_core::intent::shaping::ShapeReport, CoreErr
         Err(error) => return error.into_cli_output(),
     };
     let mut stdout = format!(
-        "Intent: {}\nAcceptance test: {}\nValidated after {} round(s).\nFeasibility: not checked\n",
+        "Intent: {}\nAcceptance test: {}\nValidated after {} round(s).\nFeasibility: {}\n",
         report.intent_path.display(),
         report.acceptance_path.display(),
         report.rounds,
+        report.feasibility,
     );
     if !report.warnings.is_empty() {
         stdout.push_str("Warnings\n");

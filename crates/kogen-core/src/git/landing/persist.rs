@@ -162,6 +162,11 @@ pub(super) fn persist_terminal(
     if let Some(verdict) = request.snapshot.fields.get("verdict") {
         entry = entry.with("verdict", verdict.clone());
     }
+    for field in ["rung", "advisory_items"] {
+        if let Some(value) = request.snapshot.fields.get(field) {
+            entry = entry.with(field, value.clone());
+        }
+    }
     request.store.record(&entry, request.snapshot)?;
     Ok(())
 }

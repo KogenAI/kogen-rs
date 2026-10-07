@@ -100,6 +100,7 @@ pub enum RequestEvent {
     Wait {
         reason: String,
         wait_ms: u64,
+        paused_ms: u64,
         budget_paused: bool,
     },
 }
@@ -221,12 +222,14 @@ pub fn respond(
                 }
                 if policy.decision == "pause" {
                     let wait_ms = policy.delay;
+                    let wait_started = clock.now_ms();
+                    clock.sleep_ms(wait_ms);
                     events.push(RequestEvent::Wait {
                         reason: policy.reason.clone(),
                         wait_ms,
+                        paused_ms: clock.now_ms().saturating_sub(wait_started),
                         budget_paused: true,
                     });
-                    clock.sleep_ms(wait_ms);
                     return Err(call_error(
                         refresh_failure.unwrap_or(failure),
                         events,

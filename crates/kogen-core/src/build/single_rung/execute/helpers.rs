@@ -69,6 +69,14 @@ pub(super) fn record_started(
         "builder".to_owned(),
         json!({"model":options.builder_model,"effort":options.builder_effort}),
     );
+    roles.insert(
+        "rung2".to_owned(),
+        json!({"model":options.rung2_model,"effort":options.rung2_effort}),
+    );
+    roles.insert(
+        "rung3".to_owned(),
+        json!({"model":options.rung3_model,"effort":options.rung3_effort}),
+    );
     provider.record_event(
         snapshot,
         &RunEvent::new("started", now_ms())
@@ -79,9 +87,9 @@ pub(super) fn record_started(
             )
             .with("base_sha", json!(base_sha))
             .with("recipe", json!(options.recipe))
-            .with("max_rungs", json!(1))
+            .with("max_rungs", json!(options.max_rungs))
             .with("roles", Value::Object(roles))
-            .with("land", json!("green-or-advisory"))
+            .with("land", json!(options.land_policy))
             .with("budget_ms", json!(options.wall_ms))
             .with("credential_source", json!(account.credential_source))
             .with("credential_label", json!(account.label))
@@ -97,10 +105,11 @@ pub(super) fn progress_exclusions(
         .setup_outputs
         .iter()
         .map(std::path::PathBuf::from)
-        .chain(std::iter::once(support::candidate_path(
-            options,
-            &approved.slug,
-        )))
+        .chain([
+            std::path::PathBuf::from(format!(".kogen/intents/{}/intent.md", approved.slug)),
+            std::path::PathBuf::from(&approved.acceptance_path),
+            support::candidate_path(options, &approved.slug),
+        ])
         .collect()
 }
 
@@ -283,13 +292,21 @@ pub(super) fn candidate_diff(
         .map_err(|error| environment_error("candidate_diff_failed", error.to_string()))
 }
 
+pub(super) fn candidate_working_diff(workspace: &Path, base: &str) -> Result<Vec<u8>, CoreError> {
+    let repo = crate::git::GitRepo::workspace(workspace);
+    let _ = repo.output(&["add", "-N", "--all"]);
+    repo.output(&["diff", "--binary", base, "--"])
+        .map_err(|error| environment_error("candidate_diff_failed", error.to_string()))
+}
+
 pub(super) fn publish_candidate(
     workspace: &Path,
     origin: &Path,
     commit: &str,
     run_id: &str,
+    rung: &str,
 ) -> Result<(), CoreError> {
-    let reference = format!("refs/kogen/candidates/{run_id}/R1");
+    let reference = format!("refs/kogen/candidates/{run_id}/{rung}");
     let lease = format!("--force-with-lease={reference}:");
     let source = format!("{commit}:{reference}");
     let origin = origin.to_string_lossy();
@@ -334,7 +351,10 @@ pub(super) fn checks_json(report: &crate::gate::GateReport) -> Value {
     })).collect::<Vec<_>>())
 }
 
-pub(super) fn acceptance_json(report: &crate::gate::GateReport) -> Value {
+pub(super) fn acceptance_json(
+    report: &crate::gate::GateReport,
+    demoted: &std::collections::BTreeSet<String>,
+) -> Value {
     json!(
         report
             .acceptance
@@ -343,10 +363,73 @@ pub(super) fn acceptance_json(report: &crate::gate::GateReport) -> Value {
             .map(|(id, passed)| json!({
                 "id":id,
                 "status":if *passed {"passed"} else {"failed"},
-                "demoted":report.demoted_items.contains(id)
+                "result":if *passed {"pass"} else {"fail"},
+                "demoted":report.demoted_items.contains(id) || demoted.contains(id)
             }))
             .collect::<Vec<_>>()
     )
+}
+
+pub(super) fn acceptance_only_red(report: &crate::gate::GateReport) -> bool {
+    report.checks.iter().all(|check| !check.blocks_gate())
+        && report
+            .fix_results
+            .iter()
+            .all(crate::gate::FixResult::passed)
+        && report.protection_findings.is_empty()
+        && report.acceptance.item_pass.values().any(|passed| !passed)
+}
+
+pub(super) fn gate_feedback(report: &crate::gate::GateReport) -> String {
+    let checks = report
+        .checks
+        .iter()
+        .filter(|check| check.blocks_gate())
+        .map(|check| format!("check {}: {:?}", check.name, check.status))
+        .collect::<Vec<_>>();
+    let acceptance = report
+        .acceptance
+        .item_pass
+        .iter()
+        .filter_map(|(id, passed)| (!passed).then_some(format!("acceptance {id}: failed")))
+        .collect::<Vec<_>>();
+    let details = checks
+        .into_iter()
+        .chain(acceptance)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if details.is_empty() {
+        "The gate did not produce a landable candidate. Inspect the current tree and fix the failing checks.".to_owned()
+    } else {
+        details
+    }
+}
+
+pub(super) fn red_count(
+    report: &crate::gate::GateReport,
+    demoted: &std::collections::BTreeSet<String>,
+) -> usize {
+    let mut identities = std::collections::BTreeSet::new();
+    let mut anonymous = 0;
+    for check in report.checks.iter().filter(|check| check.blocks_gate()) {
+        if check.findings.is_empty() {
+            anonymous += 1;
+        } else {
+            identities.extend(
+                check.findings.iter().map(|finding| {
+                    format!("{}\0{}\0{}", finding.path, finding.rule, finding.symbol)
+                }),
+            );
+        }
+    }
+    anonymous
+        + identities.len()
+        + report
+            .acceptance
+            .item_pass
+            .iter()
+            .filter(|(id, passed)| !**passed && !demoted.contains(*id))
+            .count()
 }
 
 pub(super) fn cleanup_path(path: &Path) {

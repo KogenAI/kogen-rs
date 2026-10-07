@@ -376,6 +376,40 @@ pub(super) fn protected_workspace(
         .into_owned();
     let mut manifest = std::collections::BTreeMap::new();
     for (path, expected) in hashes {
+        if path == approved.acceptance_path {
+            let bytes = origin
+                .blob_at(base_sha, &path)
+                .map_err(|error| environment_error("protected_manifest_read_failed", error))?;
+            if let Some(bytes) = &bytes
+                && crate::intent::intent_sha256(bytes) != expected
+            {
+                return Err(controller_error(
+                    "approval_invalid",
+                    format!("protected manifest does not match base path {path}"),
+                ));
+            }
+            if bytes.is_none() && expected != crate::gate::ABSENT_SHA256 {
+                return Err(controller_error(
+                    "approval_invalid",
+                    format!("protected manifest bytes are unavailable for {path}"),
+                ));
+            }
+            manifest.insert(
+                path,
+                ProtectedEntry {
+                    sha256: expected,
+                    bytes,
+                },
+            );
+            manifest.insert(
+                candidate_path.clone(),
+                ProtectedEntry {
+                    sha256: crate::intent::intent_sha256(&approved.acceptance_bytes),
+                    bytes: Some(approved.acceptance_bytes.clone()),
+                },
+            );
+            continue;
+        }
         let bytes = if path == intent_path {
             Some(approved.intent_bytes.clone())
         } else if path == candidate_path {

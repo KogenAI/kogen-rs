@@ -18,6 +18,7 @@ pub fn run(
                 run_id,
                 commit: String::new(),
                 verdict: "none".to_owned(),
+                advisory_items: Vec::new(),
                 reason: "build_already_claimed".to_owned(),
                 stderr: String::new(),
                 has_run: false,
@@ -94,6 +95,7 @@ pub fn run(
                     .and_then(Value::as_str)
                     .unwrap_or("none")
                     .to_owned(),
+                advisory_items: Vec::new(),
                 reason: error.reason,
                 stderr: snapshot
                     .fields

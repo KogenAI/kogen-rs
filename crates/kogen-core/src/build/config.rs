@@ -11,10 +11,17 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub(super) struct BuildOptions {
     pub recipe: String,
+    pub max_rungs: u8,
+    pub experimental_r4: bool,
+    pub land_policy: String,
     pub planner_model: String,
     pub planner_effort: String,
     pub builder_model: String,
     pub builder_effort: String,
+    pub rung2_model: String,
+    pub rung2_effort: String,
+    pub rung3_model: String,
+    pub rung3_effort: String,
     pub fallback_on: bool,
     pub wall_ms: u64,
     pub tool_tokens: u64,
@@ -37,10 +44,25 @@ impl BuildOptions {
         let machine = machine_build_config()?;
         let planner = role(project, &machine, "planner", "gpt-6.1-sol", "high");
         let builder = role(project, &machine, "builder", "gpt-6-luna", "max");
+        let rung2 = role(project, &machine, "rung2", "gpt-6.1-sol", "medium");
+        let rung3 = role(project, &machine, "rung3", "gpt-6.1-sol", "high");
         let raw = project.config.as_ref().map(|config| &config.raw);
         let recipe = mapping_value(mapping_value(raw, "build"), "recipe")
             .and_then(Value::as_str)
             .unwrap_or("ladder")
+            .to_owned();
+        let max_rungs = mapping_value(mapping_value(raw, "build"), "ladder")
+            .and_then(|ladder| mapping_value(Some(ladder), "max_rungs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(4)
+            .clamp(1, 4) as u8;
+        let experimental_r4 = mapping_value(mapping_value(raw, "build"), "ladder")
+            .and_then(|ladder| mapping_value(Some(ladder), "experimental_r4"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let land_policy = mapping_value(mapping_value(raw, "build"), "land")
+            .and_then(Value::as_str)
+            .unwrap_or("green-or-advisory")
             .to_owned();
         let fallback_on = bool_value(project, &machine, "model_fallback").unwrap_or(true);
         let wall_ms = integer_value(project, &machine, "budget_ms")
@@ -72,10 +94,17 @@ impl BuildOptions {
             acceptance(project)?;
         Ok(Self {
             recipe,
+            max_rungs,
+            experimental_r4,
+            land_policy,
             planner_model: planner.0,
             planner_effort: planner.1,
             builder_model: builder.0,
             builder_effort: builder.1,
+            rung2_model: rung2.0,
+            rung2_effort: rung2.1,
+            rung3_model: rung3.0,
+            rung3_effort: rung3.1,
             fallback_on,
             wall_ms,
             tool_tokens,
@@ -104,9 +133,17 @@ fn role(
 ) -> (String, String) {
     let mut model = default_model.to_owned();
     let mut effort = default_effort.to_owned();
-    for config in [machine.as_ref(), project.config.as_ref().map(|c| &c.raw)] {
-        let Some(value) = config
-            .and_then(|raw| mapping_value(Some(raw), "roles"))
+    let project_build = project
+        .config
+        .as_ref()
+        .and_then(|config| mapping_value(Some(&config.raw), "build"));
+    for roles in [
+        machine
+            .as_ref()
+            .and_then(|raw| mapping_value(Some(raw), "roles")),
+        project_build.and_then(|build| mapping_value(Some(build), "roles")),
+    ] {
+        let Some(value) = roles
             .and_then(Value::as_mapping)
             .and_then(|roles| roles.get(Value::String(name.to_owned())))
         else {

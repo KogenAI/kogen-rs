@@ -254,11 +254,51 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         state
             .progress
             .push(format!("shaper pass={pass} role={role} validation_passed"));
+        let feasibility = if state
+            .config
+            .as_ref()
+            .is_some_and(|config| config.raw["shaping"]["proof"].as_str() == Some("witness"))
+        {
+            let project = ProjectResolution::resolve(&CoreProjectOptions {
+                cwd: Some(state.options.cwd.clone()),
+                project: state.options.project.clone(),
+                origin: state.options.origin.clone(),
+                base: state.options.base.clone(),
+                home: Some(state.options.home.clone()),
+            })
+            .map_err(project_error)?;
+            let intent = fs::read(&state.intent_path)
+                .map_err(|error| io_error("shape_output_unavailable", error))?;
+            let acceptance = fs::read(&state.acceptance_path)
+                .map_err(|error| io_error("shape_output_unavailable", error))?;
+            if crate::build::run_witness_build(
+                &project,
+                &state.options.slug,
+                intent,
+                state.acceptance_rel.clone(),
+                acceptance,
+            )? {
+                if state
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "feasibility_concern")
+                {
+                    "PROVEN WITH CONCERNS".to_owned()
+                } else {
+                    "PROVEN".to_owned()
+                }
+            } else {
+                "UNPROVEN".to_owned()
+            }
+        } else {
+            "not checked".to_owned()
+        };
         return Ok(ShapeReport {
             intent_path: state.intent_path,
             acceptance_path: state.acceptance_path,
             transcript_path: state.transcript_path,
             rounds: pass,
+            feasibility,
             warnings: state.warnings,
             calls: state.calls,
             progress: state.progress,

@@ -109,15 +109,27 @@ impl GateReport {
         self.receipt.as_ref()
     }
 
-    pub(crate) fn apply_audit_demotions(&mut self, item_ids: &[String]) {
+    pub(crate) fn apply_audit_demotions(&mut self, item_ids: &[String]) -> bool {
         self.demoted_items.extend(
             item_ids
                 .iter()
                 .filter(|id| self.acceptance.item_pass.contains_key(*id))
                 .cloned(),
         );
+        let failed_items_are_demoted = self
+            .acceptance
+            .item_pass
+            .iter()
+            .filter_map(|(id, passed)| (!passed).then_some(id))
+            .all(|id| self.demoted_items.contains(id));
+        let acceptance_failures_are_suites = self
+            .acceptance
+            .failures
+            .iter()
+            .all(|failure| matches!(failure, AcceptanceFailure::Suite));
         let acceptance_green = !self.acceptance.item_pass.is_empty()
-            && self.acceptance.failures.is_empty()
+            && failed_items_are_demoted
+            && acceptance_failures_are_suites
             && self
                 .acceptance
                 .item_pass
@@ -145,6 +157,19 @@ impl GateReport {
         self.change_item_passes = self.change_items.iter().any(|id| {
             self.acceptance.item_pass.get(id) == Some(&true) && !self.demoted_items.contains(id)
         });
+        verified
+    }
+
+    /// Re-score a candidate after the Build auditor demotes failed acceptance
+    /// items. A demoted item cannot supply the passing change item needed to
+    /// land the candidate.
+    pub fn apply_acceptance_demotions(
+        &mut self,
+        demoted: &BTreeSet<String>,
+        change_items: &BTreeSet<String>,
+    ) -> bool {
+        self.change_items.clone_from(change_items);
+        self.apply_audit_demotions(&demoted.iter().cloned().collect::<Vec<_>>())
     }
 }
 

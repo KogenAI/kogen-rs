@@ -33,10 +33,12 @@ pub(super) fn record_provider_events(
             RequestEvent::Wait {
                 reason,
                 wait_ms,
+                paused_ms,
                 budget_paused,
             } => RunEvent::new("provider_wait", now_ms())
                 .with("reason", json!(reason))
                 .with("wait_ms", json!(wait_ms))
+                .with("paused_ms", json!(paused_ms))
                 .with("budget_paused", json!(budget_paused)),
         };
         record(store, snapshot, &entry)?;

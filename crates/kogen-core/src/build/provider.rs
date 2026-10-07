@@ -15,6 +15,7 @@ use crate::provider::http::{ProviderCall, RequestEvent, RequestPolicy, SystemClo
 use crate::provider::session::{ConversationBinding, ConversationHistory};
 use crate::run::{RunEvent, RunSnapshot, RunStore};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -23,6 +24,9 @@ pub(super) struct BuildProvider<'a> {
     options: &'a BuildOptions,
     store: &'a RunStore,
     builder_session: Option<BuilderSession>,
+    rung_sessions: BTreeMap<String, BuilderSession>,
+    usage_paused_ms: u64,
+    build_started: Instant,
     home: std::path::PathBuf,
     account: RunAccount,
     http: crate::provider::http::ReqwestPort,
@@ -68,6 +72,9 @@ impl<'a> BuildProvider<'a> {
             options,
             store,
             builder_session: None,
+            rung_sessions: BTreeMap::new(),
+            usage_paused_ms: 0,
+            build_started: Instant::now(),
             home,
             account,
             http,
@@ -102,6 +109,7 @@ impl<'a> BuildProvider<'a> {
             run_dir,
             "plan",
             "planner",
+            "",
             &self.options.planner_model,
             &self.options.planner_effort,
             planner_instructions(),
@@ -146,12 +154,14 @@ impl<'a> BuildProvider<'a> {
         &mut self,
         snapshot: &mut RunSnapshot,
         run_dir: &Path,
+        rung: &str,
         request: &crate::run::orchestration::BuildAuditRequest,
     ) -> Result<String, CoreError> {
         let mut context = self.request_context(
             run_dir,
             "audit",
-            "auditor",
+            "test-auditor",
+            rung,
             "gpt-6.1-sol",
             "high",
             auditor_instructions(),
@@ -162,13 +172,20 @@ impl<'a> BuildProvider<'a> {
         )?;
         context.tool_choice = "none".to_owned();
         let before = Instant::now();
-        let call = self.call(snapshot, &mut context, "auditor", "audit", None)?;
+        let call = self.call(
+            snapshot,
+            &mut context,
+            "auditor",
+            "audit",
+            Some(self.options.wall_ms),
+        )?;
         let elapsed = before.elapsed().as_millis() as u64;
-        self.record_call(snapshot, "audit", "R1", &call, elapsed)?;
+        self.record_call(snapshot, "audit", rung, &call, elapsed)?;
         append_transcript(
             self.store,
             json!({
                 "stage":"audit",
+                "rung":rung,
                 "model":context.model,
                 "input":context.input,
                 "text":&call.response.text,
@@ -194,52 +211,22 @@ impl<'a> BuildProvider<'a> {
         recipe_direct: bool,
     ) -> Result<DevelopResult, CoreError> {
         let (_, plan) = plan.split_once('\0').unwrap_or(("easy", plan));
-        let role = if recipe_direct {
-            crate::provider::tools::ToolRole::BuilderDirect
-        } else {
-            crate::provider::tools::ToolRole::BuilderShell
-        };
-        let callable = role.allowed();
-        let schemas = crate::provider::tools::canonical_tool_schemas()
-            .into_iter()
-            .filter(|schema| {
-                schema
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| callable.contains(&name))
-            })
-            .collect();
-        let builder_instructions = builder_instructions(recipe_direct);
         let first = builder_message(&self.approved.intent_bytes, base_acceptance, plan);
-        let context = self.request_context(
-            run_dir,
-            "develop",
-            "builder",
-            &self.options.builder_model,
-            &self.options.builder_effort,
-            builder_instructions,
-            vec![user_item(&first)],
-            schemas,
-            callable.iter().map(|name| (*name).to_owned()).collect(),
-            true,
-        )?;
-        self.builder_session = Some(BuilderSession {
-            context,
-            turns: 0,
-            empty_finish_count: 0,
-            budget_note_added: false,
-            recipe_direct,
-        });
-        self.drive_builder(
+        self.develop_on_rung(
             snapshot,
             run_dir,
             workspace,
-            baseline_tree,
+            "R1",
+            &self.options.builder_model,
+            &self.options.builder_effort,
+            &first,
+            None,
             baseline_tree,
             excluded_paths,
             process,
             environment,
             protected,
+            recipe_direct,
             None,
         )
     }
@@ -258,22 +245,107 @@ impl<'a> BuildProvider<'a> {
         feedback: &str,
         deadline: Option<Instant>,
     ) -> Result<DevelopResult, CoreError> {
+        let first_message = builder_message(&self.approved.intent_bytes, "", "");
+        let recipe_direct = self
+            .builder_session
+            .as_ref()
+            .is_some_and(|session| session.recipe_direct);
+        self.develop_on_rung(
+            snapshot,
+            run_dir,
+            workspace,
+            "R1",
+            &self.options.builder_model,
+            &self.options.builder_effort,
+            &first_message,
+            Some(feedback),
+            baseline_tree,
+            excluded_paths,
+            process,
+            environment,
+            protected,
+            recipe_direct,
+            deadline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn develop_on_rung(
+        &mut self,
+        snapshot: &mut RunSnapshot,
+        run_dir: &Path,
+        workspace: &Path,
+        rung: &str,
+        model: &str,
+        effort: &str,
+        first_message: &str,
+        feedback: Option<&str>,
+        baseline_tree: &str,
+        excluded_paths: &[PathBuf],
+        process: &dyn crate::run::ProcessPort,
+        environment: crate::run::ChildEnvironment,
+        protected: &crate::gate::ProtectedWorkspace,
+        recipe_direct: bool,
+        deadline: Option<Instant>,
+    ) -> Result<DevelopResult, CoreError> {
         let progress_baseline = workspace_tree(workspace, excluded_paths).map_err(|error| {
             super::environment_error("candidate_snapshot_failed", error.to_string())
         })?;
-        let session = self.builder_session.as_mut().ok_or_else(|| {
-            super::controller_error(
-                "builder_session_missing",
-                "the builder conversation is unavailable",
-            )
-        })?;
-        let mut history = ConversationHistory::new(std::mem::take(&mut session.context.input));
-        history.append_user(format!(
-            "Kogen's controller reported this failure. Continue the same session and fix it:\n\n{feedback}"
-        ));
-        session.context.input = history.items().to_vec();
-        self.drive_builder(
+        let role = if recipe_direct {
+            crate::provider::tools::ToolRole::BuilderDirect
+        } else {
+            crate::provider::tools::ToolRole::BuilderShell
+        };
+        let callable = role.allowed();
+        let schemas = crate::provider::tools::canonical_tool_schemas()
+            .into_iter()
+            .filter(|schema| {
+                schema
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| callable.contains(&name))
+            })
+            .collect();
+        let existing = if rung == "R1" {
+            self.builder_session.take()
+        } else {
+            self.rung_sessions.remove(rung)
+        };
+        let mut session = if let Some(session) = existing {
+            session
+        } else {
+            let context = self.request_context(
+                run_dir,
+                "develop",
+                "builder",
+                rung,
+                model,
+                effort,
+                builder_instructions(recipe_direct),
+                vec![user_item(first_message)],
+                schemas,
+                callable.iter().map(|name| (*name).to_owned()).collect(),
+                true,
+            )?;
+            BuilderSession {
+                context,
+                turns: 0,
+                empty_finish_count: 0,
+                budget_note_added: false,
+                recipe_direct,
+            }
+        };
+        if let Some(feedback) = feedback {
+            let mut history = ConversationHistory::new(std::mem::take(&mut session.context.input));
+            history.append_user(format!(
+                "Kogen's controller reported this failure. Continue the same session and fix it:\n\n{feedback}"
+            ));
+            session.context.input = history.items().to_vec();
+        }
+        let result = self.drive_session(
             snapshot,
+            &mut session,
+            rung,
             run_dir,
             workspace,
             baseline_tree,
@@ -283,43 +355,12 @@ impl<'a> BuildProvider<'a> {
             environment,
             protected,
             deadline,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn drive_builder(
-        &mut self,
-        snapshot: &mut RunSnapshot,
-        run_dir: &Path,
-        workspace: &Path,
-        baseline_tree: &str,
-        progress_baseline: &str,
-        excluded_paths: &[PathBuf],
-        process: &dyn crate::run::ProcessPort,
-        environment: crate::run::ChildEnvironment,
-        protected: &crate::gate::ProtectedWorkspace,
-        deadline: Option<Instant>,
-    ) -> Result<DevelopResult, CoreError> {
-        let mut session = self.builder_session.take().ok_or_else(|| {
-            super::controller_error(
-                "builder_session_missing",
-                "the builder conversation is unavailable",
-            )
-        })?;
-        let result = self.drive_session(
-            snapshot,
-            &mut session,
-            run_dir,
-            workspace,
-            baseline_tree,
-            progress_baseline,
-            excluded_paths,
-            process,
-            environment,
-            protected,
-            deadline,
         );
-        self.builder_session = Some(session);
+        if rung == "R1" {
+            self.builder_session = Some(session);
+        } else {
+            self.rung_sessions.insert(rung.to_owned(), session);
+        }
         result
     }
 
@@ -328,6 +369,7 @@ impl<'a> BuildProvider<'a> {
         &mut self,
         snapshot: &mut RunSnapshot,
         session: &mut BuilderSession,
+        rung: &str,
         run_dir: &Path,
         workspace: &Path,
         baseline_tree: &str,
@@ -356,6 +398,18 @@ impl<'a> BuildProvider<'a> {
                     0,
                 );
             }
+            if self.builder_wall_budget() == 0 {
+                return self.develop_result(
+                    session,
+                    workspace,
+                    baseline_tree,
+                    progress_baseline,
+                    excluded_paths,
+                    "budget",
+                    Vec::new(),
+                    0,
+                );
+            }
             if deadline.is_none() && session.turns >= 60 {
                 return self.develop_result(
                     session,
@@ -370,26 +424,64 @@ impl<'a> BuildProvider<'a> {
             }
             session.turns = session.turns.saturating_add(1);
             let before = Instant::now();
-            let wall_budget_ms = deadline
-                .map(|deadline| {
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis()
-                        .max(1)
-                        .min(u64::MAX as u128) as u64
-                })
-                .unwrap_or(self.options.wall_ms);
-            let call = self.call(
-                snapshot,
-                &mut session.context,
-                "builder",
-                "develop",
-                Some(wall_budget_ms),
-            )?;
+            let call = loop {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return self.develop_result(
+                        session,
+                        workspace,
+                        baseline_tree,
+                        progress_baseline,
+                        excluded_paths,
+                        "landing_allowance_spent",
+                        Vec::new(),
+                        0,
+                    );
+                }
+                let wall_budget_ms = deadline
+                    .map(|deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis()
+                            .max(1)
+                            .min(u64::MAX as u128) as u64
+                    })
+                    .unwrap_or_else(|| self.builder_wall_budget())
+                    .min(self.builder_wall_budget());
+                if wall_budget_ms == 0 {
+                    return self.develop_result(
+                        session,
+                        workspace,
+                        baseline_tree,
+                        progress_baseline,
+                        excluded_paths,
+                        "budget",
+                        Vec::new(),
+                        0,
+                    );
+                }
+                match self.call(
+                    snapshot,
+                    &mut session.context,
+                    "builder",
+                    "develop",
+                    Some(wall_budget_ms),
+                ) {
+                    Ok(call) => break call,
+                    Err(error)
+                        if error.class == crate::error::ErrorClass::Provider
+                            && matches!(error.reason.as_str(), "usage_limit" | "login")
+                            && self.usage_paused_ms < 86_400_000 =>
+                    {
+                        self.usage_paused_ms =
+                            self.usage_paused_ms.saturating_add(self.scaled_ms(300_000));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             self.record_call(
                 snapshot,
                 "develop",
-                "R1",
+                rung,
                 &call,
                 before.elapsed().as_millis() as u64,
             )?;
@@ -414,6 +506,18 @@ impl<'a> BuildProvider<'a> {
                     "landing_allowance_spent",
                     Vec::new(),
                     0,
+                );
+            }
+            if self.builder_wall_budget() == 0 {
+                return self.develop_result(
+                    session,
+                    workspace,
+                    baseline_tree,
+                    progress_baseline,
+                    excluded_paths,
+                    "budget",
+                    Vec::new(),
+                    1,
                 );
             }
             if call.response.tool_calls.is_empty() {
@@ -473,7 +577,7 @@ impl<'a> BuildProvider<'a> {
                     self.record(
                         snapshot,
                         &RunEvent::new("protected_restored", now_ms())
-                            .with("rung", json!("R1"))
+                            .with("rung", json!(rung))
                             .with("path", json!(path)),
                     )?;
                     outputs.push(format!("You changed {path}; acceptance tests and the Intent are read-only and have been restored. Make the implementation satisfy them."));
@@ -534,6 +638,7 @@ impl<'a> BuildProvider<'a> {
         run_dir: &Path,
         stage: &str,
         attempt: &str,
+        rung: &str,
         model: &str,
         effort: &str,
         instructions: String,
@@ -544,7 +649,7 @@ impl<'a> BuildProvider<'a> {
     ) -> Result<RequestContext, CoreError> {
         let mut binding = ConversationBinding::new(run_dir, stage);
         binding.attempt = attempt.to_owned();
-        binding.rung = "R1".to_owned();
+        binding.rung = rung.to_owned();
         let mut context =
             RequestContext::for_conversation(&binding, model, effort, instructions, input)
                 .map_err(|error| {
@@ -560,6 +665,27 @@ impl<'a> BuildProvider<'a> {
             None
         };
         Ok(context)
+    }
+
+    fn builder_wall_budget(&self) -> u64 {
+        let elapsed = self.build_started.elapsed().as_millis() as u64;
+        let total = self.scaled_ms(self.options.wall_ms);
+        let stage_cap = self.scaled_ms(1_800_000);
+        total
+            .saturating_sub(elapsed.saturating_sub(self.usage_paused_ms))
+            .min(stage_cap)
+    }
+
+    fn scaled_ms(&self, milliseconds: u64) -> u64 {
+        ((milliseconds as f64 * self.time_scale()).round() as u64).max(1)
+    }
+
+    fn time_scale(&self) -> f64 {
+        std::env::var("KOGEN_TIME_SCALE")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(1.0)
     }
 
     fn call(

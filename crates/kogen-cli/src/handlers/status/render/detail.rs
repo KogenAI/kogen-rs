@@ -162,10 +162,12 @@ fn append_build_details(output: &mut String, run: &kogen_core::status::StatusRun
             .filter_map(|item| string(item, "id"))
             .collect::<Vec<_>>();
         if !verified.is_empty() || !remaining.is_empty() {
-            output.push_str(&format!(
-                "  acceptance verified: {}\n",
-                display_ids(&verified)
-            ));
+            if !verified.is_empty() {
+                output.push_str(&format!(
+                    "  acceptance verified: {}\n",
+                    display_ids(&verified)
+                ));
+            }
             output.push_str(&format!(
                 "  acceptance remaining: {}\n",
                 display_ids(&remaining)

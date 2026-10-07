@@ -21,6 +21,7 @@ pub(super) struct BuildOutcome {
     pub run_id: String,
     pub commit: String,
     pub verdict: String,
+    pub advisory_items: Vec<String>,
     pub reason: String,
     pub stderr: String,
     pub has_run: bool,
@@ -54,4 +55,18 @@ pub(super) fn run(
     approved: &ApprovedBuild,
 ) -> Result<BuildOutcome, CoreError> {
     SingleRungRecipe.execute(project, approved)
+}
+
+pub(super) fn run_witness_build(
+    project: &ProjectResolution,
+    approved: &ApprovedBuild,
+    options: &super::config::BuildOptions,
+    base_sha: &str,
+    run_dir: &std::path::Path,
+    store: &crate::run::RunStore,
+    snapshot: &mut crate::run::RunSnapshot,
+) -> Result<bool, CoreError> {
+    execute::run_witness_build(
+        project, approved, options, base_sha, run_dir, store, snapshot,
+    )
 }

@@ -41,7 +41,7 @@ pub(super) fn build_report(
     let paused_ms = run.map_or(0, |run| {
         events(run, "provider_wait")
             .iter()
-            .map(|event| event.get("wait_ms").and_then(Value::as_i64).unwrap_or(0))
+            .map(|event| event.get("paused_ms").and_then(Value::as_i64).unwrap_or(0))
             .sum()
     });
     let budget_ms = start
@@ -187,7 +187,7 @@ fn build_rungs(run: &StatusRun) -> Vec<Value> {
             "rung": rung,
             "model": started.get("model").cloned().unwrap_or(Value::Null),
             "effort": started.get("effort").cloned().unwrap_or(Value::Null),
-            "reason": started.get("entered_because").cloned().unwrap_or(Value::Null),
+            "reason": finished.as_ref().and_then(|event| event.get("reason")).cloned().unwrap_or_else(|| started.get("entered_because").cloned().unwrap_or(Value::Null)),
             "verdict": finished.as_ref().and_then(|event| event.get("verdict")).cloned().unwrap_or(Value::Null),
             "diff_lines": finished.as_ref().and_then(|event| event.get("diff_lines")).cloned().unwrap_or(Value::Null),
             "candidate_ref": finished.as_ref().and_then(|event| event.get("candidate_ref")).cloned().unwrap_or(Value::Null),
@@ -198,10 +198,27 @@ fn build_rungs(run: &StatusRun) -> Vec<Value> {
 }
 
 fn best_candidate(run: &StatusRun, run_dir: Option<&Path>) -> Option<Value> {
-    let event = events(run, "rung_finished")
-        .into_iter()
-        .rev()
-        .find(|event| event.get("candidate_ref").is_some())?;
+    let candidates = events(run, "rung_finished");
+    let selected_rung = event(run, "selection").and_then(|event| {
+        event
+            .get("winner_rung")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let event = selected_rung
+        .as_deref()
+        .and_then(|winner| {
+            candidates
+                .iter()
+                .find(|event| event.get("rung").and_then(Value::as_str) == Some(winner))
+        })
+        .cloned()
+        .or_else(|| {
+            candidates
+                .into_iter()
+                .rev()
+                .find(|event| event.get("candidate_ref").is_some())
+        })?;
     let diff_path = run_dir?.join("candidate.diff");
     Some(json!({
         "rung": event.get("rung").cloned().unwrap_or(Value::Null),

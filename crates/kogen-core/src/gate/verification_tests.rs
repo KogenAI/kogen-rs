@@ -91,6 +91,82 @@ fn demoting_a_failed_change_item_rescores_but_does_not_land_it_alone() {
     fixture.remove();
 }
 
+#[test]
+fn audit_demotion_allows_advisory_failure_but_never_supplies_the_change_pass() {
+    let mut report = GateReport {
+        verdict: GateVerdict::Unverified,
+        verified_tree: Some("verified-tree".to_owned()),
+        fix_results: Vec::new(),
+        base_checks: Vec::new(),
+        checks: Vec::new(),
+        acceptance: CommandAcceptanceResult {
+            process: ProcessResult {
+                exit_status: Some(1),
+                timed_out: false,
+                unavailable: false,
+                output_tail: Vec::new(),
+                log_path: PathBuf::from("acceptance.log"),
+                duration_ms: 1,
+                sandbox: None,
+            },
+            rows: Vec::new(),
+            item_pass: BTreeMap::from([("A1".to_owned(), true), ("A2".to_owned(), false)]),
+            failures: Vec::new(),
+        },
+        protection_findings: Vec::new(),
+        restored_paths: Vec::new(),
+        demoted_items: BTreeSet::new(),
+        checks_green: true,
+        fixes_green: true,
+        tree_stable: true,
+        change_items: BTreeSet::from(["A1".to_owned()]),
+        change_item_passes: false,
+        receipt: None,
+    };
+    assert!(report.apply_acceptance_demotions(
+        &BTreeSet::from(["A2".to_owned()]),
+        &BTreeSet::from(["A1".to_owned()]),
+    ));
+    assert!(report.is_verified());
+    assert!(report.is_landable());
+
+    let mut demoted_change = GateReport {
+        verdict: GateVerdict::Unverified,
+        verified_tree: Some("verified-tree".to_owned()),
+        fix_results: Vec::new(),
+        base_checks: Vec::new(),
+        checks: Vec::new(),
+        acceptance: CommandAcceptanceResult {
+            process: ProcessResult {
+                exit_status: Some(1),
+                timed_out: false,
+                unavailable: false,
+                output_tail: Vec::new(),
+                log_path: PathBuf::from("acceptance.log"),
+                duration_ms: 1,
+                sandbox: None,
+            },
+            rows: Vec::new(),
+            item_pass: BTreeMap::from([("A1".to_owned(), false)]),
+            failures: Vec::new(),
+        },
+        protection_findings: Vec::new(),
+        restored_paths: Vec::new(),
+        demoted_items: BTreeSet::new(),
+        checks_green: true,
+        fixes_green: true,
+        tree_stable: true,
+        change_items: BTreeSet::from(["A1".to_owned()]),
+        change_item_passes: false,
+        receipt: None,
+    };
+    assert!(demoted_change.apply_acceptance_demotions(
+        &BTreeSet::from(["A1".to_owned()]),
+        &BTreeSet::from(["A1".to_owned()]),
+    ));
+    assert!(!demoted_change.is_landable());
+}
+
 struct Fixture {
     root: PathBuf,
     base: PathBuf,
