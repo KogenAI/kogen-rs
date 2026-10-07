@@ -63,6 +63,7 @@ impl SandboxPolicy {
                 run_dir.join("logs"),
                 run_dir.join("tmp"),
                 run_dir.join("reports"),
+                run_dir.join("ledger.jsonl"),
                 run_dir.join("mise-state"),
                 run_dir.join("mise-cache"),
                 PathBuf::from("/tmp"),

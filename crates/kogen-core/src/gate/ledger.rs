@@ -129,6 +129,15 @@ pub fn run_command_acceptance(
         }
     }
 
+    // A file bind mount needs an existing target on Linux. Prepare only this
+    // private report, so the sandbox need not grant writes to the run root.
+    crate::safe_fs::create_file(&report_root, &report_relative, b"").map_err(|source| {
+        AcceptanceRunError::ReportSetup {
+            path: request.report_path.clone(),
+            source,
+        }
+    })?;
+
     let before =
         tree.snapshot(&request.workdir)
             .map_err(|detail| AcceptanceRunError::TreeSnapshot {
