@@ -29,7 +29,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.path.display())?;
         for issue in &self.issues {
-            write!(f, "\n  ")?;
+            writeln!(f)?;
             if let Some(line) = issue.line {
                 write!(f, "line {line}: ")?;
             }

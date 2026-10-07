@@ -1,4 +1,6 @@
 use super::{ProjectConfig, ProjectOptions, ProjectResolution, state_key, valid_slug};
+use crate::ExitCode;
+use crate::error::{CoreError, ErrorClass};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -92,6 +94,24 @@ build:
     assert!(details.contains(&"setup has duplicate name \"s\""));
     assert!(details.contains(&"fix[1].timeout_ms must be a positive integer"));
     assert!(details.contains(&"build.roles has unknown role \"judge\""));
+}
+
+#[test]
+fn config_error_details_are_indented_once_at_the_cli_boundary() {
+    let error =
+        ProjectConfig::from_bytes(".kogen/project.yaml", b"\xef\xbb\xbfname: kt\nchecks: []\n")
+            .expect_err("BOM is rejected");
+    let output = CoreError::new(
+        ErrorClass::Environment,
+        "project_config_invalid",
+        error.to_string(),
+        ExitCode::Environment,
+    )
+    .render_stdout();
+    assert_eq!(
+        output,
+        "environment/project_config_invalid: .kogen/project.yaml\n  line 1: leading UTF-8 BOM is not allowed\n"
+    );
 }
 
 #[test]

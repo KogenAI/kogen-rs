@@ -6,6 +6,7 @@ use super::super::provider::{
     ShapeProvider, ShapeSession, ShapeSessionSpec, dispatch_shaper_tools,
 };
 use super::super::validation::ValidationFailure;
+use super::checkout_lock::CheckoutLock;
 use super::config::{domains, gate_paths, role_config, selected_account};
 use super::files::{
     create_run_dir, io_error, project_error, remove_stale, repair_limit_error, request_is_empty,
@@ -316,6 +317,7 @@ impl RunState {
                 .turn(self.session.as_mut().expect("shaper session exists"))?;
             self.record_call(&turn.call);
             if !turn.response.tool_calls.is_empty() {
+                let _lock = CheckoutLock::acquire(&self.options.home, &self.checkout)?;
                 let outputs = dispatch_shaper_tools(
                     &turn,
                     &self.checkout,

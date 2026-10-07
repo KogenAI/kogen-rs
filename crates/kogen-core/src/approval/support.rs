@@ -2,6 +2,7 @@ use super::model::{LedgerFile, ShapeWarning, ShapeWarnings};
 use crate::ExitCode;
 use crate::error::{CoreError, ErrorClass};
 use crate::git::{GitError, GitRepo};
+use crate::intent::{Intent, LintSeverity};
 use crate::project::ProjectResolution;
 use serde_yaml::Value;
 use std::collections::BTreeMap;
@@ -69,6 +70,25 @@ pub(super) fn matching_shape_warnings(
     } else {
         Vec::new()
     }
+}
+
+pub(super) fn approval_style_warnings(intent: &Intent) -> Vec<ShapeWarning> {
+    intent
+        .lint()
+        .into_iter()
+        .filter(|issue| issue.severity == LintSeverity::Style)
+        .map(|issue| {
+            let item_ids = issue
+                .line
+                .and_then(|line| intent.acceptance.iter().find(|item| item.line == line))
+                .map_or_else(Vec::new, |item| vec![item.id.clone()]);
+            ShapeWarning {
+                code: format!("lint_{}", issue.rule),
+                item_ids,
+                message: issue.message,
+            }
+        })
+        .collect()
 }
 
 pub(super) fn matching_ledger(

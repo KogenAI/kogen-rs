@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use kogen_core::project::valid_slug;
+
 use crate::arguments::{
     build_command, collect_positionals, missing_positional, scan_options, unexpected_positional,
 };
@@ -112,6 +114,20 @@ fn parse_route(route: Route, tail: &[String], page: HelpPage, cwd: &Path) -> Par
         );
     }
 
+    if matches!(
+        route,
+        Route::Status | Route::IntentShape | Route::IntentApprove | Route::IntentRemove
+    ) && positional.first().is_some_and(|slug| !valid_slug(slug))
+    {
+        return usage(
+            format!(
+                "kogen {}: <slug> must be 3 to 48 lowercase letters, digits or single dashes",
+                route.path()
+            ),
+            page,
+        );
+    }
+
     match build_command(route, positional, options, cwd) {
         Ok(command) => ParsedRequest::Command(command),
         Err(message) => usage(message, page),
@@ -120,4 +136,37 @@ fn parse_route(route: Route, tail: &[String], page: HelpPage, cwd: &Path) -> Par
 
 fn usage(message: String, page: HelpPage) -> ParsedRequest {
     ParsedRequest::Usage(UsageError { message, page })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+    use crate::help::HelpPage;
+    use crate::request::{ParsedRequest, UsageError};
+    use std::path::Path;
+
+    #[test]
+    fn invalid_slugs_are_usage_errors_with_the_route_help_page() {
+        for (args, message, page) in [
+            (
+                vec!["intent", "approve", "--", "--by"],
+                "kogen intent approve: <slug> must be 3 to 48 lowercase letters, digits or single dashes",
+                HelpPage::IntentApprove,
+            ),
+            (
+                vec!["status", "ab"],
+                "kogen status: <slug> must be 3 to 48 lowercase letters, digits or single dashes",
+                HelpPage::Status,
+            ),
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(
+                parse(&args, Path::new("/checkout")),
+                ParsedRequest::Usage(UsageError {
+                    message: message.to_owned(),
+                    page,
+                })
+            );
+        }
+    }
 }

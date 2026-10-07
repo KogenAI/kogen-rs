@@ -62,6 +62,20 @@ fn parse_reports_first_structural_line_and_message() {
 }
 
 #[test]
+fn section_errors_report_the_following_line() {
+    let prefix = "---\ntitle: Greet Almir by name\nsize: small\ndomains: [app]\n---\nChange the greeting.\n\n## Acceptance\n- A1: greeting is updated\n\n## Verify\n- A1: test\n\n";
+    let unknown = format!("{prefix}## Extras\nmore\n");
+    let error = Intent::parse("greet", unknown.as_bytes()).expect_err("unknown section");
+    assert_eq!(error.0.line, 15);
+    assert_eq!(error.0.message, "unknown Intent section \"Extras\"");
+
+    let duplicate = format!("{prefix}## Verify\n- A1: test\n");
+    let error = Intent::parse("greet", duplicate.as_bytes()).expect_err("duplicate section");
+    assert_eq!(error.0.line, 15);
+    assert_eq!(error.0.message, "duplicate Verify section");
+}
+
+#[test]
 fn lint_error_kernel_matches_each_structural_rule() {
     let cases = [
         (

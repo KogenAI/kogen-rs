@@ -49,8 +49,30 @@ pub(super) fn resolve(
 }
 
 pub(super) fn display_relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
+    let relative = path
+        .strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
-        .replace('\\', "/")
+        .replace('\\', "/");
+    if relative.is_empty() {
+        ".".to_owned()
+    } else {
+        relative
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_relative;
+    use std::path::Path;
+
+    #[test]
+    fn workspace_root_is_searchable_as_dot() {
+        let root = Path::new("/workspace");
+        assert_eq!(display_relative(root, root), ".");
+        assert_eq!(
+            display_relative(root, &root.join("lib/greet.txt")),
+            "lib/greet.txt"
+        );
+    }
 }

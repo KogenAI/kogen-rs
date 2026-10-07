@@ -155,7 +155,7 @@ impl Intent {
             if let Some((heading, next)) = known_heading(logical.trim()) {
                 if !seen.insert(heading) {
                     return Err(parse_error(
-                        line.line,
+                        line.line + 1,
                         format!("duplicate {heading} section"),
                     ));
                 }
@@ -170,7 +170,7 @@ impl Intent {
                 && section != Section::Brief
             {
                 return Err(parse_error(
-                    line.line,
+                    line.line + 1,
                     format!("unknown Intent section \"{name}\""),
                 ));
             }

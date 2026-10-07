@@ -8,6 +8,9 @@ mod render;
 pub mod replay;
 mod support;
 
+#[cfg(test)]
+mod tests;
+
 use crate::ExitCode;
 use crate::error::{CliOutput, CoreError};
 use crate::git::GitRepo;
@@ -173,7 +176,16 @@ fn approve_inner(
         &check_outcome,
     )?;
 
-    let warnings = matching_shape_warnings(project, slug, &actual_hash);
+    let mut warnings = matching_shape_warnings(project, slug, &actual_hash);
+    for warning in approval_style_warnings(&intent) {
+        if !warnings.iter().any(|existing| {
+            existing.code == warning.code
+                && existing.item_ids == warning.item_ids
+                && existing.message == warning.message
+        }) {
+            warnings.push(warning);
+        }
+    }
     let has_concern = warnings
         .iter()
         .any(|warning| warning.code == "feasibility_concern");
