@@ -202,7 +202,6 @@ mod tests {
         ClaimStart, claim, claim_owner_is_live, new_run_id, owner_marker, process_start_seconds,
     };
     use std::path::PathBuf;
-    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ORIGIN: AtomicU64 = AtomicU64::new(0);
@@ -214,24 +213,18 @@ mod tests {
             let id = NEXT_ORIGIN.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir()
                 .join(format!("kogen-queue-claim-{}-{id}.git", std::process::id()));
-            let output = Command::new("git")
+            let output = kogen_test_support::git_command()
                 .args(["init", "--bare", "--quiet"])
                 .arg(&path)
                 .output()
                 .expect("git is available");
             assert!(output.status.success());
-            for (key, value) in [
-                ("user.name", "Kogen queue test"),
-                ("user.email", "queue-test@example.invalid"),
-            ] {
-                let output = Command::new("git")
-                    .args(["--git-dir"])
-                    .arg(&path)
-                    .args(["config", key, value])
-                    .output()
-                    .expect("git is available");
-                assert!(output.status.success());
-            }
+            kogen_test_support::set_identity(
+                &path,
+                "Kogen queue test",
+                "queue-test@example.invalid",
+            )
+            .expect("configure queue fixture identity");
             Self(path)
         }
     }

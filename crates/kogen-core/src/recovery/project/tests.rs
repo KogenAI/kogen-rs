@@ -6,7 +6,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const RUN_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -42,8 +41,8 @@ fn crash_after_base_cas_before_incoming_cleanup_reconciles_as_landed() {
         &["init", "--bare", "--initial-branch=main", path(&origin)],
     );
     git(&temp.0, &["init", "--initial-branch=main", path(&seed)]);
-    git(&seed, &["config", "user.name", "Recovery Trace"]);
-    git(&seed, &["config", "user.email", "recovery@example.test"]);
+    kogen_test_support::set_identity(&seed, "Recovery Trace", "recovery@example.test")
+        .expect("configure recovery fixture identity");
     fs::write(seed.join("README"), b"base\n").expect("write base fixture");
     git(&seed, &["add", "README"]);
     git(&seed, &["commit", "-m", "base"]);
@@ -151,11 +150,9 @@ fn crash_after_base_cas_before_incoming_cleanup_reconciles_as_landed() {
 }
 
 fn git(directory: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = kogen_test_support::git_command()
         .args(args)
         .current_dir(directory)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .expect("run isolated Git fixture command");
     assert!(
@@ -167,10 +164,9 @@ fn git(directory: &Path, args: &[&str]) {
 }
 
 fn git_text(directory: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = kogen_test_support::git_command()
         .args(args)
         .current_dir(directory)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .expect("run isolated Git fixture query");
     assert!(output.status.success(), "git {} failed", args.join(" "));

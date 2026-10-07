@@ -605,6 +605,7 @@ name = "kogen"
 version = "0.1.0"
 dependencies = [
  "kogen-core",
+ "kogen-test-support",
  "serde_json",
 ]
 
@@ -616,6 +617,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "jsonwebtoken",
+ "kogen-test-support",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -629,10 +631,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kogen-test-support"
+version = "0.1.0"
+
+[[package]]
 name = "kogen-xspec"
 version = "0.1.0"
 dependencies = [
  "kogen-core",
+ "kogen-test-support",
  "serde",
  "serde_json",
 ]

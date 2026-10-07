@@ -1,12 +1,12 @@
 use super::*;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 #[test]
 fn snapshot_includes_excluded_untracked_files() {
     let repo = test_dir("excluded");
     git(&repo, &["init", "--quiet"]);
+    identity(&repo);
     fs::create_dir_all(repo.join(".git/info")).unwrap();
     fs::write(repo.join(".git/info/exclude"), "masked.txt\n").unwrap();
     let before = snapshot_tree(&repo).unwrap();
@@ -20,6 +20,7 @@ fn snapshot_includes_excluded_untracked_files() {
 fn snapshot_uses_raw_bytes_and_git_modes_without_running_hooks() {
     let repo = test_dir("raw");
     git(&repo, &["init", "--quiet"]);
+    identity(&repo);
     fs::create_dir_all(repo.join(".git/hooks")).unwrap();
     let marker = repo.join("hook-ran");
     let hook = repo.join(".git/hooks/post-checkout");
@@ -43,11 +44,12 @@ fn snapshot_matches_a_git_tree_for_executable_files_and_symlinks() {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let repo = test_dir("modes");
     git(&repo, &["init", "--quiet"]);
+    identity(&repo);
     fs::write(repo.join("run.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(repo.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
     symlink("run.sh", repo.join("run-link")).unwrap();
     git(&repo, &["add", "-f", "--all"]);
-    let expected = Command::new("git")
+    let expected = kogen_test_support::git_command()
         .args(["write-tree"])
         .current_dir(&repo)
         .output()
@@ -59,7 +61,7 @@ fn snapshot_matches_a_git_tree_for_executable_files_and_symlinks() {
 }
 
 fn git(root: &PathBuf, args: &[&str]) {
-    let output = Command::new("git")
+    let output = kogen_test_support::git_command()
         .args(args)
         .current_dir(root)
         .output()
@@ -69,6 +71,11 @@ fn git(root: &PathBuf, args: &[&str]) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn identity(repository: &std::path::Path) {
+    kogen_test_support::set_identity(repository, "Kogen Gate Test", "gate@example.invalid")
+        .expect("configure gate fixture identity");
 }
 
 fn test_dir(label: &str) -> PathBuf {

@@ -72,6 +72,8 @@ pub(super) fn git_output(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .envs(env.iter().map(|(key, value)| (key, value)));
+    #[cfg(any(test, feature = "hermetic-git-tests"))]
+    kogen_test_support::configure_git_command(&mut command);
     let mut child = command.spawn().map_err(|error| {
         LandingError::from(GitError {
             operation: "start git".to_owned(),

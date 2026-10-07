@@ -5,7 +5,7 @@ pub(super) use approval::ApprovalSummary;
 use kogen_core::git::{GitError, GitRepo};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -86,8 +86,7 @@ impl TempProject {
         )?;
         run_git(&self.checkout, &["init", "--initial-branch=main"])?;
         for repo in [&self.checkout, &self.origin_path] {
-            run_git(repo, &["config", "user.name", "Ann"])?;
-            run_git(repo, &["config", "user.email", "ann@x.io"])?;
+            kogen_test_support::set_identity(repo, "Ann", "ann@x.io")?;
         }
         Ok(())
     }
@@ -330,7 +329,7 @@ fn path_arg(path: &Path) -> Result<&str, String> {
 }
 
 fn run_git(directory: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = kogen_test_support::git_command()
         .args(args)
         .current_dir(directory)
         .stdin(Stdio::null())

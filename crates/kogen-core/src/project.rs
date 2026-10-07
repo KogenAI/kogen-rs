@@ -297,11 +297,11 @@ fn absolute_from(base: &Path, path: &Path) -> PathBuf {
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    #[cfg(any(test, feature = "hermetic-git-tests"))]
+    kogen_test_support::configure_git_command(&mut command);
+    let output = command.output().ok()?;
     output
         .status
         .success()

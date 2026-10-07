@@ -57,6 +57,8 @@ impl GitRepo {
             .args(args)
             .current_dir(&self.path)
             .envs(env.iter().copied());
+        #[cfg(any(test, feature = "hermetic-git-tests"))]
+        kogen_test_support::configure_git_command(&mut command);
         if input.is_some() {
             command.stdin(Stdio::piped());
         }

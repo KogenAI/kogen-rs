@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/kogen-core", "crates/kogen-cli", "crates/kogen-xspec"]
+members = [
+    "crates/kogen-core",
+    "crates/kogen-cli",
+    "crates/kogen-test-support",
+    "crates/kogen-xspec",
+]
 resolver = "3"
 
 [workspace.package]

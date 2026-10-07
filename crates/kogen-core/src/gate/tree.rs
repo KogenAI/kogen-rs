@@ -168,6 +168,8 @@ fn git(
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
+    #[cfg(any(test, feature = "hermetic-git-tests"))]
+    kogen_test_support::configure_git_command(&mut command);
     let mut child = command.spawn().map_err(|error| TreeSnapshotError {
         operation: "start git",
         detail: error.to_string(),

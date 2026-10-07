@@ -9,5 +9,9 @@ license.workspace = true
 kogen-core = { path = "../kogen-core" }
 serde_json = "1"
 
+[dev-dependencies]
+kogen-core = { path = "../kogen-core", features = ["hermetic-git-tests"] }
+kogen-test-support = { path = "../kogen-test-support" }
+
 [lints]
 workspace = true

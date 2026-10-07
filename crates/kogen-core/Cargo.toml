@@ -20,6 +20,13 @@ socket2 = "0.5"
 signal-hook = "0.3"
 url = "2"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
+kogen-test-support = { path = "../kogen-test-support", optional = true }
+
+[features]
+hermetic-git-tests = ["dep:kogen-test-support"]
+
+[dev-dependencies]
+kogen-test-support = { path = "../kogen-test-support" }
 
 [lints]
 workspace = true

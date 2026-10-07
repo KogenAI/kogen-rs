@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -105,12 +104,18 @@ impl Fixture {
             fs::create_dir_all(workspace.join(".kogen/intents/greet")).unwrap();
             fs::write(workspace.join(".kogen/acceptance/greet.t.sh"), &acceptance).unwrap();
             fs::write(workspace.join(".kogen/intents/greet/intent.md"), &intent).unwrap();
-            let output = Command::new("git")
+            let output = kogen_test_support::git_command()
                 .args(["init", "--quiet"])
                 .current_dir(workspace)
                 .output()
                 .unwrap();
             assert!(output.status.success());
+            kogen_test_support::set_identity(
+                workspace,
+                "Kogen Verification Test",
+                "verification@example.invalid",
+            )
+            .expect("configure verification fixture identity");
         }
         Self {
             root,

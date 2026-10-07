@@ -48,9 +48,11 @@ fn path_from_git_bytes(path: &[u8]) -> Option<PathBuf> {
 }
 
 fn git_bytes(workdir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workdir)
+    let mut command = Command::new("git");
+    command.args(args).current_dir(workdir);
+    #[cfg(any(test, feature = "hermetic-git-tests"))]
+    kogen_test_support::configure_git_command(&mut command);
+    let output = command
         .output()
         .map_err(|error| format!("run git {}: {error}", args.join(" ")))?;
     if !output.status.success() {

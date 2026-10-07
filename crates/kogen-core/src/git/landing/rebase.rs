@@ -125,6 +125,8 @@ fn git_with_identity(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[cfg(any(test, feature = "hermetic-git-tests"))]
+    kogen_test_support::configure_git_command(&mut command);
     command.output().map_err(|error| {
         LandingError::from(crate::git::GitError {
             operation: "start git rebase".to_owned(),

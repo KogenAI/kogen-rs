@@ -7,7 +7,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
-kogen-core = { path = "../kogen-core" }
+kogen-core = { path = "../kogen-core", features = ["hermetic-git-tests"] }
+kogen-test-support = { path = "../kogen-test-support" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

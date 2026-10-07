@@ -369,7 +369,6 @@ mod tests {
     use super::dispatch;
     use crate::request::{Command, ProjectOptions};
     use kogen_core::ExitCode;
-    use std::process::Command as ProcessCommand;
 
     #[test]
     fn status_rejects_oversized_project_yaml_as_invalid_config() {
@@ -379,12 +378,14 @@ mod tests {
             unique_suffix()
         ));
         std::fs::create_dir_all(checkout.join(".kogen")).expect("create project config dir");
-        let init = ProcessCommand::new("git")
+        let init = kogen_test_support::git_command()
             .args(["init", "-q", "-b", "main"])
             .current_dir(&checkout)
             .status()
             .expect("run git init");
         assert!(init.success());
+        kogen_test_support::set_identity(&checkout, "Kogen CLI Test", "cli@example.invalid")
+            .expect("configure CLI fixture identity");
 
         let mut config = b"name: kt\nchecks: []\n".to_vec();
         config.resize(1_048_577, b'x');

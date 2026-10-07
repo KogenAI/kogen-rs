@@ -2,7 +2,6 @@ use super::{ProjectConfig, ProjectOptions, ProjectResolution, state_key, valid_s
 use crate::ExitCode;
 use crate::error::{CoreError, ErrorClass};
 use std::path::PathBuf;
-use std::process::Command;
 
 #[test]
 fn slug_contract_is_exact() {
@@ -139,12 +138,14 @@ fn resolution_uses_checkout_root_for_relative_and_symlinked_project_paths() {
     std::fs::create_dir_all(&checkout).expect("create checkout");
     std::fs::create_dir_all(&home).expect("create home");
     std::os::unix::fs::symlink(&checkout, temp.join("link to checkout")).expect("create symlink");
-    let init = Command::new("git")
+    let init = kogen_test_support::git_command()
         .args(["init", "-q", "-b", "main"])
         .current_dir(&checkout)
         .status()
         .expect("run git init");
     assert!(init.success());
+    kogen_test_support::set_identity(&checkout, "Kogen Project Test", "project@example.invalid")
+        .expect("configure project fixture identity");
     let resolved = ProjectResolution::resolve(&ProjectOptions {
         cwd: Some(temp.clone()),
         project: Some(PathBuf::from("link to checkout")),
