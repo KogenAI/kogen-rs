@@ -1,6 +1,7 @@
 use super::model::{BaselineCache, BaselineRow, Finding};
 mod acceptance;
 mod cache;
+mod identity;
 
 use crate::gate::is_test_rule;
 use crate::git::GitRepo;
@@ -76,22 +77,21 @@ pub(super) fn run_setup_and_baseline(
     let setup_key =
         SetupCacheKey::from_project(project.config.as_ref(), &project.checkout, &base_tree, &env)
             .map_err(|error| CheckError::Internal(error.to_string()))?;
-    use sha2::{Digest, Sha256};
-    let context = setup_key
-        .digest_with_checks(&checks_value(project)?)
-        .map_err(|error| CheckError::Internal(error.to_string()))?;
-    let material = serde_json::json!({"v":3,"base_tree":base_tree,"context":context,
-        "adapter":config_value(project, "acceptance"),"adapter_version":"kogen-baseline-v3"});
-    let key = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&material).expect("baseline identity"))
-    );
+    let checks = checks_value(project)?;
+    let identity =
+        identity::baseline_key(&setup_key, &base_tree, &checks, &project.checkout, &env)?;
+    // Unknown check toolchains are a miss, rather than a reusable empty identity.
+    let key = identity
+        .clone()
+        .unwrap_or_else(|| format!("uncached-{}", rand::random::<u64>()));
     let setup_key = setup_key.digest();
     let cache_path = project
         .state_root
         .join("approval-cache")
         .join(format!("{key}.json"));
-    if let Some(cache) = read_cache(&cache_path, &key) {
+    if identity.is_some()
+        && let Some(cache) = read_cache(&cache_path, &key)
+    {
         return Ok(CheckOutcome {
             rows: cache.rows,
             run_dir,
@@ -116,13 +116,15 @@ pub(super) fn run_setup_and_baseline(
         || run_setup(project, &runner, &run_dir, &env),
     )?;
     let rows = run_checks(project, &runner, &run_dir, &env)?;
-    write_cache(
-        &cache_path,
-        &BaselineCache {
-            key,
-            rows: rows.clone(),
-        },
-    )?;
+    if identity.is_some() {
+        write_cache(
+            &cache_path,
+            &BaselineCache {
+                key,
+                rows: rows.clone(),
+            },
+        )?;
+    }
     Ok(CheckOutcome { rows, run_dir, env })
 }
 
