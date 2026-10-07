@@ -14,7 +14,8 @@ use super::jwt::{Identity, verify_id_token};
 use super::{Credential, now_seconds};
 
 const REQUIRED_SCOPE: &str = "chatgpt.tokens.use.direct";
-const REDIRECT_URI: &str = "http://127.0.0.1:1455/auth/callback";
+const CALLBACK_PORT: u16 = 1455;
+const CALLBACK_PATH: &str = "/auth/callback";
 const SCOPE: &str = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 
 #[path = "callback.rs"]
@@ -47,16 +48,89 @@ pub(super) struct LoginResult {
     pub identity: Identity,
 }
 
+enum LoginAttemptError {
+    AuthorizationError,
+    Core(super::super::CoreError),
+}
+
+impl From<super::super::CoreError> for LoginAttemptError {
+    fn from(error: super::super::CoreError) -> Self {
+        Self::Core(error)
+    }
+}
+
+impl LoginAttemptError {
+    fn into_core(self) -> super::super::CoreError {
+        match self {
+            Self::AuthorizationError => provider_error("login", "ChatGPT sign-in was declined"),
+            Self::Core(error) => error,
+        }
+    }
+}
+
 pub(super) fn login(
     home: &Path,
     previous_client_id: Option<&str>,
-    mut progress: impl FnMut(&str),
+    progress: impl FnMut(&str),
 ) -> Result<LoginResult, super::super::CoreError> {
+    login_with_browser(
+        home,
+        previous_client_id,
+        progress,
+        None,
+        CALLBACK_PORT,
+        open_browser,
+    )
+}
+
+pub(super) fn login_with_browser(
+    home: &Path,
+    previous_client_id: Option<&str>,
+    mut progress: impl FnMut(&str),
+    auth_url: Option<&str>,
+    callback_port: u16,
+    mut browser: impl FnMut(&str) -> Result<(), super::super::CoreError>,
+) -> Result<LoginResult, super::super::CoreError> {
+    match login_attempt(
+        home,
+        previous_client_id,
+        &mut progress,
+        auth_url,
+        callback_port,
+        &mut browser,
+    ) {
+        Ok(result) => Ok(result),
+        Err(LoginAttemptError::AuthorizationError) if previous_client_id.is_some() => {
+            progress("Saved ChatGPT client was rejected; retrying with a fresh registration\n");
+            login_attempt(
+                home,
+                None,
+                &mut progress,
+                auth_url,
+                callback_port,
+                &mut browser,
+            )
+            .map_err(LoginAttemptError::into_core)
+        }
+        Err(error) => Err(error.into_core()),
+    }
+}
+
+fn login_attempt(
+    home: &Path,
+    previous_client_id: Option<&str>,
+    progress: &mut impl FnMut(&str),
+    auth_url: Option<&str>,
+    callback_port: u16,
+    browser: &mut impl FnMut(&str) -> Result<(), super::super::CoreError>,
+) -> Result<LoginResult, LoginAttemptError> {
     let client = http_client()?;
-    let discovery = discover(&client)?;
+    let discovery = discover_at(&client, auth_url)?;
     let host_id = local::host_id(home)?;
     let client_id = previous_client_id.unwrap_or("dynamic_agent_client");
     let (verifier, challenge, state, nonce) = local::pkce_values();
+    let (listener, bound_port) = callback::bind(callback_port)?;
+    let redirect_uri = format!("http://127.0.0.1:{bound_port}{CALLBACK_PATH}");
     let mut authorize = Url::parse(&discovery.authorization_endpoint)
         .map_err(|_| provider_error("login", "ChatGPT authorization endpoint is invalid"))?;
     {
@@ -64,7 +138,7 @@ pub(super) fn login(
         query.append_pair("client_id", client_id);
         query.append_pair("ext_agent_host_id", &host_id);
         query.append_pair("response_type", "code");
-        query.append_pair("redirect_uri", REDIRECT_URI);
+        query.append_pair("redirect_uri", &redirect_uri);
         query.append_pair("scope", SCOPE);
         query.append_pair("resource", "https://api.openai.com/v1");
         query.append_pair("state", &state);
@@ -75,11 +149,13 @@ pub(super) fn login(
             query.append_pair("agent_name_hint", "Kogen");
         }
     }
-    let listener = callback::bind()?;
     progress("Continue with ChatGPT\n");
     progress(&format!("{}\n", authorize.as_str()));
-    open_browser(authorize.as_str())?;
+    browser(authorize.as_str())?;
     let returned = callback::wait(listener, &state, local::login_wait())?;
+    if returned.error {
+        return Err(LoginAttemptError::AuthorizationError);
+    }
     let code = returned.code.ok_or_else(|| {
         provider_error(
             "login",
@@ -92,7 +168,7 @@ pub(super) fn login(
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", REDIRECT_URI),
+            ("redirect_uri", redirect_uri.as_str()),
             ("client_id", returned_client_id),
             ("code_verifier", verifier.as_str()),
         ])
@@ -180,8 +256,20 @@ pub(super) fn revoke(credential: &Credential) -> bool {
 }
 
 fn discover(client: &Client) -> Result<Discovery, super::super::CoreError> {
-    let base =
-        std::env::var("KOGEN_AUTH_URL").unwrap_or_else(|_| "https://auth.openai.com".to_owned());
+    discover_at(client, None)
+}
+
+fn discover_at(
+    client: &Client,
+    auth_url: Option<&str>,
+) -> Result<Discovery, super::super::CoreError> {
+    let (base, allow_http) = match auth_url {
+        Some(base) => (base.to_owned(), true),
+        None => match std::env::var("KOGEN_AUTH_URL") {
+            Ok(base) => (base, true),
+            Err(_) => ("https://auth.openai.com".to_owned(), false),
+        },
+    };
     let url = format!(
         "{}/.well-known/openid-configuration",
         base.trim_end_matches('/')
@@ -194,16 +282,16 @@ fn discover(client: &Client) -> Result<Discovery, super::super::CoreError> {
     if config.issuer != "https://auth.openai.com" {
         return Err(provider_error("login", "ChatGPT OpenID issuer is invalid"));
     }
-    validate_endpoint(&config.authorization_endpoint)?;
-    validate_endpoint(&config.token_endpoint)?;
-    validate_endpoint(&config.jwks_uri)?;
+    validate_endpoint(&config.authorization_endpoint, allow_http)?;
+    validate_endpoint(&config.token_endpoint, allow_http)?;
+    validate_endpoint(&config.jwks_uri, allow_http)?;
     if let Some(endpoint) = &config.revocation_endpoint {
-        validate_endpoint(endpoint)?;
+        validate_endpoint(endpoint, allow_http)?;
     }
     Ok(config)
 }
 
-fn validate_endpoint(endpoint: &str) -> Result<(), super::super::CoreError> {
+fn validate_endpoint(endpoint: &str, allow_http: bool) -> Result<(), super::super::CoreError> {
     let url = Url::parse(endpoint)
         .map_err(|_| provider_error("login", "ChatGPT OpenID endpoint is invalid"))?;
     if !matches!(url.scheme(), "https" | "http")
@@ -215,7 +303,7 @@ fn validate_endpoint(endpoint: &str) -> Result<(), super::super::CoreError> {
             "ChatGPT OpenID endpoint is invalid",
         ));
     }
-    if url.scheme() == "http" && std::env::var_os("KOGEN_AUTH_URL").is_none() {
+    if url.scheme() == "http" && !allow_http {
         return Err(provider_error(
             "login",
             "ChatGPT OpenID endpoint must use HTTPS",

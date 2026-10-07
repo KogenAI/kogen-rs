@@ -21,8 +21,29 @@ pub fn list(home: &Path) -> Result<String, super::CoreError> {
 /// before the browser opens so users can see and copy the authorization URL.
 pub fn login(
     home: &Path,
+    progress: impl FnMut(&str),
+    warning: impl FnMut(&str),
+) -> Result<String, super::CoreError> {
+    login_with_auth(
+        home,
+        progress,
+        warning,
+        |home, previous_client, progress| auth::login_owned(home, previous_client, progress),
+    )
+}
+
+fn login_with_auth(
+    home: &Path,
     mut progress: impl FnMut(&str),
     mut warning: impl FnMut(&str),
+    owned_login: impl FnOnce(
+        &Path,
+        Option<&str>,
+        &mut dyn FnMut(&str),
+    ) -> Result<
+        (auth::Credential, String, Option<String>, Option<String>),
+        super::CoreError,
+    >,
 ) -> Result<String, super::CoreError> {
     let profiles = read_profiles(home)?;
     let old_profile = profile(&profiles, "chatgpt", LABEL).cloned();
@@ -36,15 +57,9 @@ pub fn login(
     let old_credential = login_credential.credential;
     let previous_client = old_credential
         .as_ref()
-        .map(|credential| credential.client_id.as_str())
-        .or_else(|| {
-            old_profile
-                .as_ref()
-                .and_then(|record| record.get("client_id"))
-                .and_then(Value::as_str)
-        });
+        .map(|credential| credential.client_id.as_str());
     let (credential, subject, email, plan_usage) =
-        auth::login_owned(home, previous_client, &mut progress)?;
+        owned_login(home, previous_client, &mut progress)?;
     if let Some(previous_subject) = old_profile
         .as_ref()
         .and_then(|record| record.get("subject"))
@@ -321,7 +336,23 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::warn_unreadable_credential;
+    use super::{login_with_auth, warn_unreadable_credential};
+    use crate::provider::auth::{self, Credential};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde_json::{Value, json};
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+    use url::Url;
+
+    const TEST_PRIVATE_KEY: &str = include_str!("auth/testdata/id-token-private.pem");
+    const TEST_PUBLIC_MODULUS: &str = "pJp-vPp6IGgUoaCryWoZAJHp5rbgb1xyavqihuOaiweQAk3D3WBQNGCmnD0Q8owsJt1kbz402skh5Q10TW6X6zVwflLTnICSwCu6qD6aM6NIkuidnEAtOGoEtzpcazASnVqa8uLDJeQrTelEAzfYAYs0zsY4d7EYliPtX5fwMhdreoyhx7n6oK7OExLTknOEQ5VKXjnYpC6SZMyps9KJipTXkGcqbtqGJrS-Kj9kMSWNrEyDBv8juBiHVsUNwhI_6j8mwEVJbQPxkQ1AwpNdAqOmEDDqcu7r_ZQWel9pE-_b-zKDQmBlbL5q9wmMRn7TTMKTnhe_BnFMpfUWQ4bJlw";
+    const RETRY_MESSAGE: &str =
+        "Saved ChatGPT client was rejected; retrying with a fresh registration\n";
 
     #[test]
     fn unreadable_credential_warning_is_one_stderr_line() {
@@ -340,5 +371,347 @@ mod tests {
         let mut warnings = Vec::new();
         warn_unreadable_credential(false, &mut |line| warnings.push(line.to_owned()));
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn login_retries_rejected_clients_once_and_skips_profile_only_clients() {
+        let server = FakeAuthServer::start();
+
+        let credential_home = scratch_home();
+        for (previous_client, error, registered_client) in [
+            (
+                "legacy-client-id",
+                Some("3p_login_workspace_scope_denied"),
+                "fresh-client-one",
+            ),
+            (
+                "fresh-client-one",
+                Some("access_denied"),
+                "fresh-client-two",
+            ),
+        ] {
+            auth::put_login_credential(
+                &credential_home,
+                "default",
+                &Credential {
+                    client_id: previous_client.to_owned(),
+                    access_token: "test-access-token".to_owned(),
+                    refresh_token: "test-refresh-token".to_owned(),
+                    id_token: "test-id-token".to_owned(),
+                    expires_at: 0,
+                    scopes: Vec::new(),
+                    subject: "test-subject".to_owned(),
+                    email: None,
+                    host_id: "test-host".to_owned(),
+                },
+            )
+            .unwrap();
+            let outcome = run_login(&credential_home, &server, error, registered_client);
+            assert_eq!(
+                outcome.stdout,
+                "chatgpt:default signed in (owner@example.test)\n"
+            );
+            assert_eq!(
+                outcome.authorization_clients,
+                vec![previous_client, "dynamic_agent_client"]
+            );
+            assert_eq!(
+                outcome
+                    .progress
+                    .iter()
+                    .filter(|line| *line == RETRY_MESSAGE)
+                    .count(),
+                1
+            );
+            assert!(outcome.warnings.is_empty());
+            let saved = auth::get_login_credential(&credential_home, "default")
+                .unwrap()
+                .credential
+                .unwrap();
+            assert_eq!(saved.client_id, registered_client);
+            let profiles: Value = serde_json::from_slice(
+                &std::fs::read(credential_home.join(".kogen/profiles.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                profiles["chatgpt"]["default"]["client_id"],
+                registered_client
+            );
+        }
+
+        let profile_home = scratch_home();
+        std::fs::create_dir_all(profile_home.join(".kogen")).unwrap();
+        std::fs::write(
+            profile_home.join(".kogen/profiles.json"),
+            br#"{"chatgpt":{"default":{"client_id":"signed-out-profile-client","subject":"test-subject","signed_in":false}}}"#,
+        )
+        .unwrap();
+        let outcome = run_login(&profile_home, &server, None, "fresh-client-from-profile");
+        assert_eq!(outcome.authorization_clients, ["dynamic_agent_client"]);
+        assert!(!outcome.progress.iter().any(|line| line == RETRY_MESSAGE));
+        let saved = auth::get_login_credential(&profile_home, "default")
+            .unwrap()
+            .credential
+            .unwrap();
+        assert_eq!(saved.client_id, "fresh-client-from-profile");
+
+        std::fs::remove_dir_all(credential_home).unwrap();
+        std::fs::remove_dir_all(profile_home).unwrap();
+    }
+
+    struct LoginOutcome {
+        stdout: String,
+        progress: Vec<String>,
+        warnings: Vec<String>,
+        authorization_clients: Vec<String>,
+    }
+
+    fn run_login(
+        home: &Path,
+        server: &FakeAuthServer,
+        first_error: Option<&str>,
+        registered_client_id: &str,
+    ) -> LoginOutcome {
+        let mut progress_lines = Vec::new();
+        let mut warnings = Vec::new();
+        let mut authorization_clients = Vec::new();
+        let mut callback_workers = Vec::new();
+        let stdout = login_with_auth(
+            home,
+            |line| progress_lines.push(line.to_owned()),
+            |line| warnings.push(line.to_owned()),
+            |home, previous_client, progress| {
+                auth::login_owned_with_browser(
+                    home,
+                    previous_client,
+                    progress,
+                    Some(&server.base_url),
+                    0,
+                    |authorization_url| {
+                        let authorization = Url::parse(authorization_url).unwrap();
+                        let query: std::collections::HashMap<_, _> = authorization
+                            .query_pairs()
+                            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                            .collect();
+                        authorization_clients.push(query["client_id"].clone());
+                        *server.nonce.lock().unwrap() = Some(query["nonce"].clone());
+                        let callback_error = if authorization_clients.len() == 1 {
+                            first_error
+                        } else {
+                            None
+                        };
+                        callback_workers.push(send_callback(
+                            query["redirect_uri"].clone(),
+                            query["state"].clone(),
+                            callback_error.map(str::to_owned),
+                            registered_client_id.to_owned(),
+                        ));
+                        Ok(())
+                    },
+                )
+            },
+        )
+        .unwrap();
+        for worker in callback_workers {
+            worker.join().unwrap();
+        }
+        LoginOutcome {
+            stdout,
+            progress: progress_lines,
+            warnings,
+            authorization_clients,
+        }
+    }
+
+    fn send_callback(
+        redirect_uri: String,
+        state: String,
+        error: Option<String>,
+        registered_client_id: String,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let mut callback = Url::parse(&redirect_uri).unwrap();
+            {
+                let mut query = callback.query_pairs_mut();
+                query.append_pair("state", &state);
+                if let Some(error) = error {
+                    query.append_pair("error", &error);
+                } else {
+                    query.append_pair("code", "test-authorization-code");
+                    query.append_pair("client_id", &registered_client_id);
+                }
+            }
+            let target = format!("{}?{}", callback.path(), callback.query().unwrap());
+            let mut stream = TcpStream::connect(("127.0.0.1", callback.port().unwrap())).unwrap();
+            write!(
+                stream,
+                "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+        })
+    }
+
+    struct FakeAuthServer {
+        base_url: String,
+        nonce: Arc<Mutex<Option<String>>>,
+        stopped: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl FakeAuthServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let nonce = Arc::new(Mutex::new(None));
+            let server_nonce = Arc::clone(&nonce);
+            let stopped = Arc::new(AtomicBool::new(false));
+            let server_stopped = Arc::clone(&stopped);
+            let server_base = base_url.clone();
+            let worker = thread::spawn(move || {
+                while !server_stopped.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            handle_fake_auth_request(&mut stream, &server_base, &server_nonce);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                base_url,
+                nonce,
+                stopped,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for FakeAuthServer {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    fn handle_fake_auth_request(
+        stream: &mut TcpStream,
+        base_url: &str,
+        nonce: &Mutex<Option<String>>,
+    ) {
+        let (headers, body) = read_request(stream);
+        let path = headers
+            .lines()
+            .next()
+            .unwrap()
+            .split_ascii_whitespace()
+            .nth(1)
+            .unwrap();
+        let response = match path {
+            "/.well-known/openid-configuration" => json!({
+                "issuer": "https://auth.openai.com",
+                "authorization_endpoint": format!("{base_url}/authorize"),
+                "token_endpoint": format!("{base_url}/token"),
+                "jwks_uri": format!("{base_url}/jwks")
+            })
+            .to_string(),
+            "/token" => fake_token_response(&body, nonce),
+            "/jwks" => json!({
+                "keys": [{
+                    "kty": "RSA",
+                    "kid": "test-key",
+                    "alg": "RS256",
+                    "use": "sig",
+                    "n": TEST_PUBLIC_MODULUS,
+                    "e": "AQAB"
+                }]
+            })
+            .to_string(),
+            _ => "{}".to_owned(),
+        };
+        write_response(stream, &response);
+    }
+
+    fn fake_token_response(body: &[u8], nonce: &Mutex<Option<String>>) -> String {
+        let form: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(body).into_owned().collect();
+        let client_id = form.get("client_id").unwrap();
+        let nonce = nonce.lock().unwrap().clone().unwrap();
+        let claims = json!({
+            "iss": "https://auth.openai.com",
+            "aud": client_id,
+            "sub": "test-subject",
+            "email": "owner@example.test",
+            "exp": auth::now_seconds() + 3600,
+            "nonce": nonce,
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key".to_owned());
+        let id_token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        json!({
+            "access_token": "test-access-token",
+            "refresh_token": "test-refresh-token",
+            "id_token": id_token,
+            "expires_in": 3600,
+            "scope": "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+        })
+        .to_string()
+    }
+
+    fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut header_bytes = Vec::new();
+        while !header_bytes.ends_with(b"\r\n\r\n") {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            header_bytes.push(byte[0]);
+        }
+        let headers = String::from_utf8(header_bytes).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or_default();
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).unwrap();
+        (headers, body)
+    }
+
+    fn write_response(stream: &mut TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
+
+    fn scratch_home() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "kogen-chatgpt-login-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 }

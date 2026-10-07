@@ -12,17 +12,22 @@ use super::super::super::provider_error;
 pub(super) struct CallbackData {
     pub code: Option<String>,
     pub client_id: Option<String>,
+    pub error: bool,
 }
 
-pub(super) fn bind() -> Result<TcpListener, crate::error::CoreError> {
+pub(super) fn bind(port: u16) -> Result<(TcpListener, u16), crate::error::CoreError> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
         .map_err(|_| provider_error("login", "could not bind ChatGPT sign-in callback"))?;
     socket
         .set_reuse_address(true)
         .map_err(|_| provider_error("login", "could not configure ChatGPT sign-in callback"))?;
-    let address = SocketAddr::from(([127, 0, 0, 1], 1455));
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
     socket.bind(&address.into()).map_err(|_| {
-        provider_error("login", "ChatGPT sign-in callback port 1455 is unavailable")
+        if port == 1455 {
+            provider_error("login", "ChatGPT sign-in callback port 1455 is unavailable")
+        } else {
+            provider_error("login", "could not bind ChatGPT sign-in callback")
+        }
     })?;
     socket
         .listen(16)
@@ -30,7 +35,12 @@ pub(super) fn bind() -> Result<TcpListener, crate::error::CoreError> {
     socket
         .set_nonblocking(true)
         .map_err(|_| provider_error("login", "could not configure ChatGPT sign-in callback"))?;
-    Ok(socket.into())
+    let listener: TcpListener = socket.into();
+    let bound_port = listener
+        .local_addr()
+        .map_err(|_| provider_error("login", "could not configure ChatGPT sign-in callback"))?
+        .port();
+    Ok((listener, bound_port))
 }
 
 pub(super) fn wait(
@@ -42,6 +52,9 @@ pub(super) fn wait(
     while started.elapsed() < timeout {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|_| provider_error("login", "ChatGPT callback request was invalid"))?;
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let target = read_target(&mut stream)?;
                 if !target.starts_with("/auth/callback?") && target != "/auth/callback" {
@@ -66,12 +79,17 @@ pub(super) fn wait(
                 }
                 if query.contains_key("error") {
                     write_response(&mut stream, false);
-                    return Err(provider_error("login", "ChatGPT sign-in was declined"));
+                    return Ok(CallbackData {
+                        code: None,
+                        client_id: None,
+                        error: true,
+                    });
                 }
                 write_response(&mut stream, true);
                 return Ok(CallbackData {
                     code: query.get("code").cloned(),
                     client_id: query.get("client_id").cloned(),
+                    error: false,
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

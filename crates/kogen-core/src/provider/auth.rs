@@ -195,6 +195,31 @@ pub(crate) fn login_owned(
     ))
 }
 
+#[cfg(test)]
+pub(crate) fn login_owned_with_browser(
+    home: &Path,
+    previous_client_id: Option<&str>,
+    progress: impl FnMut(&str),
+    auth_url: Option<&str>,
+    callback_port: u16,
+    browser: impl FnMut(&str) -> Result<(), super::CoreError>,
+) -> Result<(Credential, String, Option<String>, Option<String>), super::CoreError> {
+    let result = oauth::login_with_browser(
+        home,
+        previous_client_id,
+        progress,
+        auth_url,
+        callback_port,
+        browser,
+    )?;
+    Ok((
+        result.credential,
+        result.identity.subject,
+        result.identity.email,
+        result.identity.plan_usage,
+    ))
+}
+
 pub(crate) fn revoke_owned(credential: &Credential) -> bool {
     oauth::revoke(credential)
 }
