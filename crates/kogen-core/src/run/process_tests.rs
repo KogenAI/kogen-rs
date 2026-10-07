@@ -12,10 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 fn chatty_child_times_out_and_keeps_bounded_tail() {
     let root = test_dir("chatty");
     let mut request = ProcessRequest::new("/bin/sh", &root, &root);
-    request.args = vec![
-        "-c".into(),
-        "while :; do printf '0123456789abcdef'; done".into(),
-    ];
+    request.args = vec!["-c".into(), "while :; do printf '%16385s' x; done".into()];
     request.timeout = Duration::from_millis(250);
     request.log_name = "chatty".to_owned();
 

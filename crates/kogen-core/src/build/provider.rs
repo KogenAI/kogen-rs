@@ -2,8 +2,9 @@ use super::approval::ApprovedBuild;
 use super::config::BuildOptions;
 use super::provider_error::provider_error;
 use super::provider_prompt::{
-    append_transcript, auditor_instructions, builder_instructions, builder_message, now_ms,
-    planner_instructions, user_item, workspace_changed, workspace_tree,
+    append_context_packet, append_transcript, auditor_instructions, builder_instructions,
+    builder_message, now_ms, planner_instructions, public_context_packet, user_item,
+    workspace_changed, workspace_tree,
 };
 use crate::error::CoreError;
 use crate::project::ProjectResolution;
@@ -417,6 +418,8 @@ impl<'a> BuildProvider<'a> {
         let mut session = if let Some(session) = existing {
             session
         } else {
+            let packet = public_context_packet(workspace, &self.approved.intent_bytes);
+            let initial_message = append_context_packet(first_message, &packet);
             let context = self.request_context(
                 run_dir,
                 "develop",
@@ -425,7 +428,7 @@ impl<'a> BuildProvider<'a> {
                 model,
                 effort,
                 builder_instructions(recipe_direct),
-                vec![user_item(first_message)],
+                vec![user_item(&initial_message)],
                 callable.iter().map(|name| (*name).to_owned()).collect(),
                 true,
             )?;
