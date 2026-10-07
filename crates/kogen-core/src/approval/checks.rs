@@ -2,6 +2,7 @@ use super::model::{BaselineCache, BaselineRow, Finding};
 mod acceptance;
 mod cache;
 
+use crate::gate::is_test_rule;
 use crate::git::GitRepo;
 use crate::project::ProjectResolution;
 use crate::run::setup_cache::{SetupCacheKey, SetupCacheRequest, run_setup as run_cached_setup};
@@ -238,7 +239,11 @@ fn parse_finding(line: &str) -> Option<Finding> {
         .or_else(|| rest.strip_prefix("note: "))?;
     let rest = rest.strip_prefix('[')?;
     let (rule, rest) = rest.split_once("] ")?;
-    let (symbol, message) = rest.split_once(": ").unwrap_or(("", rest));
+    let (symbol, message) = if is_test_rule(rule) {
+        rest.split_once(": ").unwrap_or(("", rest))
+    } else {
+        ("", rest)
+    };
     Some(Finding {
         path: path.to_owned(),
         rule: rule.to_owned(),
@@ -365,5 +370,23 @@ fn safe_log_name(name: &str) -> String {
         "approval".to_owned()
     } else {
         sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_finding;
+
+    #[test]
+    fn approval_baselines_only_extract_symbols_for_test_failures() {
+        let lint = parse_finding("lib/old.txt:2:1: error: [lint/todo] old.txt: TODO found")
+            .expect("parse lint finding");
+        assert_eq!(lint.symbol, "");
+        assert_eq!(lint.message, "old.txt: TODO found");
+
+        let test = parse_finding("test/unit/greet.t.sh:1:1: error: [kt/test] alpha: failed")
+            .expect("parse kt test finding");
+        assert_eq!(test.symbol, "alpha");
+        assert_eq!(test.message, "failed");
     }
 }

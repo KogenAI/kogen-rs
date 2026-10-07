@@ -11,12 +11,14 @@ fn matching_base_red_findings_are_excused_but_new_identities_are_not() {
     };
     let same = CheckResult {
         name: "lint".to_owned(),
+        program: "lint".to_owned(),
         status: CheckStatus::Red,
         exit_status: Some(1),
         findings: vec![finding("lib/a.rs", "lint/todo", "", "changed text", 9)],
         changed_paths: Vec::new(),
         log_path: PathBuf::new(),
         duration_ms: 1,
+        timeout: Duration::from_secs(1),
         excused: false,
     };
     assert!(is_excused(&baseline, &same));
@@ -70,6 +72,14 @@ fn gnu_finding_identity_ignores_position_and_message() {
     assert_eq!(parsed.column, Some(8));
     assert_eq!(parsed.symbol, "test says hello");
     assert_eq!(parsed.message, "assertion failed");
+}
+
+#[test]
+fn kt_test_findings_keep_the_test_symbol_in_the_identity() {
+    let parsed =
+        parse_gnu_finding("test/unit/greet.t.sh:1:1: error: [kt/test] alpha: failed").unwrap();
+    assert_eq!(parsed.symbol, "alpha");
+    assert_eq!(parsed.message, "failed");
 }
 
 struct EditingRunner;

@@ -58,6 +58,16 @@ fn forced_unavailable_records_warning_and_integrity_check() {
 }
 
 #[test]
+fn sandbox_exec_missing_target_is_normalized_to_unavailable_127() {
+    assert!(sandbox_exec_target_missing(
+        b"sandbox-exec: execvp() of 'missing-check' failed: No such file or directory\n"
+    ));
+    assert!(!sandbox_exec_target_missing(
+        b"check: No such file or directory\n"
+    ));
+}
+
+#[test]
 fn unconfined_result_exposes_warning_reason() {
     let root = test_dir("warning");
     let runner = FixedRunner(AtomicUsize::new(0));

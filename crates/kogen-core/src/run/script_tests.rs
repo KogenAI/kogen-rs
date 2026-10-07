@@ -61,3 +61,15 @@ fn large_shell_source_is_transported_through_mode_0600_file() {
     assert!(observed.stdin_is_null);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn shell_tool_deadline_scales_for_conformance_runs() {
+    assert_eq!(
+        scale_duration(DEFAULT_SHELL_TIMEOUT, 0.01),
+        Duration::from_millis(1_200)
+    );
+    assert_eq!(
+        scale_duration(DEFAULT_SHELL_TIMEOUT, 1.0),
+        DEFAULT_SHELL_TIMEOUT
+    );
+}

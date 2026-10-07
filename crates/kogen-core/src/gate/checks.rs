@@ -133,12 +133,14 @@ pub struct CheckBaseline {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckResult {
     pub name: String,
+    pub program: String,
     pub status: CheckStatus,
     pub exit_status: Option<i32>,
     pub findings: Vec<CheckFinding>,
     pub changed_paths: Vec<String>,
     pub log_path: PathBuf,
     pub duration_ms: u64,
+    pub timeout: Duration,
     pub excused: bool,
 }
 
@@ -283,12 +285,18 @@ pub(crate) fn check_result(
     };
     CheckResult {
         name: command.name.clone(),
+        program: command
+            .argv
+            .first()
+            .map(|program| program.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         status,
         exit_status: process.exit_status,
         findings,
         changed_paths,
         log_path: process.log_path,
         duration_ms: process.duration_ms,
+        timeout: command.timeout,
         excused: false,
     }
 }
@@ -353,10 +361,10 @@ fn parse_gnu_finding(line: &str) -> Option<CheckFinding> {
     })
 }
 
-fn is_test_rule(rule: &str) -> bool {
+pub(crate) fn is_test_rule(rule: &str) -> bool {
     matches!(
         rule.split('/').next().unwrap_or_default(),
-        "test" | "exunit" | "minitest" | "rails" | "acceptance"
+        "test" | "kt" | "exunit" | "minitest" | "rails" | "acceptance"
     )
 }
 

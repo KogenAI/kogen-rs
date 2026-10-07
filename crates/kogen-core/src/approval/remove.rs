@@ -155,8 +155,12 @@ fn active_build_for_slug(
     let Ok(run) = serde_json::from_slice::<Value>(&bytes) else {
         return Ok(false);
     };
-    Ok(run.get("slug").and_then(Value::as_str) == Some(slug)
-        && run.get("status").and_then(Value::as_str) == Some("building"))
+    Ok(claim_matches_active_run(&run, slug))
+}
+
+fn claim_matches_active_run(run: &Value, slug: &str) -> bool {
+    run.get("slug").and_then(Value::as_str) == Some(slug)
+        && run.get("status").and_then(Value::as_str) == Some("running")
 }
 
 fn build_state(project: &ProjectResolution, slug: &str) -> Option<String> {
@@ -245,4 +249,26 @@ fn git_error(reason: &str, error: GitError) -> crate::error::CoreError {
 #[allow(dead_code)]
 fn _path_buf(path: &str) -> PathBuf {
     PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claim_matches_active_run;
+    use serde_json::json;
+
+    #[test]
+    fn claim_blocks_removal_while_the_run_snapshot_is_running() {
+        assert!(claim_matches_active_run(
+            &json!({"slug":"greet","status":"running"}),
+            "greet"
+        ));
+        assert!(!claim_matches_active_run(
+            &json!({"slug":"greet","status":"landed"}),
+            "greet"
+        ));
+        assert!(!claim_matches_active_run(
+            &json!({"slug":"farewell","status":"running"}),
+            "greet"
+        ));
+    }
 }

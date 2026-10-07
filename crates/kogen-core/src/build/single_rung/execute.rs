@@ -89,7 +89,10 @@ fn landing_stderr(sandbox_warning: &str, warnings: &[String]) -> String {
 }
 
 fn gate_end_reason(report: &crate::gate::GateReport, develop_reason: &str) -> String {
-    if matches!(develop_reason, "turn_cap" | "budget") {
+    if matches!(
+        develop_reason,
+        "turn_cap" | "budget" | "protected_restore_limit"
+    ) {
         develop_reason.to_owned()
     } else if report.is_landable() {
         "green".to_owned()
@@ -609,7 +612,11 @@ fn run_rung(
     let mut current_rung = "R1".to_owned();
     let mut rung_reason = gate_end_reason(&report, &develop.reason);
     let mut previous_red_count = None;
-    while !report.is_landable() && repairs < 6 && rung_reason != "budget" {
+    while !report.is_landable()
+        && repairs < 6
+        && rung_reason != "budget"
+        && rung_reason != "protected_restore_limit"
+    {
         let count = red_count(&report, &demoted);
         if previous_red_count.is_some_and(|previous| count >= previous) {
             rung_reason = "no_progress".to_owned();
@@ -674,6 +681,10 @@ fn run_rung(
         )?;
         if repaired.reason == "turn_cap" {
             rung_reason = "turn_cap".to_owned();
+            break;
+        }
+        if repaired.reason == "protected_restore_limit" {
+            rung_reason = "protected_restore_limit".to_owned();
             break;
         }
         if repaired.reason == "budget" {
@@ -884,7 +895,11 @@ fn run_rung(
         }
         repairs = 0;
         previous_red_count = None;
-        while !report.is_landable() && repairs < 6 && rung_reason != "budget" {
+        while !report.is_landable()
+            && repairs < 6
+            && rung_reason != "budget"
+            && rung_reason != "protected_restore_limit"
+        {
             let count = red_count(&report, &demoted);
             if previous_red_count.is_some_and(|previous| count >= previous) {
                 rung_reason = "no_progress".to_owned();
@@ -948,6 +963,10 @@ fn run_rung(
             )?;
             if repaired.reason == "turn_cap" {
                 rung_reason = "turn_cap".to_owned();
+                break;
+            }
+            if repaired.reason == "protected_restore_limit" {
+                rung_reason = "protected_restore_limit".to_owned();
                 break;
             }
             if repaired.reason == "budget" {
@@ -1164,7 +1183,11 @@ fn run_rung(
             }
             repairs = 0;
             previous_red_count = None;
-            while !report.is_landable() && repairs < 6 && rung_reason != "budget" {
+            while !report.is_landable()
+                && repairs < 6
+                && rung_reason != "budget"
+                && rung_reason != "protected_restore_limit"
+            {
                 let count = red_count(&report, &demoted);
                 if previous_red_count.is_some_and(|previous| count >= previous) {
                     rung_reason = "no_progress".to_owned();
@@ -1228,6 +1251,10 @@ fn run_rung(
                 )?;
                 if repaired.reason == "turn_cap" {
                     rung_reason = "turn_cap".to_owned();
+                    break;
+                }
+                if repaired.reason == "protected_restore_limit" {
+                    rung_reason = "protected_restore_limit".to_owned();
                     break;
                 }
                 if repaired.reason == "budget" {
@@ -1336,21 +1363,6 @@ fn run_rung(
     record(
         store,
         snapshot,
-        RunEvent::new("verification", now_ms())
-            .with("rung", json!(current_rung))
-            .with("tree", json!(tree.clone()))
-            .with(
-                "result",
-                json!(if report.is_landable() { "green" } else { "red" }),
-            )
-            .with("checks", checks_json(&report))
-            .with("acceptance", acceptance_json(&report, &demoted))
-            .with("count", json!(support::gate_failure_count(&report)))
-            .with("blocking_count", json!(red_count(&report, &demoted))),
-    )?;
-    record(
-        store,
-        snapshot,
         RunEvent::new("rung_finished", now_ms())
             .with("rung", json!(current_rung))
             .with("reason", json!(rung_reason.clone()))
@@ -1370,6 +1382,13 @@ fn run_rung(
             .with("tool_calls", json!(develop.tool_outputs.len()))
             .with("model_stages", json!(develop.model_stages)),
     )?;
+    if landable {
+        record(
+            store,
+            snapshot,
+            commit_result_event(&candidate_commit.commit, &tree),
+        )?;
+    }
     if !landable {
         let winner = best_candidate(&candidates)
             .expect("at least the final rung has a candidate")
@@ -1708,11 +1727,7 @@ pub(super) fn run_witness_build(
         .map_err(|error| environment_error("witness_publish_failed", error.to_string()))?;
     provider.record_event(
         snapshot,
-        &RunEvent::new("commit_result", now_ms())
-            .with("rung", json!("R1"))
-            .with("candidate_commit", json!(witness_commit.commit))
-            .with("tree", json!(tree))
-            .with("verdict", json!("green")),
+        &commit_result_event(&witness_commit.commit, &tree),
     )?;
     drop(provider);
     cleanup_path(base.workspace());
@@ -1935,11 +1950,7 @@ fn try_witness(
     )?;
     provider.record_event(
         snapshot,
-        &RunEvent::new("commit_result", now_ms())
-            .with("rung", json!("witness"))
-            .with("candidate_commit", json!(candidate_commit.commit.clone()))
-            .with("tree", json!(tree.clone()))
-            .with("verdict", json!("green")),
+        &commit_result_event(&candidate_commit.commit, &tree),
     )?;
     cleanup_path(base.workspace());
     Ok(Some(WitnessCandidate {

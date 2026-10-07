@@ -25,6 +25,7 @@ pub(super) struct BuildProvider<'a> {
     store: &'a RunStore,
     builder_session: Option<BuilderSession>,
     rung_sessions: BTreeMap<String, BuilderSession>,
+    shared_tools: Vec<Value>,
     usage_paused_ms: u64,
     build_started: Instant,
     home: std::path::PathBuf,
@@ -37,8 +38,15 @@ struct BuilderSession {
     context: RequestContext,
     turns: u32,
     empty_finish_count: u8,
+    protected_restores: u8,
     budget_note_added: bool,
     recipe_direct: bool,
+}
+
+const PROTECTED_RESTORE_LIMIT: u8 = 4;
+
+fn protected_restore_limit_reached(restores: u8) -> bool {
+    restores >= PROTECTED_RESTORE_LIMIT
 }
 
 impl<'a> BuildProvider<'a> {
@@ -65,6 +73,11 @@ impl<'a> BuildProvider<'a> {
             std::env::var("KOGEN_BENCH_ACCOUNT").ok().as_deref(),
             std::env::var_os("KOGEN_AUTH_PATH").is_some(),
         )?;
+        let tool_role = if matches!(options.recipe.as_str(), "direct" | "direct-escalate") {
+            crate::provider::tools::ToolRole::BuilderDirect
+        } else {
+            crate::provider::tools::ToolRole::BuilderShell
+        };
         let http = crate::provider::http::ReqwestPort::new()
             .map_err(|failure| provider_error(failure.kind, failure.message))?;
         Ok(Self {
@@ -79,6 +92,7 @@ impl<'a> BuildProvider<'a> {
             account,
             http,
             clock: SystemClock::default(),
+            shared_tools: shared_build_tool_schemas(tool_role),
         })
     }
 
@@ -115,12 +129,23 @@ impl<'a> BuildProvider<'a> {
             planner_instructions(),
             vec![user_item(&input)],
             Vec::new(),
-            Vec::new(),
             false,
         )?;
-        let before = Instant::now();
-        let call = self.call(snapshot, &mut context, "planner", "plan", None)?;
-        let elapsed = before.elapsed().as_millis() as u64;
+        let (call, elapsed) = loop {
+            let before = Instant::now();
+            match self.call(snapshot, &mut context, "planner", "plan", None) {
+                Ok(call) => break (call, before.elapsed().as_millis() as u64),
+                Err(error)
+                    if error.class == crate::error::ErrorClass::Provider
+                        && matches!(error.reason.as_str(), "usage_limit" | "login")
+                        && self.usage_paused_ms < 86_400_000 =>
+                {
+                    self.usage_paused_ms =
+                        self.usage_paused_ms.saturating_add(self.scaled_ms(300_000));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let difficulty = call
             .response
             .text
@@ -136,7 +161,17 @@ impl<'a> BuildProvider<'a> {
                 .with("difficulty", json!(difficulty))
                 .with("wall_ms", json!(elapsed)),
         )?;
-        self.record_call(snapshot, "plan", "", &call, elapsed)?;
+        self.record_call(
+            snapshot,
+            "plan",
+            "",
+            &call,
+            elapsed,
+            super::provider_journal::RequestIdentity {
+                cache_key: &context.cache_key,
+                thread_id: &context.thread_id,
+            },
+        )?;
         append_transcript(
             self.store,
             json!({
@@ -167,7 +202,6 @@ impl<'a> BuildProvider<'a> {
             auditor_instructions(),
             vec![user_item(&request.user_message())],
             Vec::new(),
-            Vec::new(),
             false,
         )?;
         context.tool_choice = "none".to_owned();
@@ -180,7 +214,17 @@ impl<'a> BuildProvider<'a> {
             Some(self.options.wall_ms),
         )?;
         let elapsed = before.elapsed().as_millis() as u64;
-        self.record_call(snapshot, "audit", rung, &call, elapsed)?;
+        self.record_call(
+            snapshot,
+            "audit",
+            rung,
+            &call,
+            elapsed,
+            super::provider_journal::RequestIdentity {
+                cache_key: &context.cache_key,
+                thread_id: &context.thread_id,
+            },
+        )?;
         append_transcript(
             self.store,
             json!({
@@ -297,15 +341,6 @@ impl<'a> BuildProvider<'a> {
             crate::provider::tools::ToolRole::BuilderShell
         };
         let callable = role.allowed();
-        let schemas = crate::provider::tools::canonical_tool_schemas()
-            .into_iter()
-            .filter(|schema| {
-                schema
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| callable.contains(&name))
-            })
-            .collect();
         let existing = if rung == "R1" {
             self.builder_session.take()
         } else {
@@ -323,7 +358,6 @@ impl<'a> BuildProvider<'a> {
                 effort,
                 builder_instructions(recipe_direct),
                 vec![user_item(first_message)],
-                schemas,
                 callable.iter().map(|name| (*name).to_owned()).collect(),
                 true,
             )?;
@@ -331,6 +365,7 @@ impl<'a> BuildProvider<'a> {
                 context,
                 turns: 0,
                 empty_finish_count: 0,
+                protected_restores: 0,
                 budget_note_added: false,
                 recipe_direct,
             }
@@ -484,6 +519,10 @@ impl<'a> BuildProvider<'a> {
                 rung,
                 &call,
                 before.elapsed().as_millis() as u64,
+                super::provider_journal::RequestIdentity {
+                    cache_key: &session.context.cache_key,
+                    thread_id: &session.context.thread_id,
+                },
             )?;
             append_transcript(
                 self.store,
@@ -535,6 +574,7 @@ impl<'a> BuildProvider<'a> {
             }
             let calls = call.response.tool_calls.clone();
             let mut outputs = Vec::with_capacity(calls.len());
+            let mut restoration_notes = Vec::new();
             let mut finish = false;
             for tool_call in &calls {
                 if tool_call.name == "finish" {
@@ -574,24 +614,42 @@ impl<'a> BuildProvider<'a> {
                 outputs.push(output);
                 let restored = protected.restore_after_batch(workspace).unwrap_or_default();
                 for path in restored {
+                    session.protected_restores = session.protected_restores.saturating_add(1);
                     self.record(
                         snapshot,
                         &RunEvent::new("protected_restored", now_ms())
                             .with("rung", json!(rung))
                             .with("path", json!(path)),
                     )?;
-                    outputs.push(format!("You changed {path}; acceptance tests and the Intent are read-only and have been restored. Make the implementation satisfy them."));
+                    restoration_notes.push(format!("You changed {path}; acceptance tests and the Intent are read-only and have been restored. Make the implementation satisfy them."));
                 }
             }
+            session.context.input = append_tool_batch_history(
+                std::mem::take(&mut session.context.input),
+                call.response.raw_items.clone(),
+                &calls,
+                &outputs,
+                &restoration_notes,
+            );
             let mut history = ConversationHistory::new(std::mem::take(&mut session.context.input));
-            history.append_all(call.response.raw_items.clone());
-            history.append_tool_results(&calls, &outputs);
             super::provider_prompt::append_turn_budget_note(
                 &mut history,
                 session.turns,
                 &mut session.budget_note_added,
             );
             session.context.input = history.items().to_vec();
+            if protected_restore_limit_reached(session.protected_restores) {
+                return self.develop_result(
+                    session,
+                    workspace,
+                    baseline_tree,
+                    progress_baseline,
+                    excluded_paths,
+                    "protected_restore_limit",
+                    outputs,
+                    session.turns,
+                );
+            }
             if finish {
                 return self.develop_result(
                     session,
@@ -643,7 +701,6 @@ impl<'a> BuildProvider<'a> {
         effort: &str,
         instructions: String,
         input: Vec<Value>,
-        tools: Vec<Value>,
         callable_tools: Vec<String>,
         development: bool,
     ) -> Result<RequestContext, CoreError> {
@@ -655,8 +712,7 @@ impl<'a> BuildProvider<'a> {
                 .map_err(|error| {
                     super::environment_error("conversation_identity_failed", error.to_string())
                 })?;
-        context.tools = tools;
-        context.callable_tools = callable_tools;
+        configure_build_tools(&mut context, &self.shared_tools, callable_tools);
         context.tool_choice = "auto".to_owned();
         context.development_request = development;
         context.generation_tokens = if development {
@@ -752,12 +808,144 @@ impl<'a> BuildProvider<'a> {
         rung: &str,
         call: &ProviderCall,
         wall_ms: u64,
+        identity: super::provider_journal::RequestIdentity<'_>,
     ) -> Result<(), CoreError> {
-        super::provider_journal::record_call(self.store, snapshot, stage, rung, call, wall_ms)
+        super::provider_journal::record_call(
+            self.store, snapshot, stage, rung, call, wall_ms, identity,
+        )
     }
 
     fn record(&mut self, snapshot: &mut RunSnapshot, event: &RunEvent) -> Result<(), CoreError> {
         super::provider_journal::record_event(self.store, snapshot, event)
+    }
+}
+
+fn append_tool_batch_history(
+    existing: Vec<Value>,
+    raw_items: Vec<Value>,
+    calls: &[crate::provider::ModelToolCall],
+    outputs: &[String],
+    restoration_notes: &[String],
+) -> Vec<Value> {
+    let mut history = ConversationHistory::new(existing);
+    history.append_all(raw_items);
+    history.append_tool_results(calls, outputs);
+    for note in restoration_notes {
+        history.append_user(note.clone());
+    }
+    history.items().to_vec()
+}
+
+fn shared_build_tool_schemas(role: crate::provider::tools::ToolRole) -> Vec<Value> {
+    let callable = role.allowed();
+    crate::provider::tools::canonical_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            schema
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| callable.contains(&name))
+        })
+        .collect()
+}
+
+fn configure_build_tools(
+    context: &mut RequestContext,
+    shared_tools: &[Value],
+    callable_tools: Vec<String>,
+) {
+    context.tools = shared_tools.to_vec();
+    context.callable_tools = callable_tools;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        append_tool_batch_history, configure_build_tools, protected_restore_limit_reached,
+        shared_build_tool_schemas,
+    };
+    use crate::provider::auth::{InjectedCredential, RequestCredential};
+    use crate::provider::http::{RequestContext, ResponseMode, WireConfig, build_wire_request};
+    use crate::provider::session::ConversationBinding;
+    use serde_json::{Value, json};
+    use url::Url;
+
+    #[test]
+    fn restored_protected_paths_are_appended_after_tool_results() {
+        let history = append_tool_batch_history(
+            vec![json!({"role":"user","content":[{"type":"input_text","text":"original"}]})],
+            vec![json!({"type":"function_call","call_id":"call-1"})],
+            &[crate::provider::ModelToolCall {
+                id: "item-1".to_owned(),
+                name: "shell".to_owned(),
+                arguments: json!({"cmd":"edit"}),
+            }],
+            &["exit 0".to_owned()],
+            &["You changed test/acceptance/greet.t.sh; acceptance tests and the Intent are read-only and have been restored. Make the implementation satisfy them.".to_owned()],
+        );
+
+        assert_eq!(history[2]["type"], "function_call_output");
+        assert_eq!(history[2]["output"], "exit 0");
+        assert_eq!(history[3]["role"], "user");
+        assert!(
+            history[3]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("test/acceptance/greet.t.sh")
+        );
+    }
+
+    #[test]
+    fn fourth_protected_restore_ends_the_rung() {
+        assert!(!protected_restore_limit_reached(3));
+        assert!(protected_restore_limit_reached(4));
+    }
+
+    #[test]
+    fn toolless_build_requests_keep_the_canonical_schemas_and_disable_calls() {
+        let root = std::env::temp_dir().join(format!(
+            "kogen-build-tools-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).expect("create conversation root");
+        let binding = ConversationBinding::new(&root, "audit");
+        let mut context = RequestContext::for_conversation(
+            &binding,
+            "gpt-6.1-sol",
+            "high",
+            "instructions",
+            vec![json!({"role":"user","content":[{"type":"input_text","text":"audit"}]})],
+        )
+        .expect("create request context");
+        let expected = shared_build_tool_schemas(crate::provider::tools::ToolRole::BuilderShell);
+        configure_build_tools(&mut context, &expected, Vec::new());
+
+        let auth = RequestCredential::Injected(InjectedCredential {
+            access_token: "fake-token".to_owned(),
+            account_id: "fake-account".to_owned(),
+            expires_at: i64::MAX,
+        });
+        let config = WireConfig {
+            endpoint_override: Some(Url::parse("https://example.invalid/v1/responses").unwrap()),
+            mode: ResponseMode::Injected,
+            supports_generation_cap: false,
+            user_agent_version: "test".to_owned(),
+        };
+        context.tool_choice = "none".to_owned();
+        let wire = build_wire_request(&context, &auth, &config).expect("encode request");
+        let body: Value = serde_json::from_slice(&wire.body).expect("parse request body");
+        let expected_names = expected
+            .iter()
+            .filter_map(|schema| schema.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(context.tools, expected);
+        assert!(context.callable_tools.is_empty());
+        assert_eq!(body["tool_choice"], "none");
+        assert_eq!(body["tools"], json!(expected));
+        assert_eq!(expected_names, ["finish", "shell", "tool_output"]);
+        std::fs::remove_dir_all(root).expect("remove conversation root");
     }
 }
 

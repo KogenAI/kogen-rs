@@ -161,15 +161,23 @@ pub(super) fn baseline_warning_lines(rows: &[super::model::BaselineRow]) -> Vec<
     let mut lines = Vec::new();
     for row in rows.iter().filter(|row| row.status == "red") {
         for finding in row.findings.iter().take(5) {
-            lines.push(format!(
-                "  - {}: [{}] {}:{}: {}: {}",
-                row.name,
-                finding.rule,
-                finding.path,
-                finding.line.unwrap_or_default(),
-                finding.symbol,
-                finding.message,
-            ));
+            let detail = if finding.symbol.is_empty() {
+                format!(
+                    "{}:{}: {}",
+                    finding.path,
+                    finding.line.unwrap_or_default(),
+                    finding.message
+                )
+            } else {
+                format!(
+                    "{}:{}: {}: {}",
+                    finding.path,
+                    finding.line.unwrap_or_default(),
+                    finding.symbol,
+                    finding.message
+                )
+            };
+            lines.push(format!("  - {}: [{}] {detail}", row.name, finding.rule));
         }
     }
     lines
@@ -359,4 +367,31 @@ fn match_class(pattern: &[u8], path: &[u8]) -> bool {
         }
     }
     included && glob_bytes(&pattern[end + 1..], &path[1..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::baseline_warning_lines;
+    use crate::approval::model::{BaselineRow, Finding};
+
+    #[test]
+    fn baseline_warning_omits_the_empty_symbol_separator() {
+        let rows = [BaselineRow {
+            name: "lint".to_owned(),
+            status: "red".to_owned(),
+            exit_status: Some(1),
+            findings: vec![Finding {
+                path: "lib/greet.txt".to_owned(),
+                rule: "lint/todo".to_owned(),
+                symbol: String::new(),
+                message: "greet.txt: TODO found".to_owned(),
+                line: Some(2),
+            }],
+        }];
+
+        assert_eq!(
+            baseline_warning_lines(&rows),
+            ["  - lint: [lint/todo] lib/greet.txt:2: greet.txt: TODO found"]
+        );
+    }
 }

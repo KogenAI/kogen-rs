@@ -57,7 +57,7 @@ pub fn run_private_script(
         let mut request = ProcessRequest::new("sh", cwd.as_ref(), run_dir);
         request.args.push(script_path.as_os_str().to_owned());
         request.env = env;
-        request.timeout = DEFAULT_SHELL_TIMEOUT;
+        request.timeout = scaled_shell_timeout();
         request.stdin = StdinSource::Null;
         request.log_name = "shell".to_owned();
         let result = runner.run(request).map_err(ScriptError::Process);
@@ -69,6 +69,24 @@ pub fn run_private_script(
         }
         result
     }
+}
+
+fn scaled_shell_timeout() -> Duration {
+    let scale = std::env::var("KOGEN_TIME_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    scale_duration(DEFAULT_SHELL_TIMEOUT, scale)
+}
+
+fn scale_duration(duration: Duration, scale: f64) -> Duration {
+    Duration::from_millis(
+        (duration.as_millis() as f64 * scale)
+            .floor()
+            .max(1.0)
+            .min(u64::MAX as f64) as u64,
+    )
 }
 
 #[cfg(unix)]

@@ -171,6 +171,7 @@ impl<'a> SandboxedProcessPort<'a> {
 impl ProcessPort for SandboxedProcessPort<'_> {
     fn run(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
         let prepared = platform::prepare(request, &self.policy)?;
+        let sandbox_exec_wrapper = prepared.request.program == OsStr::new("/usr/bin/sandbox-exec");
         let before = if prepared.observation.status != SandboxStatus::Confined
             && self.policy.verify_integrity
         {
@@ -202,12 +203,23 @@ impl ProcessPort for SandboxedProcessPort<'_> {
         cleanup(&prepared.cleanup_paths);
         let after = after?;
         let mut result = result?;
+        if sandbox_exec_wrapper && sandbox_exec_target_missing(&result.output_tail) {
+            result.exit_status = Some(127);
+            result.unavailable = true;
+        }
         if before.as_ref() != after.as_ref() {
             return Err(ProcessError::SandboxIntegrityChanged);
         }
         result.sandbox = Some(prepared.observation);
         Ok(result)
     }
+}
+
+fn sandbox_exec_target_missing(output: &[u8]) -> bool {
+    String::from_utf8_lossy(output).lines().any(|line| {
+        line.starts_with("sandbox-exec: execvp() of '")
+            && line.ends_with(": No such file or directory")
+    })
 }
 
 pub(super) struct PreparedSandbox {

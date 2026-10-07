@@ -23,7 +23,7 @@ pub(in crate::handlers::status) fn render_detail(
                 .map_or(0, |n| n + 1);
             format!("queued, {position} of {}", report.board.queue.len())
         }
-        StatusKind::Building => building_detail(intent, report),
+        StatusKind::Building => format!("building, {}", building_detail(intent, report)),
         StatusKind::Blocked => intent
             .wait_reason
             .clone()
@@ -250,11 +250,50 @@ pub(super) fn short_id(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::display_ids;
+    use super::{display_ids, render_detail};
+    use kogen_core::project::ProjectResolution;
+    use kogen_core::status::{IntentFacts, IntentStatus, StatusKind, StatusReport, StatusRun};
 
     #[test]
     fn empty_acceptance_progress_lists_render_a_dash() {
         assert_eq!(display_ids(&[]), "-");
         assert_eq!(display_ids(&["A1", "A2"]), "A1, A2");
+    }
+
+    #[test]
+    fn building_slug_status_includes_the_required_prefix() {
+        let intent = IntentStatus {
+            facts: IntentFacts {
+                slug: "greet".to_owned(),
+                latest_run: Some(StatusRun {
+                    run_id: "12345678abcdef".to_owned(),
+                    status: "running".to_owned(),
+                    started_ms: 1_000,
+                    ..StatusRun::default()
+                }),
+                ..IntentFacts::default()
+            },
+            kind: StatusKind::Building,
+            wait_reason: None,
+        };
+        let report = StatusReport {
+            board: Default::default(),
+            agents: Vec::new(),
+            queue_pid: None,
+            now_ms: 1_000,
+        };
+        let project = ProjectResolution {
+            checkout: std::env::temp_dir(),
+            origin: std::env::temp_dir(),
+            base: "main".to_owned(),
+            state_root: std::env::temp_dir(),
+            config: None,
+        };
+
+        let output = render_detail(&intent, &report, &project);
+        assert!(
+            output.starts_with("greet: building, starting, 0s (Build 12345678)\n"),
+            "{output:?}"
+        );
     }
 }

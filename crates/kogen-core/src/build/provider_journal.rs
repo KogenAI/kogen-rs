@@ -46,6 +46,12 @@ pub(super) fn record_provider_events(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct RequestIdentity<'a> {
+    pub(super) cache_key: &'a str,
+    pub(super) thread_id: &'a str,
+}
+
 pub(super) fn record_call(
     store: &RunStore,
     snapshot: &mut RunSnapshot,
@@ -53,12 +59,11 @@ pub(super) fn record_call(
     rung: &str,
     call: &ProviderCall,
     wall_ms: u64,
+    identity: RequestIdentity<'_>,
 ) -> Result<(), CoreError> {
     record_provider_events(store, snapshot, stage, &call.events)?;
-    let body = call
-        .attempts
-        .last()
-        .and_then(|wire| serde_json::from_slice::<Value>(&wire.body).ok());
+    let wire = call.attempts.last();
+    let body = wire.and_then(|wire| serde_json::from_slice::<Value>(&wire.body).ok());
     let model = body
         .as_ref()
         .and_then(|body| body.get("model"))
@@ -69,6 +74,12 @@ pub(super) fn record_call(
         .and_then(|body| body.pointer("/reasoning/effort"))
         .cloned()
         .unwrap_or(Value::Null);
+    let prompt_cache_key = body
+        .as_ref()
+        .and_then(|body| body.get("prompt_cache_key"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let thread_id = json!(identity.thread_id);
     let event = RunEvent::new("model_stage", now_ms())
         .with("stage", json!(stage))
         .with("rung", json!(rung))
@@ -76,11 +87,10 @@ pub(super) fn record_call(
         .with("effort", effort)
         .with("tokens", usage_value(&call.response.usage))
         .with("wall_ms", json!(wall_ms))
-        .with(
-            "prompt_cache_key",
-            body.and_then(|body| body.get("prompt_cache_key").cloned())
-                .unwrap_or(Value::Null),
-        );
+        .with("prompt_cache_key", prompt_cache_key.clone())
+        .with("cache_key", json!(identity.cache_key))
+        .with("thread_id", thread_id.clone())
+        .with("conversation_id", thread_id);
     record(store, snapshot, &event)
 }
 
@@ -96,4 +106,81 @@ fn record(store: &RunStore, snapshot: &mut RunSnapshot, event: &RunEvent) -> Res
     store
         .record(event, snapshot)
         .map_err(|error| controller_error("run_journal_failed", error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_call;
+    use crate::provider::http::{ProviderCall, ResponseMode, WireRequest};
+    use crate::provider::{ModelResponse, ModelUsage};
+    use crate::run::{RunSnapshot, RunStore};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use url::Url;
+
+    #[test]
+    fn model_stage_journal_records_cache_and_conversation_identity() {
+        let directory = std::env::temp_dir().join(format!(
+            "kogen-provider-journal-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let store = RunStore::new(&directory);
+        let mut snapshot = RunSnapshot {
+            schema: 1,
+            run_id: "run".to_owned(),
+            slug: "greet".to_owned(),
+            approval_sha256: String::new(),
+            approval_commit: String::new(),
+            target_branch: "main".to_owned(),
+            status: "running".to_owned(),
+            landing: None,
+            owner_pid: std::process::id(),
+            owner_started_ms: 0,
+            started_ms: 0,
+            fields: BTreeMap::new(),
+        };
+        let call = ProviderCall {
+            response: ModelResponse {
+                id: "response".to_owned(),
+                text: String::new(),
+                tool_calls: Vec::new(),
+                usage: ModelUsage::default(),
+                raw_items: Vec::new(),
+            },
+            events: Vec::new(),
+            attempts: vec![WireRequest {
+                endpoint: Url::parse("https://example.invalid/responses").unwrap(),
+                mode: ResponseMode::Injected,
+                headers: vec![("thread-id".to_owned(), "thread-123".to_owned())],
+                body: serde_json::to_vec(&json!({
+                    "model": "gpt-6.1-sol",
+                    "reasoning": {"effort": "high"},
+                    "prompt_cache_key": "cache-456"
+                }))
+                .unwrap(),
+            }],
+        };
+
+        record_call(
+            &store,
+            &mut snapshot,
+            "plan",
+            "",
+            &call,
+            12,
+            super::RequestIdentity {
+                cache_key: "cache-456",
+                thread_id: "thread-123",
+            },
+        )
+        .unwrap();
+        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        let event: Value = serde_json::from_str(events.trim()).unwrap();
+        assert_eq!(event["prompt_cache_key"], "cache-456");
+        assert_eq!(event["cache_key"], "cache-456");
+        assert_eq!(event["thread_id"], "thread-123");
+        assert_eq!(event["conversation_id"], "thread-123");
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }
