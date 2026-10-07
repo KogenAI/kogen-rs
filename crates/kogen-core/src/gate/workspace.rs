@@ -14,10 +14,14 @@ pub(crate) struct TreeEntry {
 pub(crate) struct WorkspaceTree {
     pub root: PathBuf,
     pub entries: BTreeMap<PathBuf, TreeEntry>,
+    excluded_paths: Vec<PathBuf>,
 }
 
 impl WorkspaceTree {
-    pub fn capture(root: &Path) -> Result<Self, WorkspaceError> {
+    pub fn capture_excluding(
+        root: &Path,
+        excluded_paths: &[PathBuf],
+    ) -> Result<Self, WorkspaceError> {
         let root = fs::canonicalize(root).map_err(|source| WorkspaceError::Io {
             operation: "resolve workspace",
             path: root.to_path_buf(),
@@ -27,8 +31,12 @@ impl WorkspaceTree {
             return Err(WorkspaceError::NotDirectory(root));
         }
         let mut entries = BTreeMap::new();
-        visit(&root, &root, &mut entries)?;
-        Ok(Self { root, entries })
+        visit(&root, &root, &mut entries, excluded_paths)?;
+        Ok(Self {
+            root,
+            entries,
+            excluded_paths: excluded_paths.to_vec(),
+        })
     }
 
     pub fn changed_paths(&self, other: &Self) -> Vec<String> {
@@ -50,7 +58,7 @@ impl WorkspaceTree {
     /// Replaces workspace files from this snapshot and leaves the root `.git`
     /// entry intact. It is used after a check or test changes its input tree.
     pub fn restore(&self) -> Result<(), WorkspaceError> {
-        clear_workspace(&self.root)?;
+        clear_workspace(&self.root, &self.excluded_paths)?;
         for entry in self.entries.values() {
             let destination = self.root.join(&entry.path);
             create_parents(&self.root, &entry.path)?;
@@ -101,6 +109,7 @@ fn visit(
     root: &Path,
     directory: &Path,
     entries: &mut BTreeMap<PathBuf, TreeEntry>,
+    excluded_paths: &[PathBuf],
 ) -> Result<(), WorkspaceError> {
     let mut children = fs::read_dir(directory)
         .map_err(|source| io_error("read workspace directory", directory, source))?
@@ -113,10 +122,20 @@ fn visit(
             continue;
         }
         let path = child.path();
+        let relative = path
+            .strip_prefix(root)
+            .expect("walked entries are descendants of the workspace")
+            .to_path_buf();
+        if excluded_paths
+            .iter()
+            .any(|excluded| relative.starts_with(excluded))
+        {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path)
             .map_err(|source| io_error("inspect workspace entry", &path, source))?;
         if metadata.file_type().is_dir() {
-            visit(root, &path, entries)?;
+            visit(root, &path, entries, excluded_paths)?;
             continue;
         }
         let (mode, bytes) = if metadata.file_type().is_symlink() {
@@ -157,15 +176,42 @@ fn visit(
     Ok(())
 }
 
-fn clear_workspace(root: &Path) -> Result<(), WorkspaceError> {
-    let children =
-        fs::read_dir(root).map_err(|source| io_error("read workspace directory", root, source))?;
+fn clear_workspace(root: &Path, excluded_paths: &[PathBuf]) -> Result<(), WorkspaceError> {
+    clear_directory(root, root, excluded_paths)
+}
+
+fn clear_directory(
+    root: &Path,
+    directory: &Path,
+    excluded_paths: &[PathBuf],
+) -> Result<(), WorkspaceError> {
+    let children = fs::read_dir(directory)
+        .map_err(|source| io_error("read workspace directory", directory, source))?;
     for child in children {
-        let child = child.map_err(|source| io_error("read workspace entry", root, source))?;
-        if child.file_name() == ".git" {
+        let child = child.map_err(|source| io_error("read workspace entry", directory, source))?;
+        if directory == root && child.file_name() == ".git" {
             continue;
         }
-        remove_entry(&child.path())?;
+        let path = child.path();
+        let relative = path
+            .strip_prefix(root)
+            .expect("walked entries are descendants of the workspace");
+        if excluded_paths.iter().any(|excluded| relative == excluded) {
+            continue;
+        }
+        if excluded_paths
+            .iter()
+            .any(|excluded| excluded.starts_with(relative))
+        {
+            if fs::symlink_metadata(&path)
+                .map_err(|source| io_error("inspect workspace entry", &path, source))?
+                .is_dir()
+            {
+                clear_directory(root, &path, excluded_paths)?;
+            }
+            continue;
+        }
+        remove_entry(&path)?;
     }
     Ok(())
 }

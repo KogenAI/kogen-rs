@@ -17,7 +17,7 @@ mod tests;
 pub use engine::{
     IntegrationGate, IntegrationResult, LandingObserver, LandingOutcome, LandingPoint,
     LandingRequest, LandingWait, NoLandingObserver, RepairResult, SystemLandingWait, land,
-    land_with_observer,
+    land_excluding, land_with_observer, land_with_observer_excluding,
 };
 pub use error::{LandingError, LandingErrorKind};
 pub use model::{LandingEvent, LandingModel, LandingObservation, RebaseKind};

@@ -115,13 +115,14 @@ pub fn dispatch(command: Command) -> CliOutput {
             Ok(project) => status::command(&project, slug.as_deref(), watch, json),
             Err(error) => error.into_cli_output(),
         },
-        _ => CoreError::new(
-            ErrorClass::Controller,
-            "internal_error",
-            "command handler is not available",
-            ExitCode::Bug,
-        )
-        .into_cli_output(),
+        Command::QueueStart { detach, project } => match resolve_project(project) {
+            Ok(project) => kogen_core::build::queue_start(&project, detach),
+            Err(error) => error.into_cli_output(),
+        },
+        Command::QueueStop { project } => match resolve_project(project) {
+            Ok(project) => kogen_core::build::queue_stop(&project),
+            Err(error) => error.into_cli_output(),
+        },
     }
 }
 

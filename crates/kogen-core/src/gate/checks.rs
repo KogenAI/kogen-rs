@@ -196,10 +196,21 @@ pub fn run_check(
     run_dir: &Path,
     env: &ChildEnvironment,
 ) -> Result<CheckResult, CheckRunError> {
+    run_check_excluding(runner, command, workdir, run_dir, env, &[])
+}
+
+pub(crate) fn run_check_excluding(
+    runner: &dyn ProcessPort,
+    command: &CheckCommand,
+    workdir: &Path,
+    run_dir: &Path,
+    env: &ChildEnvironment,
+    excluded_paths: &[PathBuf],
+) -> Result<CheckResult, CheckRunError> {
     let Some((program, args)) = command.argv.split_first() else {
         return Err(CheckRunError::EmptyCommand(command.name.clone()));
     };
-    let before = WorkspaceTree::capture(workdir)
+    let before = WorkspaceTree::capture_excluding(workdir, excluded_paths)
         .map_err(|error| CheckRunError::Snapshot(error.to_string()))?;
     let mut request = ProcessRequest::new(program.clone(), workdir, run_dir);
     request.args = args.to_vec();
@@ -207,7 +218,7 @@ pub fn run_check(
     request.timeout = command.timeout;
     request.log_name = log_name(&command.name);
     let process = runner.run(request);
-    let after = WorkspaceTree::capture(workdir)
+    let after = WorkspaceTree::capture_excluding(workdir, excluded_paths)
         .map_err(|error| CheckRunError::Snapshot(error.to_string()))?;
     let changed_paths = before.changed_paths(&after);
     if !changed_paths.is_empty() {

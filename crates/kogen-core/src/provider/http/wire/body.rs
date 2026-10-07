@@ -116,7 +116,8 @@ impl Serialize for WireBody<'_> {
     {
         let lite = self.mode == ResponseMode::Lite;
         let injected = matches!(self.mode, ResponseMode::Injected | ResponseMode::Lite);
-        let include_tools = matches!(self.mode, ResponseMode::Injected | ResponseMode::Grok);
+        let include_tools = !self.tools.is_empty()
+            && matches!(self.mode, ResponseMode::Injected | ResponseMode::Grok);
         let include = injected || self.mode == ResponseMode::Grok;
         let include_cache_key = !self.request.cache_key.is_empty();
         let include_text = self.request.model == "gpt-6-luna";

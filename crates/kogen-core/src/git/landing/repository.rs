@@ -4,7 +4,7 @@ use super::gitops::{arg, args, git, git_with_config, path_arg};
 use super::rebase;
 use super::refs::{base_ref, check_commit, incoming_ref, validate_run_id};
 use super::worktree;
-use crate::gate::snapshot_tree;
+use crate::gate::snapshot_tree_excluding;
 use crate::git::GitRepo;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -151,9 +151,20 @@ impl LandingRepository {
         title: &str,
         slug: &str,
     ) -> Result<CandidateCommit, LandingError> {
+        self.candidate_commit_excluding(expected_parent, verified_tree, title, slug, &[])
+    }
+
+    pub fn candidate_commit_excluding(
+        &self,
+        expected_parent: &str,
+        verified_tree: &str,
+        title: &str,
+        slug: &str,
+        excluded_paths: &[PathBuf],
+    ) -> Result<CandidateCommit, LandingError> {
         validate_identity(title, slug)?;
         check_commit(expected_parent)?;
-        let actual_tree = snapshot_tree(&self.workspace)?;
+        let actual_tree = snapshot_tree_excluding(&self.workspace, excluded_paths)?;
         if actual_tree != verified_tree {
             return Err(LandingError::controller(
                 "verify landing tree",

@@ -37,7 +37,12 @@ pub(in crate::handlers::status) fn render_detail(
         }
     };
     let mut output = format!("{}: {state}\n", intent.facts.slug);
-    if let Some(run) = intent.facts.latest_run.as_ref() {
+    if let Some(run) = intent
+        .facts
+        .latest_run
+        .as_ref()
+        .filter(|_| intent.kind != StatusKind::Approved)
+    {
         output.push_str(&format!(
             "Build {}: {}{}\n",
             short_id(&run.run_id),

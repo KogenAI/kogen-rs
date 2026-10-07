@@ -163,6 +163,7 @@ impl Fixture {
                 argv: vec![OsString::from("lint")],
                 timeout: Duration::from_secs(1),
             }],
+            setup_outputs: Vec::new(),
             approved_baseline: vec![CheckBaseline {
                 name: "lint".to_owned(),
                 status: CheckStatus::Green,

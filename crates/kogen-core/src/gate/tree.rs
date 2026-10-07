@@ -18,6 +18,24 @@ impl TreeSnapshotPort for GitTreeSnapshot {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct GitTreeSnapshotWithExclusions {
+    excluded_paths: Vec<PathBuf>,
+}
+
+impl GitTreeSnapshotWithExclusions {
+    #[must_use]
+    pub fn new(excluded_paths: Vec<PathBuf>) -> Self {
+        Self { excluded_paths }
+    }
+}
+
+impl TreeSnapshotPort for GitTreeSnapshotWithExclusions {
+    fn snapshot(&self, workdir: &Path) -> Result<String, String> {
+        snapshot_tree_excluding(workdir, &self.excluded_paths).map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeSnapshotError {
     pub operation: &'static str,
@@ -33,7 +51,15 @@ impl fmt::Display for TreeSnapshotError {
 impl std::error::Error for TreeSnapshotError {}
 
 pub fn snapshot_tree(workdir: &Path) -> Result<String, TreeSnapshotError> {
-    let tree = WorkspaceTree::capture(workdir).map_err(workspace_error)?;
+    snapshot_tree_excluding(workdir, &[])
+}
+
+pub fn snapshot_tree_excluding(
+    workdir: &Path,
+    excluded_paths: &[PathBuf],
+) -> Result<String, TreeSnapshotError> {
+    let tree =
+        WorkspaceTree::capture_excluding(workdir, excluded_paths).map_err(workspace_error)?;
     write_tree(&tree)
 }
 

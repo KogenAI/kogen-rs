@@ -1,12 +1,12 @@
 use super::checks::{
-    CheckBaseline, CheckCommand, CheckResult, CheckRunError, FixResult, is_excused, run_check,
-    run_fix,
+    CheckBaseline, CheckCommand, CheckResult, CheckRunError, FixResult, is_excused,
+    run_check_excluding, run_fix,
 };
 use super::ledger::{AcceptanceFailure, CommandAcceptanceResult};
 use super::protection::{
     ProtectedFinding, ProtectedWorkspace, ProtectionError, install_approved_acceptance,
 };
-use super::tree::{TreeSnapshotError, snapshot_tree};
+use super::tree::{TreeSnapshotError, snapshot_tree_excluding};
 use super::workspace::{WorkspaceError, WorkspaceTree};
 use crate::run::{ChildEnvironment, ProcessError, ProcessPort};
 use std::collections::BTreeSet;
@@ -37,6 +37,7 @@ pub struct GateRequest {
     pub environment: ChildEnvironment,
     pub fixes: Vec<CheckCommand>,
     pub checks: Vec<CheckCommand>,
+    pub setup_outputs: Vec<PathBuf>,
     pub approved_baseline: Vec<CheckBaseline>,
     pub acceptance: AcceptancePlan,
     pub protection: ProtectedWorkspace,
@@ -212,24 +213,30 @@ pub fn run_gate(runner: &dyn ProcessPort, request: &GateRequest) -> Result<GateR
     }
     protection_findings.extend(request.protection.guard(&request.candidate_workspace)?);
 
-    let verified_snapshot = WorkspaceTree::capture(&request.candidate_workspace)?;
-    let verified_tree = Some(snapshot_tree(&request.candidate_workspace)?);
+    let verified_snapshot =
+        WorkspaceTree::capture_excluding(&request.candidate_workspace, &request.setup_outputs)?;
+    let verified_tree = Some(snapshot_tree_excluding(
+        &request.candidate_workspace,
+        &request.setup_outputs,
+    )?);
     let mut base_checks = Vec::with_capacity(request.checks.len());
     let mut checks = Vec::with_capacity(request.checks.len());
     for command in &request.checks {
-        base_checks.push(run_check(
+        base_checks.push(run_check_excluding(
             runner,
             command,
             &request.base_workspace,
             &request.run_dir,
             &request.environment,
+            &request.setup_outputs,
         )?);
-        let mut current = run_check(
+        let mut current = run_check_excluding(
             runner,
             command,
             &request.candidate_workspace,
             &request.run_dir,
             &request.environment,
+            &request.setup_outputs,
         )?;
         let approved = request
             .approved_baseline
@@ -250,9 +257,13 @@ pub fn run_gate(runner: &dyn ProcessPort, request: &GateRequest) -> Result<GateR
         checks.push(current);
     }
 
-    let acceptance_before = WorkspaceTree::capture(&request.candidate_workspace)?;
+    let acceptance_before =
+        WorkspaceTree::capture_excluding(&request.candidate_workspace, &request.setup_outputs)?;
     let acceptance_result = support::run_acceptance(runner, request);
-    let acceptance_after = match WorkspaceTree::capture(&request.candidate_workspace) {
+    let acceptance_after = match WorkspaceTree::capture_excluding(
+        &request.candidate_workspace,
+        &request.setup_outputs,
+    ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             acceptance_before.restore()?;
@@ -278,12 +289,13 @@ pub fn run_gate(runner: &dyn ProcessPort, request: &GateRequest) -> Result<GateR
     protection_findings.extend(request.protection.guard(&request.candidate_workspace)?);
     let acceptance_result = acceptance_result?;
 
-    let final_tree = snapshot_tree(&request.candidate_workspace)?;
+    let final_tree = snapshot_tree_excluding(&request.candidate_workspace, &request.setup_outputs)?;
     if final_tree != verified_tree.as_deref().unwrap_or_default() {
         verified_snapshot.restore()?;
     }
-    let tree_stable = snapshot_tree(&request.candidate_workspace)?
-        == verified_tree.as_deref().unwrap_or_default();
+    let tree_stable =
+        snapshot_tree_excluding(&request.candidate_workspace, &request.setup_outputs)?
+            == verified_tree.as_deref().unwrap_or_default();
     let mut acceptance = acceptance_result;
     if (acceptance_changed || !tree_stable)
         && !acceptance

@@ -159,6 +159,9 @@ pub(super) fn persist_terminal(
     if !reason.is_empty() {
         entry = entry.with("reason", json!(reason));
     }
+    if let Some(verdict) = request.snapshot.fields.get("verdict") {
+        entry = entry.with("verdict", verdict.clone());
+    }
     request.store.record(&entry, request.snapshot)?;
     Ok(())
 }

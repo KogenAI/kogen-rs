@@ -2,6 +2,7 @@
 //! Modules are added by the work packages in docs/work/QUEUE.txt.
 
 pub mod approval;
+pub mod build;
 pub mod error;
 pub mod gate;
 pub mod git;

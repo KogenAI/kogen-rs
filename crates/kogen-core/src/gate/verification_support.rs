@@ -2,7 +2,7 @@ use super::super::ledger::{
     CommandAcceptanceRequest, CommandAcceptanceResult, run_command_acceptance,
 };
 use super::super::protection::ProtectedFinding;
-use super::super::tree::GitTreeSnapshot;
+use super::super::tree::GitTreeSnapshotWithExclusions;
 use super::{GateError, GateRequest};
 use crate::run::ProcessPort;
 use std::collections::BTreeSet;
@@ -27,7 +27,8 @@ pub(super) fn run_acceptance(
         expected_items: request.acceptance.expected_items.clone(),
         adapter_unavailable: request.acceptance.adapter_unavailable,
     };
-    run_command_acceptance(runner, &GitTreeSnapshot, command).map_err(GateError::Acceptance)
+    let tree = GitTreeSnapshotWithExclusions::new(request.setup_outputs.clone());
+    run_command_acceptance(runner, &tree, command).map_err(GateError::Acceptance)
 }
 
 pub(super) fn validate_request(request: &GateRequest) -> Result<(), GateError> {

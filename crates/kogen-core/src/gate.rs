@@ -25,6 +25,7 @@ pub use protection::{
     install_approved_acceptance,
 };
 pub use tree::{GitTreeSnapshot, TreeSnapshotError, commit_tree_id, snapshot_tree};
+pub use tree::{GitTreeSnapshotWithExclusions, snapshot_tree_excluding};
 pub use verification::{
     AcceptancePlan, GateError, GateReport, GateRequest, GateVerdict, VerificationReceipt, run_gate,
 };

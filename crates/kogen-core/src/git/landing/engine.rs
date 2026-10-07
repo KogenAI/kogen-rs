@@ -6,7 +6,7 @@ use super::persist::{
 use super::repository::{CandidateCommit, LandingRepository, RebaseAttempt};
 use crate::run::{RunEvent, RunSnapshot, RunStore};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const LANDING_ALLOWANCE: Duration = Duration::from_secs(10 * 60);
@@ -112,11 +112,36 @@ pub fn land(
     integration: &mut impl IntegrationGate,
     wait: &mut impl LandingWait,
 ) -> Result<LandingOutcome, LandingError> {
-    land_with_observer(request, integration, wait, &mut NoLandingObserver)
+    land_excluding(request, &[], integration, wait)
+}
+
+pub fn land_excluding(
+    request: LandingRequest<'_>,
+    excluded_paths: &[PathBuf],
+    integration: &mut impl IntegrationGate,
+    wait: &mut impl LandingWait,
+) -> Result<LandingOutcome, LandingError> {
+    land_with_observer_excluding(
+        request,
+        excluded_paths,
+        integration,
+        wait,
+        &mut NoLandingObserver,
+    )
 }
 
 pub fn land_with_observer(
+    request: LandingRequest<'_>,
+    integration: &mut impl IntegrationGate,
+    wait: &mut impl LandingWait,
+    observer: &mut impl LandingObserver,
+) -> Result<LandingOutcome, LandingError> {
+    land_with_observer_excluding(request, &[], integration, wait, observer)
+}
+
+pub fn land_with_observer_excluding(
     mut request: LandingRequest<'_>,
+    excluded_paths: &[PathBuf],
     integration: &mut impl IntegrationGate,
     wait: &mut impl LandingWait,
     observer: &mut impl LandingObserver,
@@ -126,11 +151,12 @@ pub fn land_with_observer(
     let mut model = LandingModel::new();
     let mut expected_parent = request.expected_parent.to_owned();
     let mut verified_tree = request.verified_tree.to_owned();
-    let mut candidate = request.repository.candidate_commit(
+    let mut candidate = request.repository.candidate_commit_excluding(
         &expected_parent,
         &verified_tree,
         request.title,
         &request.snapshot.slug,
+        excluded_paths,
     )?;
     save_landing(&mut request, &candidate, &expected_parent, &verified_tree)?;
     observer.reached(LandingPoint::RecordDurable, &candidate)?;
@@ -152,11 +178,12 @@ pub fn land_with_observer(
                     };
                     expected_parent = updated.0;
                     verified_tree = updated.1;
-                    candidate = request.repository.candidate_commit(
+                    candidate = request.repository.candidate_commit_excluding(
                         &expected_parent,
                         &verified_tree,
                         request.title,
                         &request.snapshot.slug,
+                        excluded_paths,
                     )?;
                     save_landing(&mut request, &candidate, &expected_parent, &verified_tree)?;
                     continue;
@@ -231,11 +258,12 @@ pub fn land_with_observer(
                 };
                 expected_parent = updated.0;
                 verified_tree = updated.1;
-                candidate = request.repository.candidate_commit(
+                candidate = request.repository.candidate_commit_excluding(
                     &expected_parent,
                     &verified_tree,
                     request.title,
                     &request.snapshot.slug,
+                    excluded_paths,
                 )?;
                 save_landing(&mut request, &candidate, &expected_parent, &verified_tree)?;
             }

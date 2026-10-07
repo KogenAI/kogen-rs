@@ -194,18 +194,25 @@ pub fn owner_is_alive(pid: u32, started_ms: i64) -> bool {
     process_start_matches(pid, started_ms).unwrap_or(true)
 }
 
-fn process_start_matches(pid: u32, expected_ms: i64) -> Option<bool> {
+/// Return the process start instant used by run ownership records.
+///
+/// `ps lstart` only has second precision on supported hosts, so callers store
+/// this timestamp at that same precision for PID-reuse detection.
+pub fn process_started_ms(pid: u32) -> Option<i64> {
     let output = Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
         .env("LC_ALL", "C")
         .output()
         .ok()?;
     if !output.status.success() {
-        return Some(false);
+        return None;
     }
     let started = String::from_utf8(output.stdout).ok()?;
-    let seconds = date_seconds(started.trim())?;
-    Some(seconds == expected_ms / 1000)
+    date_seconds(started.trim()).map(|seconds| seconds * 1000)
+}
+
+fn process_start_matches(pid: u32, expected_ms: i64) -> Option<bool> {
+    process_started_ms(pid).map(|actual_ms| actual_ms == expected_ms / 1000 * 1000)
 }
 
 fn date_seconds(lstart: &str) -> Option<i64> {
