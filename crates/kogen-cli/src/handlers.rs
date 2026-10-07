@@ -363,3 +363,61 @@ fn version_line() -> String {
         env!("KOGEN_SOURCE_DATE")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch;
+    use crate::request::{Command, ProjectOptions};
+    use kogen_core::ExitCode;
+    use std::process::Command as ProcessCommand;
+
+    #[test]
+    fn status_rejects_oversized_project_yaml_as_invalid_config() {
+        let checkout = std::env::temp_dir().join(format!(
+            "kogen-cli-oversized-config-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(checkout.join(".kogen")).expect("create project config dir");
+        let init = ProcessCommand::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&checkout)
+            .status()
+            .expect("run git init");
+        assert!(init.success());
+
+        let mut config = b"name: kt\nchecks: []\n".to_vec();
+        config.resize(1_048_577, b'x');
+        std::fs::write(checkout.join(".kogen/project.yaml"), config)
+            .expect("write oversized project config");
+        let checkout = std::fs::canonicalize(checkout).expect("canonical checkout path");
+        let output = dispatch(Command::Status {
+            slug: None,
+            watch: false,
+            json: false,
+            project: ProjectOptions {
+                project: checkout.clone(),
+                origin: None,
+                base: None,
+            },
+        });
+
+        assert_eq!(output.exit_code, ExitCode::Environment);
+        assert_eq!(output.stderr, "");
+        assert_eq!(
+            output.stdout,
+            format!(
+                "environment/project_config_invalid: {}/.kogen/project.yaml\n  document exceeds the maximum size of 1048576 bytes\n",
+                checkout.display()
+            )
+        );
+        std::fs::remove_dir_all(checkout).expect("remove temporary project");
+    }
+
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    }
+}

@@ -36,9 +36,14 @@ pub(super) fn render_card(card: ApprovalCard<'_>) -> String {
         .map(|(_, line)| line.as_str())
         .collect::<Vec<_>>();
     for line in trim_blank_edges(&brief) {
-        out.push_str("  ");
-        out.push_str(line);
-        out.push('\n');
+        let line = line.trim_end();
+        if line.is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
     }
     out.push_str("\nAcceptance\n");
     for item in &intent.acceptance {
@@ -130,4 +135,35 @@ pub(super) fn render_warning_prefix(
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApprovalCard, render_card};
+    use crate::intent::Intent;
+
+    #[test]
+    fn approval_card_keeps_paragraph_breaks_without_trailing_spaces() {
+        let source = b"---\ntitle: Paragraphs\nsize: small\ndomains: [app]\n---\nFirst paragraph.  \n\nSecond paragraph.\n\n## Acceptance\n- A1: update the greeting in lib/greet.txt\n\n## Verify\n- A1: test\n";
+        let intent = Intent::parse("tiers", source).expect("valid Intent");
+        let hash = "a".repeat(64);
+        let base_sha = "b".repeat(40);
+        let rendered = render_card(ApprovalCard {
+            intent: &intent,
+            hash: &hash,
+            approver: "Kogen Test <test@kogen.invalid>",
+            base: "main",
+            base_sha: &base_sha,
+            feasibility: "not checked",
+            warnings: &[],
+            baseline_warning: false,
+            baseline: &[],
+        });
+
+        assert!(rendered.contains("  First paragraph.\n\n  Second paragraph.\n"));
+        assert!(
+            rendered.lines().all(|line| !line.ends_with(' ')),
+            "approval card contains a trailing space: {rendered:?}"
+        );
+    }
 }
