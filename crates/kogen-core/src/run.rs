@@ -5,6 +5,7 @@
 //! exact child environment; this module never invokes a shell implicitly.
 
 mod environment;
+pub mod orchestration;
 mod persistence;
 mod process;
 mod sandbox;

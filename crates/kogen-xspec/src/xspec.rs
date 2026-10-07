@@ -1,5 +1,7 @@
 mod approve;
+mod gate;
 mod intent;
+mod orchestration;
 mod queue;
 mod rebase;
 mod recovery;
@@ -20,6 +22,8 @@ pub struct Adapter {
     status: kogen_core::status::StatusReplay,
     recovery: kogen_core::recovery::RecoveryModel,
     landing: kogen_core::git::landing::LandingModel,
+    orchestration: kogen_core::run::orchestration::replay::OrchestrationReplay,
+    gate: kogen_core::run::orchestration::GateReplay,
 }
 
 #[derive(Clone, Copy)]
@@ -31,6 +35,8 @@ enum Slice {
     Status,
     Recovery,
     Rebase,
+    Orchestration,
+    Gate,
 }
 
 impl Adapter {
@@ -43,6 +49,8 @@ impl Adapter {
             "status" => Slice::Status,
             "recovery" => Slice::Recovery,
             "rebase" => Slice::Rebase,
+            "orchestration" => Slice::Orchestration,
+            "gate" => Slice::Gate,
             _ => return Err(format!("unknown private slice `{name}`")),
         };
         let project = TempProject::new()?;
@@ -57,6 +65,8 @@ impl Adapter {
             status: kogen_core::status::StatusReplay::new(),
             recovery: kogen_core::recovery::RecoveryModel::new(),
             landing: kogen_core::git::landing::LandingModel::new(),
+            orchestration: kogen_core::run::orchestration::replay::OrchestrationReplay::new(),
+            gate: kogen_core::run::orchestration::GateReplay::new(),
         })
     }
 
@@ -84,6 +94,10 @@ impl Adapter {
                         Slice::Status => status::apply(&mut self.status, &event),
                         Slice::Recovery => recovery::apply(&mut self.recovery, &event),
                         Slice::Rebase => rebase::apply(&mut self.landing, &event),
+                        Slice::Orchestration => {
+                            orchestration::apply(&mut self.orchestration, &event)
+                        }
+                        Slice::Gate => gate::apply(&mut self.gate, &event),
                     }
                 }
             }
@@ -103,6 +117,8 @@ impl Adapter {
         self.status = kogen_core::status::StatusReplay::new();
         self.recovery = kogen_core::recovery::RecoveryModel::new();
         self.landing = kogen_core::git::landing::LandingModel::new();
+        self.orchestration = kogen_core::run::orchestration::replay::OrchestrationReplay::new();
+        self.gate = kogen_core::run::orchestration::GateReplay::new();
         Ok(self.observation())
     }
 
@@ -119,6 +135,8 @@ impl Adapter {
                 .expect("recovery observations are serializable"),
             Slice::Rebase => serde_json::to_value(self.landing.observe())
                 .expect("landing observations are serializable"),
+            Slice::Orchestration => orchestration::observe(&self.orchestration),
+            Slice::Gate => gate::observe(&self.gate),
         }
     }
 }
@@ -136,7 +154,7 @@ fn initial_state(slice: Slice) -> Value {
             "setupRuns": 0,
             "last": "ok",
         }),
-        Slice::Status | Slice::Recovery => Value::Null,
+        Slice::Status | Slice::Recovery | Slice::Orchestration | Slice::Gate => Value::Null,
         Slice::Rebase => json!(kogen_core::git::landing::LandingModel::new().observe()),
     }
 }
