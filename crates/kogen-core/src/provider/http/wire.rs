@@ -253,7 +253,7 @@ pub fn build_wire_request(
     {
         return Err(ProviderFailure::new(
             ProviderErrorKind::Login,
-            "Codex login is missing, invalid, or expired.",
+            "ChatGPT login is missing the account ID required for the Codex backend.",
         ));
     }
     let body = body::encode(request, config.mode).map_err(|_| {

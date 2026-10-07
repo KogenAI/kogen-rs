@@ -25,6 +25,8 @@ pub const OUTPUT_CANCEL_THRESHOLD_TOKENS: u64 = 512;
 pub const REASONING_CANCEL_THRESHOLD_TOKENS: u64 = 1_024;
 pub const MAX_POSTS: u64 = 360;
 pub const MAX_TOTAL_TOKENS: u64 = 2_000_000;
+pub const SPLIT_MAX_POSTS: u64 = MAX_POSTS / 2;
+pub const SPLIT_MAX_TOTAL_TOKENS: u64 = MAX_TOTAL_TOKENS / 2;
 pub const PLANNED_TOKEN_RESERVATION: u64 = 1_941_504;
 pub const INPUT_OVERHEAD_TOKENS: u64 = 512;
 pub const LOCAL_TOKENIZER_ID: &str = "whitespace-v1";
@@ -76,11 +78,54 @@ pub enum FixtureProvenance {
     Reconstructed,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[serde(rename_all = "snake_case")]
 pub enum Endpoint {
     OpenAiResponses,
     ChatgptBackend,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub enum EndpointSelection {
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "chatgpt")]
+    Chatgpt,
+    #[serde(rename = "both")]
+    Both,
+}
+
+impl EndpointSelection {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "openai" => Ok(Self::OpenAi),
+            "chatgpt" => Ok(Self::Chatgpt),
+            "both" => Ok(Self::Both),
+            _ => Err("--endpoints must be openai, chatgpt, or both".to_owned()),
+        }
+    }
+
+    const fn includes(self, endpoint: Endpoint) -> bool {
+        match self {
+            Self::OpenAi => matches!(endpoint, Endpoint::OpenAiResponses),
+            Self::Chatgpt => matches!(endpoint, Endpoint::ChatgptBackend),
+            Self::Both => true,
+        }
+    }
+
+    const fn maximum_posts(self) -> u64 {
+        match self {
+            Self::Both => MAX_POSTS,
+            Self::OpenAi | Self::Chatgpt => SPLIT_MAX_POSTS,
+        }
+    }
+
+    const fn maximum_total_tokens(self) -> u64 {
+        match self {
+            Self::Both => MAX_TOTAL_TOKENS,
+            Self::OpenAi | Self::Chatgpt => SPLIT_MAX_TOTAL_TOKENS,
+        }
+    }
 }
 
 impl Endpoint {
@@ -130,6 +175,7 @@ pub struct EndpointOutputLimit {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ReplayPlan {
     pub schema_version: u32,
+    pub endpoint_selection: EndpointSelection,
     pub seed: String,
     pub prng: String,
     pub source_revision: String,
@@ -232,6 +278,55 @@ pub fn build_plan(
     manifest_bytes: &[u8],
     seed: &str,
 ) -> Result<ReplayPlan, String> {
+    build_plan_for_endpoints(manifest, manifest_bytes, seed, EndpointSelection::Both)
+}
+
+/// Build a reproducible plan for one endpoint or the full two-endpoint study.
+/// Single-endpoint plans retain all of that endpoint's paired attempts and use
+/// half of the global post and token allocation.
+pub fn build_plan_for_endpoints(
+    manifest: &FixtureManifest,
+    manifest_bytes: &[u8],
+    seed: &str,
+    selection: EndpointSelection,
+) -> Result<ReplayPlan, String> {
+    let mut plan = build_complete_plan(manifest, manifest_bytes, seed)?;
+    if selection == EndpointSelection::Both {
+        return Ok(plan);
+    }
+
+    plan.endpoint_selection = selection;
+    plan.attempts
+        .retain(|attempt| selection.includes(attempt.endpoint));
+    for (index, attempt) in plan.attempts.iter_mut().enumerate() {
+        attempt.schedule_index = index as u32;
+    }
+    plan.maximum_posts = selection.maximum_posts();
+    plan.maximum_total_tokens = selection.maximum_total_tokens();
+    plan.scheduled_posts = plan.attempts.len() as u64;
+    plan.scheduled_input_reservation = plan
+        .attempts
+        .iter()
+        .map(|attempt| attempt.input_reservation_tokens)
+        .sum();
+    plan.scheduled_output_reservation = plan
+        .attempts
+        .iter()
+        .map(|attempt| attempt.output_reservation_tokens)
+        .sum();
+    plan.scheduled_total_reservation = plan
+        .scheduled_input_reservation
+        .saturating_add(plan.scheduled_output_reservation);
+    plan.plan_sha256 = plan_digest(&plan)?;
+    verify_plan(&plan)?;
+    Ok(plan)
+}
+
+fn build_complete_plan(
+    manifest: &FixtureManifest,
+    manifest_bytes: &[u8],
+    seed: &str,
+) -> Result<ReplayPlan, String> {
     validate_manifest(manifest)?;
     if seed.is_empty() {
         return Err("--seed must not be empty".to_owned());
@@ -306,7 +401,8 @@ pub fn build_plan(
     let scheduled_total_reservation =
         scheduled_input_reservation.saturating_add(scheduled_output_reservation);
     let mut plan = ReplayPlan {
-        schema_version: 2,
+        schema_version: 3,
+        endpoint_selection: EndpointSelection::Both,
         seed: seed.to_owned(),
         prng: "ChaCha20Rng rand_chacha-0.3.1".to_owned(),
         source_revision: "unresolved".to_owned(),
@@ -440,7 +536,7 @@ pub fn validate_manifest(manifest: &FixtureManifest) -> Result<(), String> {
 }
 
 pub fn verify_plan(plan: &ReplayPlan) -> Result<(), String> {
-    if plan.schema_version != 2 {
+    if plan.schema_version != 3 {
         return Err("unsupported replay plan schema_version".to_owned());
     }
     if plan.model != MODEL || plan.effort != EFFORT {
@@ -464,14 +560,34 @@ pub fn verify_plan(plan: &ReplayPlan) -> Result<(), String> {
             "plan admission does not match the coordinator cancel-on-overflow policy".to_owned(),
         );
     }
-    if plan.maximum_posts != MAX_POSTS
-        || plan.scheduled_posts != MAX_POSTS
+    if plan.maximum_posts != plan.endpoint_selection.maximum_posts()
+        || plan.scheduled_posts != plan.maximum_posts
         || plan.scheduled_posts != plan.attempts.len() as u64
     {
         return Err("plan request allocation is invalid".to_owned());
     }
-    if plan.maximum_total_tokens != MAX_TOTAL_TOKENS {
+    if plan.maximum_total_tokens != plan.endpoint_selection.maximum_total_tokens() {
         return Err("plan total-token cap is invalid".to_owned());
+    }
+    let mut endpoint_counts = std::collections::BTreeMap::new();
+    for attempt in &plan.attempts {
+        if !plan.endpoint_selection.includes(attempt.endpoint) {
+            return Err("plan contains an endpoint outside its frozen selection".to_owned());
+        }
+        *endpoint_counts.entry(attempt.endpoint).or_insert(0_u64) += 1;
+    }
+    match plan.endpoint_selection {
+        EndpointSelection::OpenAi
+            if endpoint_counts.get(&Endpoint::OpenAiResponses) == Some(&SPLIT_MAX_POSTS)
+                && endpoint_counts.len() == 1 => {}
+        EndpointSelection::Chatgpt
+            if endpoint_counts.get(&Endpoint::ChatgptBackend) == Some(&SPLIT_MAX_POSTS)
+                && endpoint_counts.len() == 1 => {}
+        EndpointSelection::Both
+            if endpoint_counts.get(&Endpoint::OpenAiResponses) == Some(&SPLIT_MAX_POSTS)
+                && endpoint_counts.get(&Endpoint::ChatgptBackend) == Some(&SPLIT_MAX_POSTS)
+                && endpoint_counts.len() == 2 => {}
+        _ => return Err("plan endpoint allocation is incomplete".to_owned()),
     }
     let input_reservation = plan
         .attempts
@@ -495,6 +611,26 @@ pub fn verify_plan(plan: &ReplayPlan) -> Result<(), String> {
     }
     if plan_digest(plan)? != plan.plan_sha256 {
         return Err("replay plan SHA-256 does not match its contents".to_owned());
+    }
+    let mut episodes = std::collections::BTreeMap::<&str, Vec<&PlannedAttempt>>::new();
+    for attempt in &plan.attempts {
+        episodes
+            .entry(attempt.episode_id.as_str())
+            .or_default()
+            .push(attempt);
+    }
+    for episode in episodes.values() {
+        if episode.len() != 2
+            || episode[0].endpoint != episode[1].endpoint
+            || episode[0]
+                .schedule_index
+                .abs_diff(episode[1].schedule_index)
+                != 1
+            || !episode.iter().any(|attempt| attempt.phase == "primer")
+            || !episode.iter().any(|attempt| attempt.phase == "probe")
+        {
+            return Err("plan episode is missing its adjacent primer/probe pair".to_owned());
+        }
     }
     for (index, attempt) in plan.attempts.iter().enumerate() {
         if attempt.schedule_index as usize != index {
@@ -1411,6 +1547,81 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_splits_preserve_pairs_and_half_budget_with_distinct_hashes() {
+        let (manifest, bytes) = fixture_manifest();
+        let openai = build_plan_for_endpoints(
+            &manifest,
+            &bytes,
+            "endpoint-split-seed",
+            EndpointSelection::OpenAi,
+        )
+        .unwrap();
+        let openai_repeat = build_plan_for_endpoints(
+            &manifest,
+            &bytes,
+            "endpoint-split-seed",
+            EndpointSelection::OpenAi,
+        )
+        .unwrap();
+        let chatgpt = build_plan_for_endpoints(
+            &manifest,
+            &bytes,
+            "endpoint-split-seed",
+            EndpointSelection::Chatgpt,
+        )
+        .unwrap();
+
+        assert_eq!(openai, openai_repeat);
+        assert_ne!(openai.plan_sha256, chatgpt.plan_sha256);
+        for (plan, endpoint) in [
+            (&openai, Endpoint::OpenAiResponses),
+            (&chatgpt, Endpoint::ChatgptBackend),
+        ] {
+            verify_plan(plan).unwrap();
+            assert_eq!(plan.maximum_posts, SPLIT_MAX_POSTS);
+            assert_eq!(plan.scheduled_posts, SPLIT_MAX_POSTS);
+            assert_eq!(plan.maximum_total_tokens, SPLIT_MAX_TOTAL_TOKENS);
+            assert_eq!(plan.scheduled_total_reservation, 970_752);
+            assert!(plan.scheduled_total_reservation <= 1_000_000);
+            assert!(
+                plan.attempts
+                    .iter()
+                    .all(|attempt| attempt.endpoint == endpoint)
+            );
+            assert!(plan.attempts.chunks_exact(2).all(|pair| {
+                pair[0].episode_id == pair[1].episode_id
+                    && pair[0].phase == "primer"
+                    && pair[1].phase == "probe"
+            }));
+
+            let mut h_pairs = std::collections::BTreeMap::<&str, HashSet<(&str, &str)>>::new();
+            let mut c_pairs = std::collections::BTreeMap::<&str, HashSet<(&str, &str)>>::new();
+            for attempt in &plan.attempts {
+                if !attempt.pair_h_id.is_empty() {
+                    h_pairs
+                        .entry(&attempt.pair_h_id)
+                        .or_default()
+                        .insert((&attempt.episode_id, &attempt.affinity));
+                }
+                if !attempt.pair_c_id.is_empty() {
+                    c_pairs
+                        .entry(&attempt.pair_c_id)
+                        .or_default()
+                        .insert((&attempt.episode_id, &attempt.cache_condition));
+                }
+            }
+            assert!(h_pairs.values().all(|pair| pair.len() == 2));
+            assert!(c_pairs.values().all(|pair| pair.len() == 2));
+            assert!(c_pairs.values().all(|pair| {
+                pair.iter()
+                    .map(|(_, condition)| *condition)
+                    .collect::<HashSet<_>>()
+                    == HashSet::from(["cold", "warm"])
+            }));
+        }
+    }
+
+    #[test]
     fn header_mask_changes_only_the_six_routing_headers() {
         let mut request = RequestContext {
             model: MODEL.to_owned(),
@@ -1546,5 +1757,22 @@ mod tests {
         assert!(backend.header("openai-beta").is_some());
         assert!(backend.header("originator").is_some());
         assert_eq!(api.header("user-agent"), backend.header("user-agent"));
+
+        let mut owned_without_backend_account = planning_credential();
+        if let RequestCredential::Owned(credential) = &mut owned_without_backend_account {
+            credential.id_token = "not-a-jwt".to_owned();
+        } else {
+            panic!("planning credential should use the Owned auth path");
+        }
+        assert!(
+            build_wire_request(&context, &owned_without_backend_account, &api_config).is_ok(),
+            "the OpenAI Owned adapter does not need a ChatGPT account ID"
+        );
+        let failure = build_wire_request(&context, &owned_without_backend_account, &backend_config)
+            .unwrap_err();
+        assert_eq!(
+            failure.message,
+            "ChatGPT login is missing the account ID required for the Codex backend."
+        );
     }
 }

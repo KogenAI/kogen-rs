@@ -1,7 +1,8 @@
 use kogen_cache_replay::execute::{ReceiptLedger, execute_plan, unadmitted_ledger};
 use kogen_cache_replay::{
-    CHATGPT_BACKEND_ENDPOINT, FixtureManifest, MAX_POSTS, MAX_TOTAL_TOKENS, ReplayPlan,
-    adapter_source_sha256, build_plan, dry_run_rows, plan_digest, sha256_hex, verify_plan,
+    EndpointSelection, FixtureManifest, MAX_POSTS, MAX_TOTAL_TOKENS, ReplayPlan, SPLIT_MAX_POSTS,
+    SPLIT_MAX_TOTAL_TOKENS, adapter_source_sha256, build_plan_for_endpoints, dry_run_rows,
+    plan_digest, sha256_hex, verify_plan,
 };
 use kogen_core::provider::RunAccount;
 use kogen_core::provider::auth::{self, RequestCredential};
@@ -31,7 +32,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let options = parse_options(args.collect())?;
-    reject_ambient_overrides(&options)?;
+    reject_ambient_overrides()?;
     match command.as_str() {
         "plan" => run_plan(&options),
         "dry-run" => run_dry_run(&options),
@@ -41,15 +42,20 @@ fn run() -> Result<(), String> {
 }
 
 fn run_plan(options: &BTreeMap<String, String>) -> Result<(), String> {
-    reject_unknown_options(options, &["fixtures", "seed", "out"])?;
+    reject_unknown_options(options, &["fixtures", "seed", "endpoints", "out"])?;
     let fixture_path = required(options, "fixtures")?;
     let seed = required(options, "seed")?;
     let out = PathBuf::from(required(options, "out")?);
+    let selection = options
+        .get("endpoints")
+        .map(|value| EndpointSelection::parse(value))
+        .transpose()?
+        .unwrap_or(EndpointSelection::Both);
     let fixture_bytes = fs::read(fixture_path)
         .map_err(|_| format!("could not read sanitized fixture manifest {}", fixture_path))?;
     let manifest: FixtureManifest = serde_json::from_slice(&fixture_bytes)
         .map_err(|error| format!("fixture manifest is invalid JSON: {error}"))?;
-    let mut plan = build_plan(&manifest, &fixture_bytes, seed)?;
+    let mut plan = build_plan_for_endpoints(&manifest, &fixture_bytes, seed, selection)?;
     plan.source_revision = source_revision();
     plan.binary_sha256 = current_binary_sha256()?;
     plan.adapter_source_sha256 = adapter_source_sha256();
@@ -60,6 +66,7 @@ fn run_plan(options: &BTreeMap<String, String>) -> Result<(), String> {
         "{}",
         json!({
             "plan_sha256": plan.plan_sha256,
+            "endpoint_selection": plan.endpoint_selection,
             "request_count": plan.scheduled_posts,
             "scheduled_posts": plan.scheduled_posts,
             "scheduled_input_reservation": plan.scheduled_input_reservation,
@@ -81,6 +88,7 @@ fn run_dry_run(options: &BTreeMap<String, String>) -> Result<(), String> {
     let plan = read_plan(plan_path)?;
     let output = json!({
         "plan_sha256": plan.plan_sha256,
+        "endpoint_selection": plan.endpoint_selection,
         "source_revision": plan.source_revision,
         "binary_sha256": plan.binary_sha256,
         "adapter_source_sha256": plan.adapter_source_sha256,
@@ -131,9 +139,12 @@ fn run_execute(options: &BTreeMap<String, String>) -> Result<(), String> {
         .open(&attempts_path)
         .map_err(|error| format!("could not create {}: {error}", attempts_path.display()))?;
     let mut attempt_writer = BufWriter::new(attempts_file);
-    let explicit_auth_path = options.get("auth-path").map(PathBuf::from);
-    let auth_source = if explicit_auth_path.is_some() {
-        "explicit_injected_path"
+    let injected_auth_path = options
+        .get("auth-path")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("KOGEN_AUTH_PATH").map(PathBuf::from));
+    let auth_source = if injected_auth_path.is_some() {
+        "kogen_injected_auth_path"
     } else {
         "kogen_owned_account_selection"
     };
@@ -169,9 +180,9 @@ fn run_execute(options: &BTreeMap<String, String>) -> Result<(), String> {
     }
     let http = ReqwestPort::new_without_redirects().map_err(|failure| failure.message)?;
     let home = kogen_home()?;
-    let account = selected_chatgpt_account(&home, explicit_auth_path.is_some())?;
+    let account = selected_chatgpt_account(&home, injected_auth_path.is_some())?;
     let mut load_credential =
-        || load_kogen_credential(&home, &account, explicit_auth_path.as_deref());
+        || load_kogen_credential(&home, &account, injected_auth_path.as_deref());
     let ledger = execute_plan(
         &plan,
         max_posts,
@@ -395,16 +406,10 @@ fn parse_cap(value: &str, name: &str) -> Result<u64, String> {
         .map_err(|_| format!("{name} must be an unsigned integer"))
 }
 
-fn reject_ambient_overrides(options: &BTreeMap<String, String>) -> Result<(), String> {
+fn reject_ambient_overrides() -> Result<(), String> {
     if env::var_os("KOGEN_PROVIDER_URL").is_some() {
         return Err(
             "KOGEN_PROVIDER_URL is not allowed; replay endpoints are fixed and allowlisted"
-                .to_owned(),
-        );
-    }
-    if env::var_os("KOGEN_AUTH_PATH").is_some() && !options.contains_key("auth-path") {
-        return Err(
-            "KOGEN_AUTH_PATH is not allowed; pass --auth-path explicitly to execute for injected auth"
                 .to_owned(),
         );
     }
@@ -413,6 +418,6 @@ fn reject_ambient_overrides(options: &BTreeMap<String, String>) -> Result<(), St
 
 fn usage() -> String {
     format!(
-        "Usage:\n  kogen-cache-replay plan --fixtures <sanitized-fixtures.json> --seed <seed> --out <plan.json>\n  kogen-cache-replay dry-run --plan <plan.json>\n  kogen-cache-replay execute --plan <plan.json> --max-posts <n> --max-total-tokens <n> --out <receipt-dir> [--auth-path <path>]\n\nThe replay allocation is capped at {MAX_POSTS} POSTs and {MAX_TOTAL_TOKENS} tokens. {CHATGPT_BACKEND_ENDPOINT} currently has no verified output-cap contract, so its plans are not admitted for execution."
+        "Usage:\n  kogen-cache-replay plan --fixtures <sanitized-fixtures.json> --seed <seed> [--endpoints openai|chatgpt|both] --out <plan.json>\n  kogen-cache-replay dry-run --plan <plan.json>\n  kogen-cache-replay execute --plan <plan.json> --max-posts <n> --max-total-tokens <n> --out <receipt-dir> [--auth-path <path>]\n\nThe full replay allocation is capped at {MAX_POSTS} POSTs and {MAX_TOTAL_TOKENS} tokens. Single-endpoint splits are capped at {SPLIT_MAX_POSTS} POSTs and {SPLIT_MAX_TOTAL_TOKENS} tokens. KOGEN_AUTH_PATH may be supplied by the host's injected-auth environment for execution."
     )
 }

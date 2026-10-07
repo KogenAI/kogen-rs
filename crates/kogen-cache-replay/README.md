@@ -43,18 +43,62 @@ replay. Keep plans and receipts outside the repository.
 ## Commands
 
 ```text
-kogen-cache-replay plan --fixtures /tmp/claude-501/krs-cache-replay/fixtures.json --seed cache-study-20261007 --out /tmp/claude-501/krs-cache-replay/plan.json
-kogen-cache-replay dry-run --plan /tmp/claude-501/krs-cache-replay/plan.json
-kogen-cache-replay execute --plan /tmp/claude-501/krs-cache-replay/plan.json --max-posts 360 --max-total-tokens 2000000 --out /tmp/claude-501/krs-cache-replay/receipts
+kogen-cache-replay plan --fixtures /tmp/claude-501/krs-cache-replay/fixtures.json --seed cache-study-20261007 --endpoints openai --out /tmp/claude-501/krs-cache-replay/openai/plan.json
+kogen-cache-replay dry-run --plan /tmp/claude-501/krs-cache-replay/openai/plan.json
+kogen-cache-replay execute --plan /tmp/claude-501/krs-cache-replay/openai/plan.json --max-posts 180 --max-total-tokens 1000000 --out /tmp/claude-501/krs-cache-replay/openai/receipts
+
+kogen-cache-replay plan --fixtures /tmp/claude-501/krs-cache-replay/fixtures.json --seed cache-study-20261007 --endpoints chatgpt --out /tmp/claude-501/krs-cache-replay/chatgpt/plan.json
+kogen-cache-replay dry-run --plan /tmp/claude-501/krs-cache-replay/chatgpt/plan.json
+kogen-cache-replay execute --plan /tmp/claude-501/krs-cache-replay/chatgpt/plan.json --max-posts 180 --max-total-tokens 1000000 --out /tmp/claude-501/krs-cache-replay/chatgpt/receipts
+
+# Both endpoints, when the full 2M-token budget is intended:
+kogen-cache-replay plan --fixtures /tmp/claude-501/krs-cache-replay/fixtures.json --seed cache-study-20261007 --endpoints both --out /tmp/claude-501/krs-cache-replay/both/plan.json
 ```
 
 The frozen plan records request bodies and hashes, randomized order, endpoint
 output-limit fields, header masks, and per-request input/output reservations.
 `dry-run` prints each request's body size, prefix length, header factors, and
-reservation without dispatching it.
+reservation without dispatching it. `--endpoints` defaults to `both`. Each
+single-endpoint plan keeps that endpoint's 180 adjacent primer/probe requests,
+including its complete AB/BA, cold/warm, header, and scope schedule. Its hard
+caps are 180 POSTs and 1,000,000 tokens; the frozen worst-case reservation is
+970,752 tokens for each split. The two split plan hashes are deterministic and
+distinct.
 
-`KOGEN_PROVIDER_URL` is rejected. Ambient `KOGEN_AUTH_PATH` is rejected unless
-`--auth-path` explicitly selects Kogen injected credentials. Without that
-option, execution uses Kogen's normal selected Owned ChatGPT account and
-refresh path. Receipts retain raw usage and HTTP status but omit auth headers,
-response text, provider response IDs, and turn-state values.
+The first live run stopped on its first backend request because Kogen's
+`OwnedBackend` adapter requires an account ID. For an Owned login Kogen derives
+that value from the `chatgpt_account_id` ID-token claim; the selected login
+returned no account ID, so wire construction failed before body validation or
+dispatch. The injected credential path supplies its account ID directly.
+
+`KOGEN_PROVIDER_URL` is rejected. Execution uses `KOGEN_AUTH_PATH` from the
+host's established injected-auth environment when it is set; `--auth-path` is
+also supported. Without either, execution uses Kogen's normal selected Owned
+ChatGPT account and refresh path. Kogen re-reads injected credentials for each
+request. Keep the injected credential on the benchmark host; never put it in
+the source bundle, fixtures, plan, or receipts.
+
+## Linux benchmark host
+
+Build from the unpacked source bundle on the benchmark host. Include the
+sanitized `fixtures.json` alongside the bundle, but do not include credentials.
+The plan pins the binary SHA-256, so generate the execution plan with the Linux
+binary after building it. This also ensures the plan hash reflects the host
+build. The R74 host must set `KOGEN_AUTH_PATH` through its established
+injection before running these commands:
+
+```sh
+cd /path/to/unpacked/kogen-cache-replay-source
+CARGO_TARGET_DIR=/tmp/krs-target cargo build --release --locked -p kogen-cache-replay
+REPLAY_BIN=/tmp/krs-target/release/kogen-cache-replay
+REPLAY_DIR=/tmp/krs-cache-replay
+: "${KOGEN_AUTH_PATH:?R74 host injection must set KOGEN_AUTH_PATH}"
+mkdir -p "$REPLAY_DIR/chatgpt"
+"$REPLAY_BIN" plan --fixtures "$REPLAY_DIR/fixtures.json" --seed cache-study-20261007 --endpoints chatgpt --out "$REPLAY_DIR/chatgpt/plan.json"
+"$REPLAY_BIN" dry-run --plan "$REPLAY_DIR/chatgpt/plan.json" > "$REPLAY_DIR/chatgpt/dry-run.json"
+"$REPLAY_BIN" execute --plan "$REPLAY_DIR/chatgpt/plan.json" --max-posts 180 --max-total-tokens 1000000 --out "$REPLAY_DIR/chatgpt/receipts"
+```
+
+The OpenAI split command is the same with `--endpoints openai`, an `openai`
+plan/receipt directory, and no injected-auth requirement. The `both` plan uses
+the full 360 POST and 2,000,000 token cap.

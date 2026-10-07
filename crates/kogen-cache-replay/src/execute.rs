@@ -283,10 +283,11 @@ where
         };
         let wire = match build_wire_for_attempt(planned, &auth, sticky_state) {
             Ok(wire) => wire,
-            Err(_) => {
-                stop_reason =
-                    Some("frozen body or Kogen wire validation failed before dispatch".to_owned());
-                receipt.unexecuted_reason = Some("wire_validation_failed".to_owned());
+            Err(reason) => {
+                stop_reason = Some(format!(
+                    "Kogen wire validation failed before dispatch: {reason}"
+                ));
+                receipt.unexecuted_reason = stop_reason.clone();
                 journal(&receipt)?;
                 ledger.attempts.push(receipt);
                 continue;
