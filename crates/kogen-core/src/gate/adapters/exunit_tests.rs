@@ -100,6 +100,42 @@ fn unavailable_detection_reads_only_the_first_twenty_lines() {
     later.extend_from_slice(b"mix: command not found\n");
     assert!(!unavailable(&later));
     assert!(!unavailable(b"mix test failed because test is missing\n"));
+    assert!(!unavailable(
+        b"** (Mix.Error) Mix requires the Hex package manager to build dependency :demo\n"
+    ));
+    assert!(!unavailable(
+        b"** (Mix.Error) Could not find an SCM for dependency :demo from Demo.MixProject\n"
+    ));
+}
+
+#[test]
+fn diagnostics_name_the_missing_runtime_or_report_dependency_setup_failure() {
+    assert_eq!(
+        environment_failure(b"elixir: command not found\n", true),
+        Some(EnvironmentFailure {
+            reason: "tool_missing",
+            detail: "elixir not found (via mise exec)".to_owned(),
+        })
+    );
+
+    let hex_missing = environment_failure(
+        b"** (Mix.Error) Mix requires the Hex package manager to build dependency :demo\n",
+        true,
+    )
+    .unwrap();
+    assert_eq!(hex_missing.reason, "setup_failed");
+    assert_eq!(hex_missing.detail, "dependencies not fetched (hex missing)");
+
+    let scm_missing = environment_failure(
+        b"** (Mix.Error) Could not find an SCM for dependency :demo from Demo.MixProject\n",
+        true,
+    )
+    .unwrap();
+    assert_eq!(scm_missing.reason, "setup_failed");
+    assert_eq!(
+        scm_missing.detail,
+        "dependencies not fetched (dependency SCM missing)"
+    );
 }
 
 #[test]

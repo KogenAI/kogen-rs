@@ -242,6 +242,20 @@ impl ShapeCommands {
                 }
             })?
         };
+        if self.acceptance.adapter == "exunit"
+            && !result.process.timed_out
+            && (result.process.unavailable
+                || result.process.exit_status.is_some_and(|status| status != 0))
+            && let Some(failure) = crate::gate::adapters::exunit::process_environment_failure(
+                &result.process,
+                use_mise,
+            )
+        {
+            return Err(ValidationFailure {
+                reason: failure.reason,
+                detail: failure.detail,
+            });
+        }
         if result.process.unavailable || matches!(result.process.exit_status, Some(126 | 127)) {
             return Err(ValidationFailure {
                 reason: "tool_missing",

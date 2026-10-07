@@ -166,14 +166,8 @@ fn run_inner(
         run_dir,
         &base_environment,
     )?;
-    if base_acceptance
-        .failures
-        .contains(&crate::gate::AcceptanceFailure::ToolMissing)
-    {
-        return Err(environment_error(
-            "tool_missing",
-            "acceptance runner is unavailable on the build base",
-        ));
+    if let Some(error) = support::base_acceptance_environment_error(options, &base_acceptance) {
+        return Err(error);
     }
     let acceptance_text = base_acceptance_text(approved, &base_acceptance);
     provider.record_event(

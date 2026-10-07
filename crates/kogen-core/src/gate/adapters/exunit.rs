@@ -7,7 +7,7 @@ use crate::gate::ledger::{
     AcceptanceFailure, AcceptanceRunError, CommandAcceptanceRequest, CommandAcceptanceResult,
     TreeSnapshotPort, run_command_acceptance,
 };
-use crate::run::ProcessPort;
+use crate::run::{ProcessPort, ProcessResult};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -17,6 +17,12 @@ use std::path::{Path, PathBuf};
 pub const ACCEPTANCE_EXTENSION: &str = "_test.exs";
 pub const CANDIDATE_DIRECTORY: &str = "test/acceptance";
 pub const SETUP_SEEDS: &[&str] = &["deps", "_build"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentFailure {
+    pub reason: &'static str,
+    pub detail: String,
+}
 
 #[derive(Debug)]
 pub enum ExUnitAdapterError {
@@ -192,10 +198,37 @@ pub fn formatter(checks: &[CheckCommand], file: &Path) -> Option<Vec<OsString>> 
 
 /// A missing runtime mentioned near the start of the log is an adapter signal.
 pub fn unavailable(log: &[u8]) -> bool {
-    String::from_utf8_lossy(log)
-        .lines()
-        .take(20)
-        .any(missing_runtime_line)
+    missing_runtime(log).is_some()
+}
+
+/// Names the runtime or setup problem shown by an ExUnit log.
+///
+/// The runtime signal follows the adapter contract and only reads its first 20
+/// lines. Dependency errors are setup failures, not an unavailable runtime.
+pub fn environment_failure(log: &[u8], via_mise: bool) -> Option<EnvironmentFailure> {
+    if let Some(tool) = missing_runtime(log) {
+        let detail = if via_mise {
+            format!("{tool} not found (via mise exec)")
+        } else {
+            format!("{tool} not found")
+        };
+        return Some(EnvironmentFailure {
+            reason: "tool_missing",
+            detail,
+        });
+    }
+    dependency_setup_failure(log).map(|detail| EnvironmentFailure {
+        reason: "setup_failed",
+        detail: detail.to_owned(),
+    })
+}
+
+pub fn process_environment_failure(
+    process: &ProcessResult,
+    via_mise: bool,
+) -> Option<EnvironmentFailure> {
+    let log = fs::read(&process.log_path).unwrap_or_else(|_| process.output_tail.clone());
+    environment_failure(&log, via_mise)
 }
 
 /// Runs ExUnit through the shared ledger and applies its log-based unavailable signal.
@@ -241,27 +274,66 @@ fn is_elixir_file(path: &Path) -> bool {
     )
 }
 
-fn missing_runtime_line(line: &str) -> bool {
+fn missing_runtime(log: &[u8]) -> Option<&'static str> {
+    String::from_utf8_lossy(log)
+        .lines()
+        .take(20)
+        .find_map(missing_runtime_name)
+}
+
+fn missing_runtime_name(line: &str) -> Option<&'static str> {
     let line = line.to_ascii_lowercase();
-    let missing = [
-        "not found",
-        "no such file",
-        "could not find",
-        "cannot find",
-        "can't find",
-        "not recognized",
-    ];
-    if !missing.iter().any(|marker| line.contains(marker)) {
-        return false;
-    }
-    ["erl", "elixir", "mix"].iter().any(|name| {
+    ["erl", "elixir", "mix"].into_iter().find(|name| {
         line.match_indices(name).any(|(index, _)| {
-            let before = line.as_bytes().get(index.wrapping_sub(1)).copied();
-            let after = line.as_bytes().get(index + name.len()).copied();
-            before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
-                && after.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+            let before = line[..index].trim_end();
+            let after = line[index + name.len()..].trim_start();
+            let before_boundary = line.as_bytes().get(index.wrapping_sub(1)).copied();
+            let after_boundary = line.as_bytes().get(index + name.len()).copied();
+            let is_word = before_boundary
+                .is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+                && after_boundary.is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_');
+            if !is_word {
+                return false;
+            }
+
+            let named_before = [
+                "could not find",
+                "cannot find",
+                "can't find",
+                "not found:",
+                "missing",
+            ]
+            .iter()
+            .any(|marker| before.ends_with(marker));
+            let named_after = [
+                ": command not found",
+                " command not found",
+                ": not found",
+                " not found",
+                ": no such file",
+                " no such file",
+                " is not available",
+                " is missing",
+                " not recognized",
+            ]
+            .iter()
+            .any(|marker| after.starts_with(marker));
+            named_before || named_after
         })
     })
+}
+
+fn dependency_setup_failure(log: &[u8]) -> Option<&'static str> {
+    let log = String::from_utf8_lossy(log).to_ascii_lowercase();
+    if log.contains("mix requires the hex package manager")
+        || (log.contains("could not find hex") && log.contains("dependency"))
+    {
+        Some("dependencies not fetched (hex missing)")
+    } else if log.contains("could not find an scm for dependency") {
+        Some("dependencies not fetched (dependency SCM missing)")
+    } else {
+        None
+    }
 }
 
 fn elixir_string(value: &str) -> String {
