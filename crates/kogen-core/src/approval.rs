@@ -51,7 +51,47 @@ pub fn approve(
     given_hash: Option<&str>,
     by: Option<&str>,
 ) -> CliOutput {
-    match approve_inner(project, slug, given_hash, by) {
+    approve_with_effects(project, slug, given_hash, by, &mut NoApprovalEffects)
+}
+
+/// Effect port used to inject a ref race in deterministic adapter replays.
+/// Production callers use [`approve`], which supplies a no-op implementation.
+pub trait ApprovalEffects {
+    fn before_late_read(
+        &mut self,
+        _project: &ProjectResolution,
+        _slug: &str,
+        _attempt: u8,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn before_ref_cas(
+        &mut self,
+        _project: &ProjectResolution,
+        _slug: &str,
+        _attempt: u8,
+        _expected: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct NoApprovalEffects;
+
+impl ApprovalEffects for NoApprovalEffects {}
+
+/// Run the production approval decision with an injected effect at the CAS
+/// boundary. The policy, source reread, retry count, and CAS remain in the
+/// same command path used by [`approve`].
+pub fn approve_with_effects(
+    project: &ProjectResolution,
+    slug: &str,
+    given_hash: Option<&str>,
+    by: Option<&str>,
+    effects: &mut dyn ApprovalEffects,
+) -> CliOutput {
+    match approve_inner(project, slug, given_hash, by, effects) {
         Ok(output) => output,
         Err(error) => error.into_cli_output(),
     }
@@ -67,6 +107,7 @@ fn approve_inner(
     slug: &str,
     given_hash: Option<&str>,
     by: Option<&str>,
+    effects: &mut dyn ApprovalEffects,
 ) -> Result<CliOutput, CoreError> {
     if !valid_slug(slug) {
         return Err(intent_error(
@@ -292,6 +333,9 @@ fn approve_inner(
             },
         )
         .map_err(|error| environment_git("approval_commit_failed", error))?;
+        effects
+            .before_late_read(project, slug, tries)
+            .map_err(|detail| controller_error("approval_effect_failed", detail))?;
         let late_intent = read_source(&intent_path)
             .map_err(|_| hash_mismatch(slug, "unavailable", given_hash.unwrap_or_default()))?;
         let late_acceptance = read_source(&source_path)
@@ -310,6 +354,9 @@ fn approve_inner(
                 given_hash.unwrap_or_default(),
             ));
         }
+        effects
+            .before_ref_cas(project, slug, tries, parent.as_deref())
+            .map_err(|detail| controller_error("approval_effect_failed", detail))?;
         if origin
             .cas_ref(&ref_name, &commit, parent.as_deref())
             .map_err(|error| environment_git("approval_ref_update_failed", error))?

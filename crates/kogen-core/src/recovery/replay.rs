@@ -1,4 +1,4 @@
-//! Pure recovery transition shared by the production reconciler and xspec.
+//! Recovery decisions shared by the production reconciler and deterministic replay effects.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -13,6 +13,10 @@ pub struct RecoveryRun {
     pub incoming: bool,
     pub queued: bool,
     pub reason: String,
+    pub work: bool,
+    pub preserved: bool,
+    pub preserve_ok: bool,
+    pub cleanup_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -26,6 +30,9 @@ pub struct RecoveryFact {
     pub queued: bool,
     pub claim: bool,
     pub reason: String,
+    pub work: bool,
+    pub preserved: bool,
+    pub preserve_ok: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +73,7 @@ pub fn recovery_decision(
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecoveryEvent {
     Put(RecoveryFact),
+    PreservationResult { id: String, ok: bool },
     Recover,
     Reapprove(String),
 }
@@ -98,6 +106,13 @@ impl RecoveryModel {
     pub fn apply(&mut self, event: RecoveryEvent) -> RecoveryObservation {
         match event {
             RecoveryEvent::Put(fact) => self.put(fact),
+            RecoveryEvent::PreservationResult { id, ok } => {
+                if let Some(run) = self.runs.get_mut(&id) {
+                    run.preserve_ok = ok;
+                } else {
+                    self.error("unknown_run");
+                }
+            }
             RecoveryEvent::Recover => self.recover(),
             RecoveryEvent::Reapprove(id) => self.reapprove(&id),
         }
@@ -160,6 +175,10 @@ impl RecoveryModel {
                 incoming: fact.incoming,
                 queued: fact.queued,
                 reason: fact.reason,
+                work: fact.work,
+                preserved: fact.preserved,
+                preserve_ok: fact.preserve_ok,
+                cleanup_pending: false,
             },
         );
         if fact.claim {
@@ -177,13 +196,18 @@ impl RecoveryModel {
             let Some(run) = self.runs.get(id).cloned() else {
                 continue;
             };
-            if let Some(decision) =
+            if run.cleanup_pending {
+                self.finish(id, &run.status, &run.reason);
+            } else if let Some(decision) =
                 recovery_decision(&run.status, run.alive, run.on_base, &run.last_event)
             {
                 self.finish(id, decision.status, decision.reason);
             }
         }
-        if self.line == before.line && self.claim == before.claim {
+        if self.runs.values().any(|run| run.cleanup_pending) {
+            self.last = "ok".to_owned();
+            self.line = "cleanup_failure".to_owned();
+        } else if self.runs == before.runs && self.claim == before.claim {
             self.last = "ok".to_owned();
             self.line = "unchanged".to_owned();
         }
@@ -191,16 +215,26 @@ impl RecoveryModel {
 
     fn finish(&mut self, id: &str, status: &str, reason: &str) {
         if let Some(run) = self.runs.get_mut(id) {
+            let needs_copy = run.work || run.incoming;
+            let preserved = run.preserved || (needs_copy && run.preserve_ok);
+            let pending = needs_copy && !preserved;
             run.status = status.to_owned();
             run.reason = reason.to_owned();
-            run.incoming = false;
             run.queued = false;
+            run.preserved = preserved;
+            run.work &= pending;
+            run.incoming = run.incoming && pending;
+            run.cleanup_pending = pending;
+            self.line = if pending {
+                "cleanup_failure".to_owned()
+            } else {
+                reason.to_owned()
+            };
         }
         if self.claim == id {
             self.claim.clear();
         }
         self.last = "ok".to_owned();
-        self.line = reason.to_owned();
     }
 
     fn reapprove(&mut self, id: &str) {
@@ -209,6 +243,10 @@ impl RecoveryModel {
             return;
         }
         let run = self.runs.get(id).cloned().unwrap_or_default();
+        if run.cleanup_pending {
+            self.error("cleanup_pending");
+            return;
+        }
         if run.status == "landed" {
             self.error("already_landed");
             return;
@@ -240,4 +278,45 @@ fn known_status(status: &str) -> bool {
         status,
         "running" | "landed" | "failed" | "parked" | "stopped" | "approved"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecoveryEvent, RecoveryFact, RecoveryModel};
+
+    #[test]
+    fn failed_preservation_retains_work_and_incoming_until_retry_succeeds() {
+        let mut replay = RecoveryModel::new();
+        replay.apply(RecoveryEvent::Put(RecoveryFact {
+            id: "r1".to_owned(),
+            status: "running".to_owned(),
+            alive: false,
+            on_base: false,
+            last_event: "other".to_owned(),
+            incoming: true,
+            queued: false,
+            claim: true,
+            reason: String::new(),
+            work: true,
+            preserved: false,
+            preserve_ok: false,
+        }));
+
+        let failed = replay.apply(RecoveryEvent::Recover);
+        let run = &failed.runs["r1"];
+        assert_eq!(run.status, "failed");
+        assert!(run.work && run.incoming && run.cleanup_pending);
+        assert!(!run.preserved);
+        assert!(failed.claim.is_empty());
+
+        replay.apply(RecoveryEvent::PreservationResult {
+            id: "r1".to_owned(),
+            ok: true,
+        });
+        let retried = replay.apply(RecoveryEvent::Recover);
+        let run = &retried.runs["r1"];
+        assert!(run.preserved);
+        assert!(!run.work && !run.incoming && !run.cleanup_pending);
+        assert_eq!(run.reason, "crashed");
+    }
 }

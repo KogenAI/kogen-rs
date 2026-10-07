@@ -1,11 +1,6 @@
-//! Pure transitions shared by the private replay adapter and approval command.
-
-mod approve;
-mod intent;
+//! Git helpers used by the production approval command.
 
 use crate::git::{GitError, GitRepo};
-pub use approve::{approve_apply, approve_initial, approve_observe};
-pub use intent::{intent_apply, intent_initial};
 
 /// Compute the prefix decision from the exact source bytes.
 #[must_use]

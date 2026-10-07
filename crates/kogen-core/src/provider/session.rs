@@ -1,7 +1,5 @@
 //! Build cache affinity, conversation identity, and append-only history.
 
-pub mod replay;
-
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;

@@ -1,7 +1,7 @@
-use super::{Adapter, SourceBytes, empty_observation, object, string, value_with};
-use kogen_core::approval::replay::{self, intent_apply};
-use kogen_core::intent::{approval_sha256, intent_sha256};
-use serde_json::{Value, json};
+use super::{Adapter, ApprovalAlias, boolean, object, string};
+use kogen_core::error::CliOutput;
+use kogen_core::intent::{Intent, approval_sha256};
+use serde_json::{Map, Value, json};
 
 pub(super) fn apply(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
     let tag = string(event, "tag")?;
@@ -14,225 +14,368 @@ pub(super) fn apply(adapter: &mut Adapter, event: &Value) -> Result<Value, Strin
     }
 }
 
-pub(super) fn observe(adapter: &Adapter) -> Value {
-    let mut observation = adapter.state.clone();
-    if let Ok(summaries) = adapter.project.approval_summaries(&["alpha", "bravo"])
-        && let Some(refs) = observation.get_mut("refs").and_then(Value::as_object_mut)
-    {
-        for (slug, summary) in summaries {
-            if let Some(reference) = refs.get_mut(&slug).and_then(Value::as_object_mut) {
-                // Keep the model's symbolic digest while taking the count
-                // from the real temporary Git ref when it has an approval.
-                reference.insert("n".to_owned(), json!(summary.n));
-            }
+pub(super) fn observe(adapter: &Adapter) -> Result<Value, String> {
+    let summaries = adapter.project.approval_summaries(&["alpha", "bravo"])?;
+    let mut refs = Map::new();
+    let mut life = Map::new();
+    for (slug, alias) in &adapter.approval_aliases {
+        let summary = summaries
+            .get(slug)
+            .ok_or_else(|| format!("expected approval ref refs/kogen/intents/{slug} is missing"))?;
+        if summary.sha != alias.actual_sha {
+            return Err(format!(
+                "approval ref {slug} now binds {}, expected {}",
+                summary.sha, alias.actual_sha
+            ));
+        }
+        if summary.commit != alias.actual_commit {
+            return Err(format!(
+                "approval ref {slug} moved to {}, expected {}",
+                summary.commit, alias.actual_commit
+            ));
         }
     }
-    if observation.is_object() {
-        return observation;
+    for slug in ["alpha", "bravo"] {
+        if !adapter.project.intent_source_exists(slug)? {
+            continue;
+        }
+        let status = if let Some(summary) = summaries.get(slug) {
+            let status = adapter
+                .project
+                .adopted_status(slug, &summary.commit)?
+                .unwrap_or_else(|| "approved".to_owned());
+            let hash = adapter
+                .intent_hash_aliases
+                .get(slug)
+                .cloned()
+                .unwrap_or_else(|| summary.sha.clone());
+            refs.insert(slug.to_owned(), json!({ "n": summary.n, "hash": hash }));
+            status
+        } else {
+            "shaped".to_owned()
+        };
+        life.insert(slug.to_owned(), json!(status));
     }
-    empty_observation()
+    let mut observation = adapter.state.clone();
+    let map = observation
+        .as_object_mut()
+        .ok_or_else(|| "intent observation state is not an object".to_owned())?;
+    map.insert("refs".to_owned(), Value::Object(refs));
+    map.insert("life".to_owned(), Value::Object(life));
+    Ok(observation)
 }
 
 fn shape(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
-    let value = event
-        .get("value")
-        .filter(|value| value.is_object())
-        .ok_or_else(|| "Shape requires a value object".to_owned())?;
-    let slug = string(value, "slug")?;
-    let result = string(value, "result")?;
-    let next = intent_apply(&adapter.state, event)?;
-    if result == "valid"
-        && next.get("did").and_then(Value::as_str) == Some("shaped")
-        && matches!(slug, "alpha" | "bravo")
-        && !adapter
-            .project
-            .intent_source_exists(slug)
-            .map_err(|error| error.to_string())?
-    {
-        let bytes = adapter.project.reset_sources(slug)?;
-        adapter.project.write_sources(slug, &bytes)?;
-        adapter.project.persist_sources(slug)?;
-    }
-    adapter.state = next;
-    Ok(observe(adapter))
-}
-
-fn approve(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
-    let value = event
-        .get("value")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "Approve requires a value object".to_owned())?;
-    let value = Value::Object(value.clone());
+    let value = Value::Object(object(event, "value")?.clone());
     let slug = string(&value, "slug")?;
-    let claim = string(&value, "hash")?;
-    let race = string(&value, "race")?;
-    let modeled_prefix_ok = super::boolean(&value, "prefixOk")?;
-
-    let source = if matches!(slug, "alpha" | "bravo")
-        && adapter
-            .project
-            .intent_source_exists(slug)
-            .map_err(|error| error.to_string())?
-        && adapter
-            .project
-            .acceptance_source_exists(slug)
-            .map_err(|error| error.to_string())?
-    {
-        Some(
-            adapter
-                .project
-                .read_sources(slug)
-                .map_err(|error| error.to_string())?,
-        )
+    let result = string(&value, "result")?;
+    let current_summary = if matches!(slug, "alpha" | "bravo") {
+        adapter.project.approval_summaries(&[slug])?.remove(slug)
     } else {
         None
     };
-    let actual_hash = source
-        .as_ref()
-        .map(|bytes| approval_sha256(&bytes.intent, &bytes.acceptance));
-    let actual_claim = actual_hash
-        .as_deref()
-        .map(|hash| super::digest::modeled_claim(hash, claim, modeled_prefix_ok));
-    let prefix_ok = actual_hash
-        .as_deref()
-        .zip(actual_claim.as_deref())
-        .is_some_and(|(hash, claim)| hash.starts_with(claim));
-    let mut effective_value = value.as_object().cloned().unwrap_or_default();
-    effective_value.insert("prefixOk".to_owned(), json!(prefix_ok));
-    effective_value.insert("race".to_owned(), json!("none"));
-    let effective = value_with(event, Value::Object(effective_value));
-
-    let mut actual_race = if matches!(race, "none" | "once" | "twice") {
-        "none"
+    let (last, exit, did) = if !matches!(slug, "alpha" | "bravo") {
+        ("unknown_slug", 2, "")
     } else {
-        race
+        match result {
+            "empty" => ("intent/request_unavailable", 2, ""),
+            "provider" => ("provider/overload", 4, ""),
+            "failed" => ("candidate/repair_limit", 1, "shape_failed"),
+            "valid" => {
+                if current_summary.is_none() && !adapter.project.intent_source_exists(slug)? {
+                    let source = adapter.project.reset_sources(slug)?;
+                    let parsed = Intent::parse(slug, &source.intent)
+                        .map_err(|error| format!("valid shape fixture did not parse: {error}"))?;
+                    if parsed
+                        .lint()
+                        .iter()
+                        .any(|issue| issue.severity == kogen_core::intent::LintSeverity::Error)
+                    {
+                        return Err("valid shape fixture failed production Intent lint".to_owned());
+                    }
+                    adapter.project.persist_sources(slug)?;
+                }
+                ("ok", 0, "shaped")
+            }
+            _ => ("unknown_result", 70, ""),
+        }
     };
-    let candidate = intent_apply(&adapter.state, &effective)?;
-    if candidate.get("did").and_then(Value::as_str) == Some("approved")
-        && matches!(race, "none" | "once" | "twice")
-    {
-        let source = source.ok_or_else(|| "approval source disappeared".to_owned())?;
-        let hash = approval_sha256(&source.intent, &source.acceptance);
-        let (tries, won) = create_and_cas_approval(adapter, slug, &source, &hash, race)?;
-        actual_race = match (tries, won) {
-            (1, true) => "none",
-            (2, true) => "once",
-            (2, false) => "twice",
-            _ => return Err("approval CAS returned an impossible attempt count".to_owned()),
-        };
-    }
-    if let Some(map) = effective.get("value").and_then(Value::as_object) {
-        let mut next_value = map.clone();
-        next_value.insert("race".to_owned(), json!(actual_race));
-        adapter.state = intent_apply(
-            &adapter.state,
-            &value_with(event, Value::Object(next_value)),
-        )?;
-    } else {
-        return Err("Approve event lost its value object".to_owned());
-    }
-    Ok(observe(adapter))
+    set_intent_state(adapter, last, exit, did, "", None);
+    observe(adapter)
 }
 
-fn create_and_cas_approval(
-    adapter: &Adapter,
-    slug: &str,
-    source: &SourceBytes,
-    hash: &str,
-    race_injection: &str,
-) -> Result<(u8, bool), String> {
-    let by = adapter
-        .project
-        .checkout_repo
-        .author_identity()
-        .map_err(|error| error.to_string())?;
-    let base = adapter
-        .project
-        .base_commit()
-        .map_err(|error| error.to_string())?;
-    let ref_name = format!("refs/kogen/intents/{slug}");
-    let mut parent = adapter
-        .project
-        .origin
-        .ref_target(&ref_name)
-        .map_err(|error| error.to_string())?;
-    let mut tries = 0_u8;
-    let mut won = false;
-    for attempt in 0..2 {
-        let approval_bytes = approval_document(slug, hash, &source.intent, &base, &by);
-        let commit = replay::create_approval_commit(
-            &adapter.project.origin,
-            replay::ApprovalPackage {
-                slug,
-                intent: &source.intent,
-                approval: &approval_bytes,
-                ledger: None,
-                test_path: &format!(".kogen/acceptance/{slug}.t.sh"),
-                acceptance: &source.acceptance,
-                by: &by,
-                hash,
-                at: "2000-01-01T00:00:00Z",
-                parent: parent.as_deref(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        if race_injection == "twice" || (race_injection == "once" && attempt == 0) {
-            adapter.project.advance_approval_ref(slug)?;
-        }
-        tries += 1;
-        if adapter
-            .project
-            .origin
-            .cas_ref(&ref_name, &commit, parent.as_deref())
-            .map_err(|error| error.to_string())?
-        {
-            won = true;
-            break;
-        }
-        if attempt == 0 {
-            parent = adapter
-                .project
-                .origin
-                .ref_target(&ref_name)
-                .map_err(|error| error.to_string())?;
-        }
+fn approve(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
+    let value = Value::Object(object(event, "value")?.clone());
+    let slug = string(&value, "slug")?;
+    let mode = string(&value, "mode")?;
+    let symbolic_hash = string(&value, "hash")?;
+    if !matches!(slug, "alpha" | "bravo") {
+        set_intent_state(adapter, "unknown_slug", 2, "", "", Some(0));
+        return observe(adapter);
     }
-    Ok((tries, won))
+    if !matches!(mode, "card" | "commit") {
+        set_intent_state(adapter, "unknown_mode", 70, "", "", None);
+        return observe(adapter);
+    }
+
+    let source_exists = adapter.project.intent_source_exists(slug)?;
+    let source = source_exists
+        .then(|| adapter.project.read_sources(slug))
+        .transpose()?;
+    let actual_hash = source
+        .as_ref()
+        .map(|source| approval_sha256(&source.intent, &source.acceptance));
+    let prefix_ok = boolean(&value, "prefixOk")?;
+    let actual_claim = if mode == "commit" {
+        actual_hash
+            .as_deref()
+            .map(|hash| super::digest::modeled_claim(hash, symbolic_hash, prefix_ok))
+    } else {
+        None
+    };
+    let project = adapter.project.resolve()?;
+    let race = string(&value, "race")?;
+    let mut effects = IntentEffects {
+        project: &adapter.project,
+        race,
+        attempts: 0,
+    };
+    let output = kogen_core::approval::approve_with_effects(
+        &project,
+        slug,
+        actual_claim.as_deref(),
+        None,
+        &mut effects,
+    );
+    let last = last_code(&output);
+    let did = match last.as_str() {
+        "needs_decision" => "card",
+        "ok" if mode == "commit" => "approved",
+        _ => "",
+    };
+    if did == "approved" {
+        let summary = adapter
+            .project
+            .approval_summaries(&[slug])?
+            .remove(slug)
+            .ok_or_else(|| {
+                format!(
+                    "production approve reported success but refs/kogen/intents/{slug} is missing"
+                )
+            })?;
+        if actual_hash.as_deref() != Some(summary.sha.as_str()) {
+            return Err(format!(
+                "production approval ref {slug} binds {}, expected actual source digest {}",
+                summary.sha,
+                actual_hash.as_deref().unwrap_or("<missing>")
+            ));
+        }
+        adapter
+            .intent_hash_aliases
+            .insert(slug.to_owned(), symbolic_hash.to_owned());
+        adapter.approval_aliases.insert(
+            slug.to_owned(),
+            ApprovalAlias {
+                sha: symbolic_hash.to_owned(),
+                actual_sha: summary.sha,
+                commit: String::new(),
+                base: String::new(),
+                actual_commit: summary.commit,
+            },
+        );
+    } else if last == "controller/approval_cas_lost"
+        && let Some(alias) = adapter.approval_aliases.get_mut(slug)
+        && let Some(summary) = adapter.project.approval_summaries(&[slug])?.get(slug)
+        && summary.sha == alias.actual_sha
+    {
+        alias.actual_commit = summary.commit.clone();
+    }
+    let cas_tries = match last.as_str() {
+        "needs_decision" | "intent/hash_mismatch" => Some(0),
+        "ok" if mode == "commit" => Some(effects.attempts),
+        "controller/approval_cas_lost" => Some(effects.attempts),
+        _ => None,
+    };
+    let shown = if matches!(
+        last.as_str(),
+        "needs_decision" | "ok" | "intent/hash_mismatch"
+    ) {
+        symbolic_hash.to_owned()
+    } else {
+        String::new()
+    };
+    set_intent_state(
+        adapter,
+        &last,
+        output.exit_code.as_i32(),
+        did,
+        &shown,
+        cas_tries,
+    );
+    observe(adapter)
 }
 
 fn remove(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
-    let next = intent_apply(&adapter.state, event)?;
-    if next.get("did").and_then(Value::as_str) == Some("removed") {
-        let value = Value::Object(object(event, "value")?.clone());
-        let slug = string(&value, "slug")?;
-        adapter.project.remove_tracked_sources(slug)?;
-        adapter.project.remove_approval_ref(slug)?;
+    let value = Value::Object(object(event, "value")?.clone());
+    let slug = string(&value, "slug")?;
+    let force = boolean(&value, "force")?;
+    if !matches!(slug, "alpha" | "bravo") {
+        set_intent_state(adapter, "unknown_slug", 2, "", "", Some(0));
+        return observe(adapter);
     }
-    adapter.state = next;
-    Ok(observe(adapter))
+    let project = adapter.project.resolve()?;
+    let output = kogen_core::approval::remove(&project, slug, force);
+    let last = last_code(&output);
+    let did = if last == "ok" { "removed" } else { "" };
+    if did == "removed" {
+        adapter.approval_aliases.remove(slug);
+        adapter.intent_hash_aliases.remove(slug);
+    }
+    set_intent_state(
+        adapter,
+        &last,
+        output.exit_code.as_i32(),
+        did,
+        "",
+        (did == "removed").then_some(0),
+    );
+    observe(adapter)
 }
 
 fn adopt(adapter: &mut Adapter, event: &Value) -> Result<Value, String> {
-    adapter.state = intent_apply(&adapter.state, event)?;
-    Ok(observe(adapter))
+    let value = Value::Object(object(event, "value")?.clone());
+    let slug = string(&value, "slug")?;
+    let status = string(&value, "status")?;
+    if !matches!(slug, "alpha" | "bravo") {
+        set_intent_state(adapter, "bad_adopt", 70, "", "", None);
+        return observe(adapter);
+    }
+    let summary = adapter.project.approval_summaries(&[slug])?.remove(slug);
+    let Some(summary) = summary else {
+        set_intent_state(adapter, "bad_adopt", 70, "", "", None);
+        return observe(adapter);
+    };
+    let previous = adapter
+        .project
+        .adopted_status(slug, &summary.commit)?
+        .unwrap_or_else(|| "approved".to_owned());
+    if !matches!(
+        status,
+        "building" | "failed" | "parked" | "interrupted" | "landed"
+    ) || (previous != "approved" && !(previous == "building" && status != "building"))
+    {
+        set_intent_state(adapter, "bad_adopt", 70, "", "", None);
+        return observe(adapter);
+    }
+    adapter.project.adopt_run_status(slug, status)?;
+    set_intent_state(adapter, "ok", 0, "adopted", "", None);
+    observe(adapter)
 }
 
-fn approval_document(slug: &str, hash: &str, intent: &[u8], base: &str, by: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "schema": 2,
-        "slug": slug,
-        "approval_sha256": hash,
-        "intent_sha256": intent_sha256(intent),
-        "target_branch": "main",
-        "base_sha": base,
-        "domains": ["platform"],
-        "acceptance_paths": [format!(".kogen/acceptance/{slug}.t.sh")],
-        "protected_manifest": {},
-        "check_baseline": [],
-        "witness": null,
-        "by": by,
-        "at": "2000-01-01T00:00:00Z",
-        "feasibility": "not checked"
-    }))
-    .unwrap_or_default()
+struct IntentEffects<'a> {
+    project: &'a super::temp::TempProject,
+    race: &'a str,
+    attempts: u8,
+}
+
+impl kogen_core::approval::ApprovalEffects for IntentEffects<'_> {
+    fn before_ref_cas(
+        &mut self,
+        _project: &kogen_core::project::ProjectResolution,
+        slug: &str,
+        attempt: u8,
+        _expected: Option<&str>,
+    ) -> Result<(), String> {
+        self.attempts = self.attempts.max(attempt);
+        if self.race == "twice" || (self.race == "once" && attempt == 1) {
+            self.project.advance_approval_ref(slug)?;
+        }
+        Ok(())
+    }
+}
+
+fn set_intent_state(
+    adapter: &mut Adapter,
+    last: &str,
+    exit: i32,
+    did: &str,
+    shown: &str,
+    cas_tries: Option<u8>,
+) {
+    let previous_cas = adapter
+        .state
+        .get("casTries")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let cas_tries = cas_tries.map_or(previous_cas, u64::from);
+    adapter.state = json!({
+        "last": last,
+        "exit": exit,
+        "did": did,
+        "shown": shown,
+        "casTries": cas_tries,
+        "life": {},
+        "refs": {},
+    });
+}
+
+fn last_code(output: &CliOutput) -> String {
+    match output.exit_code {
+        kogen_core::ExitCode::Done => "ok".to_owned(),
+        kogen_core::ExitCode::Decision => "needs_decision".to_owned(),
+        _ => output
+            .stdout
+            .lines()
+            .next()
+            .and_then(|line| line.split_once(": ").map(|(head, _)| head.to_owned()))
+            .unwrap_or_else(|| "unknown_error".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::observe;
+    use crate::xspec::Adapter;
+    use serde_json::json;
+
+    #[test]
+    fn observation_rejects_a_missing_approval_ref() {
+        let mut adapter = Adapter::new("intent").expect("temporary intent project");
+        adapter
+            .handle(json!({
+                "op": "apply",
+                "event": {"tag": "Shape", "value": {"slug": "alpha", "result": "valid"}}
+            }))
+            .expect("valid production shape");
+        adapter
+            .handle(json!({
+                "op": "apply",
+                "event": {"tag": "Approve", "value": {
+                    "slug": "alpha", "mode": "commit", "hash": "aaaa1111",
+                    "prefixOk": true, "race": "none"
+                }}
+            }))
+            .expect("approval through production decision and effects");
+
+        let approval_ref = "refs/kogen/intents/alpha";
+        let target = adapter
+            .project
+            .origin
+            .ref_target(approval_ref)
+            .expect("read approval ref")
+            .expect("production approval created ref");
+        assert!(
+            adapter
+                .project
+                .origin
+                .delete_ref_cas(approval_ref, &target)
+                .expect("delete approval ref")
+        );
+
+        let error = observe(&adapter).expect_err("missing production ref must fail closed");
+        assert!(error.contains("expected approval ref refs/kogen/intents/alpha is missing"));
+        let error = super::super::approve::observe(&adapter)
+            .expect_err("approval observation must detect its missing production ref");
+        assert!(error.contains("expected approval ref refs/kogen/intents/alpha is missing"));
+    }
 }
