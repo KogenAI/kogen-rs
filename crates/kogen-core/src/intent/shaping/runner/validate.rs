@@ -103,6 +103,7 @@ pub(super) fn validate_pass(
         &state.acceptance_rel,
         &state.run_dir.join("reports/base-acceptance.jsonl"),
         item_ids.clone(),
+        pass,
     ) {
         Ok(results) => results,
         Err(failure) => return Ok(PassResult::Failure(failure)),

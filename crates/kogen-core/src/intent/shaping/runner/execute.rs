@@ -349,9 +349,7 @@ pub(super) enum PassResult {
 impl RunState {
     fn record_feedback(&self, pass_index: usize, kind: &str, feedback: &str) {
         let value = super::super::journal::feedback_value(pass_index, kind, feedback);
-        if let Ok(mut file) = OpenOptions::new().append(true).open(&self.transcript_path) {
-            let _ = writeln!(file, "{value}");
-        }
+        super::super::journal::append(&self.transcript_path, &value);
     }
 
     fn drive_shaper(

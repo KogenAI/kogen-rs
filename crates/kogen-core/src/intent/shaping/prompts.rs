@@ -37,7 +37,9 @@ Intent format rules:
 - Use the section headings `## Acceptance`, `## Verify`, and `## Notes`, at most once each. Acceptance entries use sequential ids (`- A1: ...`); reuse each id exactly once in Verify and in its acceptance-test tag.
 - Each Acceptance item states one definite, observable result and has at most 25 words. Give every item one Verify line using `test` or `test keep`; optional modifiers are `integration`, `domain=<name>`, and `after=<id>`. A `test keep` item must already pass on the unchanged checkout. At least one item must use `test`.
 - Notes must start with `Approach:` and name a code path, an implementation mechanism, and behavior to preserve. Keep the Brief, Acceptance, and Notes within the limits for the declared size: small allows 1 Brief paragraph, 90 Brief words, 3 Acceptance items, and 250 Notes words; medium allows 2 paragraphs, 200 Brief words, 6 items, and 400 Notes words; large allows 3 paragraphs, 330 Brief words, 10 items, and 600 Notes words. Every Brief or Acceptance sentence has at most 30 words.
-- Write a complete acceptance test to the exact path supplied by the user. Add one test tagged for each Acceptance id. Do not finish by only describing the files: write both required files. If validation asks for repair, preserve valid content and correct the reported failure."#;
+- Write a complete acceptance test to the exact path supplied by the user. Add one test tagged for each Acceptance id. For ExUnit, use exactly `@tag intent: "<slug>/A<n>"` before each test, replacing `<slug>` with the supplied slug and `<n>` with the item number. `@tag acceptance: "A1"` does not write an Intent ledger row.
+- ExUnit tests must compile and load on the unchanged checkout so each tagged test executes and records its own base result. Missing feature behavior must fail at runtime. For new modules, functions, or structs, use runtime lookup, `Code.ensure_loaded?`, `function_exported?`, `apply/3`, or `struct/2` inside the test as needed; avoid compile-time imports, macros, and struct expansion that depend on the feature. A module compile failure is a validation failure, not evidence that all items are red. Existing behavior marked `test keep` must still execute and pass.
+- Do not finish by only describing the files: write both required files. If validation asks for repair, preserve valid content and correct the reported failure."#;
 pub(super) const REQUIREMENT_AUDITOR_SYSTEM: &str = "You are Kogen's requirement auditor. Map every atomic Request constraint to an Acceptance item or an untestable reason. Reply with JSON only.";
 pub(super) const TEST_AUDITOR_SYSTEM: &str = "You are Kogen's acceptance test auditor. Check that each acceptance test follows the verbatim Request. Reply with JSON only.";
 
@@ -62,6 +64,11 @@ pub(super) fn first_message(
     prompt.push_str(&format!(
         "\n\nWrite the Intent to `{intent_path}` and its acceptance test to `{acceptance_path}`."
     ));
+    if acceptance_path.ends_with("_test.exs") {
+        prompt.push_str(&format!(
+            "\n\nExUnit ledger tags: use `@tag intent: \"{slug}/A1\"` for A1, `@tag intent: \"{slug}/A2\"` for A2, and the corresponding full slug/item tag for every other item."
+        ));
+    }
     prompt
 }
 
@@ -155,6 +162,29 @@ mod tests {
         assert!(SHAPER_SYSTEM.contains("YAML map"));
         assert!(SHAPER_SYSTEM.contains("Never leave the map empty or omit a required key."));
         assert!(SHAPER_SYSTEM.contains("Use this Intent structure."));
+    }
+
+    #[test]
+    fn exunit_instructions_require_executed_intent_tags_and_runtime_feature_lookup() {
+        assert!(SHAPER_SYSTEM.contains("@tag intent: \"<slug>/A<n>\""));
+        assert!(SHAPER_SYSTEM.contains("compile and load on the unchanged checkout"));
+        assert!(SHAPER_SYSTEM.contains("apply/3"));
+        assert!(SHAPER_SYSTEM.contains("module compile failure is a validation failure"));
+        for slug in [
+            "syn-06-migration-ticket-numbers",
+            "syn-20-email-invite-flow",
+        ] {
+            let message = super::first_message(
+                slug,
+                &[],
+                &[],
+                b"request",
+                "intent.md",
+                "acceptance_test.exs",
+            );
+            assert!(message.contains(&format!("@tag intent: \"{slug}/A1\"")));
+            assert!(message.contains(&format!("@tag intent: \"{slug}/A2\"")));
+        }
     }
 
     #[test]

@@ -1,0 +1,79 @@
+Running ExUnit with seed: 723304, max_cases: 4
+
+
+
+  1) test populated SQLite migration backfills deterministically and survives rollback/remigration (Trackline.TicketNumbersAcceptance.MigrationTest)
+     .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:8
+     ** (DBConnection.OwnershipError) cannot find ownership process for #PID<0.378.0> ({Trackline.TicketNumbersAcceptance.MigrationTest, :"test populated SQLite migration backfills deterministically and survives rollback/remigration"})
+     (Trackline.Repo) using mode :manual.
+     (Note that a connection's mode reverts to :manual if its owner
+     terminates.)
+
+     When using ownership, you must manage connections in one
+     of the four ways:
+
+     * By explicitly checking out a connection
+     * By explicitly allowing a spawned process
+     * By running the pool in shared mode
+     * By using :caller option with allowed process
+
+     The first two options require every new process to explicitly
+     check a connection out or be allowed by calling checkout or
+     allow respectively.
+
+     The third option requires a {:shared, pid} mode to be set.
+     If using shared mode in tests, make sure your tests are not
+     async.
+
+     The fourth option requires [caller: pid] to be used when
+     checking out a connection from the pool. The caller process
+     should already be allowed on a connection.
+
+     If you are reading this error, it means you have not done one
+     of the steps above or that the owner process has crashed.
+
+     See Ecto.Adapters.SQL.Sandbox docs for more information.
+     code: refute "number" in column_names("tickets")
+     stacktrace:
+       (ecto_sql 3.14.0) lib/ecto/adapters/sql.ex:1118: Ecto.Adapters.SQL.raise_sql_call_error/1
+       .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:108: Trackline.TicketNumbersAcceptance.MigrationTest.column_names/1
+       .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:30: (test)
+
+.
+
+  2) test titles and export show local numbers while URLs and exported ids retain internal ids (Trackline.TicketNumbersAcceptance.BehaviorTest)
+     .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:197
+     Assertion with == failed
+     code:  assert number == 1
+     left:  nil
+     right: 1
+     stacktrace:
+       .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:201: (test)
+
+
+
+  3) test creation assigns permanent organization-local numbers without trusting callers or wasting numbers (Trackline.TicketNumbersAcceptance.BehaviorTest)
+     .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:147
+     Assertion with == failed
+     code:  assert Map.get(first, :number) == 1
+     left:  nil
+     right: 1
+     stacktrace:
+       .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:151: (test)
+
+
+
+  4) test database rejects duplicate organization-number pairs but permits cross-organization reuse (Trackline.TicketNumbersAcceptance.BehaviorTest)
+     .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:180
+     Assertion with == failed
+     code:  assert number == 1
+     left:  nil
+     right: 1
+     stacktrace:
+       .kogen/acceptance/syn-06-migration-ticket-numbers_test.exs:184: (test)
+
+
+Finished in 0.4 seconds (0.00s async, 0.4s sync)
+
+Result: 1/5 passed
+Failed: 4 tests

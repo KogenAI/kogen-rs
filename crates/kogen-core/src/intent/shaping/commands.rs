@@ -1,12 +1,11 @@
 //! Shape-time project commands, temporary staging and base acceptance reads.
 
+mod base;
 mod format;
 
 use super::snapshot::GitSnapshot;
 use super::validation::ValidationFailure;
-use crate::gate::ledger::{
-    AcceptanceFailure, CommandAcceptanceRequest, TreeSnapshotPort, run_command_acceptance,
-};
+use crate::gate::ledger::{CommandAcceptanceRequest, TreeSnapshotPort, run_command_acceptance};
 use crate::project::ProjectConfig;
 use crate::run::{
     ChildEnvironment, EnvironmentRequest, ProcessPort, ProcessRequest, ProcessResult,
@@ -187,6 +186,7 @@ impl ShapeCommands {
         source_rel: &str,
         report_path: &Path,
         item_ids: impl IntoIterator<Item = String>,
+        pass: usize,
     ) -> Result<BTreeSet<String>, ValidationFailure> {
         let use_mise = std::env::var_os("PATH")
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("mise").is_file()));
@@ -242,38 +242,12 @@ impl ShapeCommands {
                 }
             })?
         };
-        if result.process.unavailable || matches!(result.process.exit_status, Some(126 | 127)) {
-            return Err(ValidationFailure {
-                reason: "tool_missing",
-                detail: format!("{command_argv0} is not available"),
-            });
-        }
-        if result
-            .failures
-            .iter()
-            .any(|failure| matches!(failure, AcceptanceFailure::TreeMutated))
-        {
-            return Err(ValidationFailure {
-                reason: "tree_mutated",
-                detail: "base acceptance run changed the checkout tree".to_owned(),
-            });
-        }
-        if let Some(failure) = result.failures.iter().find(|failure| {
-            !matches!(
-                failure,
-                AcceptanceFailure::Suite | AcceptanceFailure::TreeMutated
-            )
-        }) {
-            return Err(ValidationFailure {
-                reason: "acceptance_failed",
-                detail: format!("base acceptance run failed: {failure:?}"),
-            });
-        }
-        Ok(result
-            .item_pass
-            .into_iter()
-            .filter_map(|(id, passed)| passed.then_some(id))
-            .collect())
+        let assessed = base::assess(&result, slug, &command_argv0);
+        super::journal::append(
+            &self.runner_dir.join("transcript.jsonl"),
+            &base::diagnostics(pass, slug, source_rel, &result, &assessed),
+        );
+        assessed
     }
 
     fn run_staged_checks(
@@ -328,9 +302,10 @@ impl ShapeCommands {
                 return Err(ValidationFailure {
                     reason: "acceptance_check_failed",
                     detail: format!(
-                        "acceptance check {} failed with exit {}",
+                        "acceptance check {} failed with exit {}.\nOutput:\n{}",
                         check.get("name").and_then(Value::as_str).unwrap_or("?"),
-                        result.exit_status.unwrap_or(-1)
+                        result.exit_status.unwrap_or(-1),
+                        base::output(&result)
                     ),
                 });
             }

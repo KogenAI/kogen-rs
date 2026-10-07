@@ -1,16 +1,25 @@
 defmodule KogenLedgerFormatter do
+  use GenServer
+
   def init(_opts), do: {:ok, nil}
 
   def handle_cast({:test_finished, test}, state) do
     tags = Map.get(test, :tags, %{})
     tag = Map.get(tags, :intent) || Map.get(tags, "intent")
 
-    if is_binary(tag) do
+    tags =
+      cond do
+        is_binary(tag) -> [tag]
+        is_list(tag) -> Enum.map(tag, &to_string/1)
+        true -> [""]
+      end
+
+    Enum.each(tags, fn tag ->
       name = test |> Map.get(:name, "") |> to_string() |> String.trim_leading("test ")
       status = test |> Map.get(:state) |> status()
       row = ~s({"tag":"#{escape(tag)}","test":"#{escape(name)}","status":"#{status}"}) <> "\n"
       File.write!(System.fetch_env!("KOGEN_LEDGER_REPORT"), row, [:append])
-    end
+    end)
 
     {:noreply, state}
   end
@@ -31,14 +40,26 @@ defmodule KogenLedgerFormatter do
     value
     |> String.to_charlist()
     |> Enum.map_join(fn
-      ?\\ -> "\\\\"
-      ?" -> "\\\""
-      ?\n -> "\\n"
-      ?\r -> "\\r"
-      ?\t -> "\\t"
+      ?\\ ->
+        "\\\\"
+
+      ?" ->
+        "\\\""
+
+      ?\n ->
+        "\\n"
+
+      ?\r ->
+        "\\r"
+
+      ?\t ->
+        "\\t"
+
       code when code < 0x20 ->
         "\\u" <> (code |> Integer.to_string(16) |> String.pad_leading(4, "0"))
-      code -> <<code::utf8>>
+
+      code ->
+        <<code::utf8>>
     end)
   end
 end

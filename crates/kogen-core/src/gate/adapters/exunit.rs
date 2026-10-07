@@ -151,7 +151,10 @@ pub fn runner_command(
     command.extend(words([
         "elixir",
         "-e",
-        &format!("Code.require_file({})", elixir_string(formatter_path)),
+        &format!(
+            "Code.require_file({}); Code.ensure_loaded!(KogenLedgerFormatter)",
+            elixir_string(formatter_path)
+        ),
         "-S",
         "mix",
         "test",

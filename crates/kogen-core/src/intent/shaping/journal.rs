@@ -5,6 +5,9 @@ use crate::provider::http::WireRequest;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::path::Path;
 
 const ROUTING_HEADER_NAMES: &[&str] = &[
     "session-id",
@@ -79,6 +82,12 @@ pub(super) fn feedback_value(pass_index: usize, feedback_kind: &str, feedback: &
         "feedback_kind": feedback_kind,
         "feedback": feedback,
     })
+}
+
+pub(super) fn append(path: &Path, value: &Value) {
+    if let Ok(mut file) = OpenOptions::new().append(true).open(path) {
+        let _ = writeln!(file, "{value}");
+    }
 }
 
 pub(super) fn input_item_count(body: &[u8]) -> Option<usize> {

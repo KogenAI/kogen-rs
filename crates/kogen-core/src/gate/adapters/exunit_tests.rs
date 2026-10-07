@@ -81,7 +81,7 @@ fn runner_command_loads_the_run_formatter_and_runs_both_formatters() {
     assert_eq!(command[3], "elixir");
     assert_eq!(
         command[5],
-        r#"Code.require_file("/run dir/ledger_formatter.ex")"#
+        r#"Code.require_file("/run dir/ledger_formatter.ex"); Code.ensure_loaded!(KogenLedgerFormatter)"#
     );
     assert_eq!(command[7], "mix");
     assert_eq!(command[9], "--formatter");

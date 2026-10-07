@@ -1,0 +1,61 @@
+Running ExUnit with seed: 19072, max_cases: 4
+
+
+
+  1) test acceptance is recipient-bound, single-use, and preserves existing membership (Trackline.EmailInviteFlowAcceptanceTest)
+     .kogen/acceptance/syn-20-email-invite-flow_test.exs:86
+     Expected Trackline.Support to implement invite_member/4
+     code: assert {:ok, _} = invite_member(org, owner, address, "agent")
+     stacktrace:
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:238: Trackline.EmailInviteFlowAcceptanceTest.call_support/2
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:90: (test)
+
+
+
+  2) test GET invite authenticates, accepts, and reports unusable links (Trackline.EmailInviteFlowAcceptanceTest)
+     .kogen/acceptance/syn-20-email-invite-flow_test.exs:182
+     Expected Trackline.Support to implement invite_member/4
+     code: assert {:ok, _} = invite_member(org, owner, recipient.email, "agent")
+     stacktrace:
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:238: Trackline.EmailInviteFlowAcceptanceTest.call_support/2
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:186: (test)
+
+
+
+  3) test refused invitation and resend requests send no email (Trackline.EmailInviteFlowAcceptanceTest)
+     .kogen/acceptance/syn-20-email-invite-flow_test.exs:50
+     Expected Trackline.Support to implement invite_member/4
+     code: for actor <- [agent, viewer, outsider] do
+     stacktrace:
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:238: Trackline.EmailInviteFlowAcceptanceTest.call_support/2
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:59: anonymous fn/4 in Trackline.EmailInviteFlowAcceptanceTest."test refused invitation and resend requests send no email"/1
+       (elixir 1.20.2) lib/enum.ex:2622: Enum."-reduce/3-lists^foldl/2-0-"/3
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:58: (test)
+
+
+
+  4) test owners deliver normalized role invitations with nonrecoverable tokens (Trackline.EmailInviteFlowAcceptanceTest)
+     .kogen/acceptance/syn-20-email-invite-flow_test.exs:29
+     Expected Trackline.Support to implement invite_member/4
+     code: for role <- ["agent", "viewer"] do
+     stacktrace:
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:238: Trackline.EmailInviteFlowAcceptanceTest.call_support/2
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:34: anonymous fn/3 in Trackline.EmailInviteFlowAcceptanceTest."test owners deliver normalized role invitations with nonrecoverable tokens"/1
+       (elixir 1.20.2) lib/enum.ex:1725: Enum."-map/2-lists^map/1-1-"/2
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:31: (test)
+
+.
+
+  5) test seven-day expiry and resend rotation use Clock and reject consumed invitations (Trackline.EmailInviteFlowAcceptanceTest)
+     .kogen/acceptance/syn-20-email-invite-flow_test.exs:130
+     Expected Trackline.Support to implement invite_member/4
+     code: assert {:ok, original} = invite_member(org, owner, recipient.email, "viewer")
+     stacktrace:
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:238: Trackline.EmailInviteFlowAcceptanceTest.call_support/2
+       .kogen/acceptance/syn-20-email-invite-flow_test.exs:133: (test)
+
+
+Finished in 0.3 seconds (0.00s async, 0.3s sync)
+
+Result: 1/6 passed
+Failed: 5 tests
