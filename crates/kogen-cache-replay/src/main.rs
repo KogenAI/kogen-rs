@@ -60,10 +60,15 @@ fn run_plan(options: &BTreeMap<String, String>) -> Result<(), String> {
         "{}",
         json!({
             "plan_sha256": plan.plan_sha256,
+            "request_count": plan.scheduled_posts,
             "scheduled_posts": plan.scheduled_posts,
+            "scheduled_input_reservation": plan.scheduled_input_reservation,
+            "scheduled_output_reservation": plan.scheduled_output_reservation,
             "scheduled_total_reservation": plan.scheduled_total_reservation,
+            "worst_case_token_estimate": plan.scheduled_total_reservation,
             "admitted": plan.admission.admitted,
             "blockers": plan.admission.blockers,
+            "admission_policy": plan.admission.policy,
             "plan_path": out
         })
     );
@@ -81,8 +86,13 @@ fn run_dry_run(options: &BTreeMap<String, String>) -> Result<(), String> {
         "adapter_source_sha256": plan.adapter_source_sha256,
         "admitted": plan.admission.admitted,
         "blockers": plan.admission.blockers,
+        "admission_policy": plan.admission.policy,
+        "request_count": plan.scheduled_posts,
         "scheduled_posts": plan.scheduled_posts,
+        "scheduled_input_reservation": plan.scheduled_input_reservation,
+        "scheduled_output_reservation": plan.scheduled_output_reservation,
         "scheduled_total_reservation": plan.scheduled_total_reservation,
+        "worst_case_token_estimate": plan.scheduled_total_reservation,
         "requests": dry_run_rows(&plan)
     });
     serde_json::to_writer_pretty(std::io::stdout().lock(), &output)
@@ -147,6 +157,7 @@ fn run_execute(options: &BTreeMap<String, String>) -> Result<(), String> {
             json!({
                 "plan_sha256": ledger.plan_sha256,
                 "admitted": false,
+                "admission_policy": ledger.admission.policy,
                 "posts_sent": ledger.posts_sent,
                 "tokens_charged_or_reserved": ledger.tokens_charged_or_reserved,
                 "aborted_reason": ledger.aborted_reason,
@@ -182,6 +193,8 @@ fn run_execute(options: &BTreeMap<String, String>) -> Result<(), String> {
         "{}",
         json!({
             "plan_sha256": ledger.plan_sha256,
+            "admitted": ledger.admission.admitted,
+            "admission_policy": ledger.admission.policy,
             "posts_sent": ledger.posts_sent,
             "tokens_charged_or_reserved": ledger.tokens_charged_or_reserved,
             "aborted_reason": ledger.aborted_reason,

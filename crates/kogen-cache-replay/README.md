@@ -1,83 +1,60 @@
 # kogen-cache-replay
 
-Private development binary for the controlled prompt-cache replay design. It
-does not add a `kogen` command. `plan` and `dry-run` are offline. `execute`
-uses Kogen's account selection, auth refresh, wire builder, and one-attempt
-`ReqwestPort` path.
+Private development binary for offline prompt-cache replay planning and a
+single-attempt runner. `plan` and `dry-run` do not load credentials or make
+network requests. The runner uses Kogen's account selection, auth refresh,
+wire builder, and one-attempt `ReqwestPort` path.
 
-## Sanitized fixture manifest
+## Admission and budget policy
 
-The tool accepts two already-sanitized Kogen-derived excerpts, with IDs
-`builder` and `shaper`. It does not read Kogen journals, sanitize raw request
-bodies, inspect credential files, or reconstruct missing source bodies. Use
-the retained offline source to produce a manifest like this before planning:
+Plans are admitted under `coordinator_cancel_on_overflow_v1`. A hard per-request
+output cap is not an admission prerequisite. The runner sends
+`max_output_tokens=256` on both allowlisted endpoints, then cancels a response
+stream when its output exceeds 512 local/provider-reported tokens or its
+reasoning count exceeds 1,024. Such attempts are marked `truncated` in the
+receipt ledger. The SSE transport monitors deltas and usage events while
+streaming; local text counts use the frozen `whitespace-v1` tokenizer.
 
-```json
-{
-  "schema_version": 1,
-  "fixtures": [
-    {
-      "id": "builder",
-      "source_run": "owned-run-identifier",
-      "source_request_ordinal": 1,
-      "source_adapter": "owned",
-      "source_body_sha256": "<64 hex characters>",
-      "provenance": "captured",
-      "sanitized": true,
-      "source_model": "gpt-6-luna",
-      "source_effort": "medium",
-      "instructions": "Sanitized source instructions",
-      "input_excerpt": "Sanitized source input excerpt"
-    },
-    {
-      "id": "shaper",
-      "source_run": "shape-run-identifier",
-      "source_request_ordinal": 2,
-      "source_adapter": "shaper",
-      "source_body_sha256": "<64 hex characters>",
-      "provenance": "reconstructed",
-      "sanitized": true,
-      "source_model": "gpt-6-luna",
-      "source_effort": "medium",
-      "instructions": "Sanitized source instructions",
-      "input_excerpt": "Sanitized source input excerpt"
-    }
-  ]
-}
-```
+`--max-posts` and `--max-total-tokens` remain hard stops. Before each POST the
+runner reserves that request's input allowance, the endpoint's requested
+output limit, and the observed framing margin. Provider-reported input and
+output totals are charged as soon as the response ends; if usage is partial or
+unknown, the complete request reservation is retained. The runner stops before
+dispatch when the next reservation would exceed the remaining token budget,
+and the stream guard also cancels when the remaining global output allowance
+is reached.
 
-`source_body_sha256` is the digest of the retained original Kogen request body;
-the excerpts are the separately sanitized material used by the replay. The
-planner counts whitespace-delimited local tokens (`whitespace-v1`), truncates
-fixture instructions to each target prefix, and limits the excerpt to 384
-local tokens. It does not claim those counts equal provider tokenization.
-Warm probes preserve the primer's input item byte-for-byte and append the fixed
-continuation as a new input item; cold sham primers and their fresh probes use
-the same two input items with independently salted static prefixes.
+## Sanitized fixtures
+
+The fixture manifest is built from the static builder instruction in
+`crates/kogen-core/src/build/provider_prompt.rs`, the shaper system instruction
+in `crates/kogen-core/src/intent/shaping/prompts.rs`, and role-filtered schemas
+from `kogen_core::provider::tools::canonical_tool_schemas()`. The task text is
+synthetic; no journal prompt text is used. Each fixture is marked
+`reconstructed`, records its source prompt builder and sanitized-material hash,
+and includes the frozen continuation. Neutral `pad` tokens extend the complete
+static prefix to 512, 2,048, or 11,008 `whitespace-v1` tokens. The schema
+reference is text in the common prompt prefix; no native tools are sent or
+executed.
+
+The manifest is `/tmp/claude-501/krs-cache-replay/fixtures.json` for this
+replay. Keep plans and receipts outside the repository.
 
 ## Commands
 
 ```text
-kogen-cache-replay plan --fixtures sanitized-fixtures.json --seed cache-study-20261007 --out /tmp/cache-replay/plan.json
-kogen-cache-replay dry-run --plan /tmp/cache-replay/plan.json
-kogen-cache-replay execute --plan /tmp/cache-replay/plan.json --max-posts 360 --max-total-tokens 2000000 --out /tmp/cache-replay/receipts
+kogen-cache-replay plan --fixtures /tmp/claude-501/krs-cache-replay/fixtures.json --seed cache-study-20261007 --out /tmp/claude-501/krs-cache-replay/plan.json
+kogen-cache-replay dry-run --plan /tmp/claude-501/krs-cache-replay/plan.json
+kogen-cache-replay execute --plan /tmp/claude-501/krs-cache-replay/plan.json --max-posts 360 --max-total-tokens 2000000 --out /tmp/claude-501/krs-cache-replay/receipts
 ```
 
-The plan freezes 360 request bodies, SHA-256 hashes, randomized order, IDs,
-header masks, and the 256-token `max_output_tokens` field. The ChatGPT backend
-endpoint has no versioned generation-cap contract in this checkout. Therefore
-the full two-endpoint plan is marked `not admitted`. `execute` records every
-scheduled slot as unexecuted in a zero-dispatch receipt ledger before
-exiting with the blocker; it does not load login state or send a POST. Do not
-clear that blocker without a versioned endpoint contract and a bounded
-admission result.
+The frozen plan records request bodies and hashes, randomized order, endpoint
+output-limit fields, header masks, and per-request input/output reservations.
+`dry-run` prints each request's body size, prefix length, header factors, and
+reservation without dispatching it.
 
-The optional `--auth-path` is explicit Kogen injected auth via
-`kogen_core::provider::auth::credential_for_request_with_injected_path`.
-`KOGEN_PROVIDER_URL` is always rejected. Ambient `KOGEN_AUTH_PATH` is rejected
-unless `--auth-path` explicitly supplies the injected credential source. Without
-`--auth-path`, every attempt uses Kogen's normal selected Owned ChatGPT account
-and refresh path. Outputs must be outside the repository. `attempts.jsonl` is
-flushed after every scheduled slot; raw usage and HTTP status are retained,
-while auth headers, response text, provider response IDs, and turn-state values
-are not written.
+`KOGEN_PROVIDER_URL` is rejected. Ambient `KOGEN_AUTH_PATH` is rejected unless
+`--auth-path` explicitly selects Kogen injected credentials. Without that
+option, execution uses Kogen's normal selected Owned ChatGPT account and
+refresh path. Receipts retain raw usage and HTTP status but omit auth headers,
+response text, provider response IDs, and turn-state values.

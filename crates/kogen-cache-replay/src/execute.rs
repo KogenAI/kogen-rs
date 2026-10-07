@@ -1,12 +1,15 @@
 //! Single-attempt execution and attempt-level receipts.
 
 use crate::{
-    MAX_POSTS, MAX_TOTAL_TOKENS, OUTPUT_TOKEN_CAP, PlannedAttempt, ReplayPlan,
-    build_wire_for_attempt, sha256_hex, verify_plan,
+    Admission, AdmissionPolicy, MAX_POSTS, MAX_TOTAL_TOKENS, OUTPUT_CANCEL_THRESHOLD_TOKENS,
+    PlannedAttempt, REASONING_CANCEL_THRESHOLD_TOKENS, ReplayPlan, build_wire_for_attempt,
+    sha256_hex, verify_plan,
 };
 use kogen_core::provider::ProviderErrorKind;
 use kogen_core::provider::auth::RequestCredential;
-use kogen_core::provider::http::{HttpPort, RequestDeadlines};
+use kogen_core::provider::http::{
+    HttpPort, RequestDeadlines, StreamLimitExceeded, StreamOutputLimits,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -19,6 +22,7 @@ pub struct ReceiptLedger {
     pub source_revision: String,
     pub binary_sha256: String,
     pub adapter_source_sha256: String,
+    pub admission: Admission,
     pub max_posts: u64,
     pub max_total_tokens: u64,
     pub posts_sent: u64,
@@ -57,6 +61,11 @@ pub struct AttemptReceipt {
     pub gap_within_tolerance: Option<bool>,
     pub request_body_sha256: String,
     pub request_body_bytes: u64,
+    pub output_limit_field: String,
+    pub requested_output_limit_tokens: u64,
+    pub admission_policy_name: String,
+    pub output_cancel_threshold_tokens: u64,
+    pub reasoning_cancel_threshold_tokens: u64,
     pub cache_key_fingerprint: String,
     pub thread_id_fingerprint: String,
     pub sent_header_names: Vec<String>,
@@ -80,7 +89,9 @@ pub struct AttemptReceipt {
     pub charged_tokens: Option<u64>,
     pub reservation_tokens: u64,
     pub error_kind: Option<String>,
-    pub output_cap_compliant: Option<bool>,
+    pub output_limit_compliant: Option<bool>,
+    pub truncated: bool,
+    pub truncation_reason: Option<String>,
 }
 
 /// Run a plan through Kogen's HTTP port exactly once per dispatched attempt.
@@ -126,11 +137,12 @@ pub fn unadmitted_ledger(
         return Err("cannot create an unadmitted ledger for an admitted plan".to_owned());
     }
     let mut ledger = ReceiptLedger {
-        schema_version: 1,
+        schema_version: 2,
         plan_sha256: plan.plan_sha256.clone(),
         source_revision: plan.source_revision.clone(),
         binary_sha256: plan.binary_sha256.clone(),
         adapter_source_sha256: plan.adapter_source_sha256.clone(),
+        admission: plan.admission.clone(),
         max_posts,
         max_total_tokens,
         posts_sent: 0,
@@ -141,7 +153,7 @@ pub fn unadmitted_ledger(
         attempts: Vec::with_capacity(plan.attempts.len()),
     };
     for planned in &plan.attempts {
-        let mut receipt = receipt_for(planned, 0);
+        let mut receipt = receipt_for(planned, 0, &plan.admission.policy);
         receipt.unexecuted_reason = Some(reason.to_owned());
         ledger.attempts.push(receipt);
     }
@@ -164,16 +176,6 @@ where
     J: FnMut(&AttemptReceipt) -> Result<(), String>,
 {
     verify_plan(plan)?;
-    let has_unverified_backend = plan
-        .attempts
-        .iter()
-        .any(|attempt| attempt.endpoint == crate::Endpoint::ChatgptBackend);
-    if !test_capability_override && has_unverified_backend {
-        return Err(format!(
-            "plan is not admitted: {} has no verified 256-token output-cap contract; no request was sent",
-            crate::CHATGPT_BACKEND_ENDPOINT
-        ));
-    }
     if !test_capability_override && !plan.admission.admitted {
         return Err(format!(
             "plan is not admitted: {}",
@@ -190,11 +192,12 @@ where
     }
 
     let mut ledger = ReceiptLedger {
-        schema_version: 1,
+        schema_version: 2,
         plan_sha256: plan.plan_sha256.clone(),
         source_revision: plan.source_revision.clone(),
         binary_sha256: plan.binary_sha256.clone(),
         adapter_source_sha256: plan.adapter_source_sha256.clone(),
+        admission: plan.admission.clone(),
         max_posts,
         max_total_tokens,
         posts_sent: 0,
@@ -210,7 +213,11 @@ where
     let mut previous_terminal: Option<Instant> = None;
 
     for planned in &plan.attempts {
-        let mut receipt = receipt_for(planned, ledger.observed_framing_margin_tokens);
+        let mut receipt = receipt_for(
+            planned,
+            ledger.observed_framing_margin_tokens,
+            &plan.admission.policy,
+        );
         if let Some(reason) = stop_reason.as_ref() {
             receipt.unexecuted_reason = Some(reason.clone());
             journal(&receipt)?;
@@ -247,6 +254,12 @@ where
             ledger.attempts.push(receipt);
             continue;
         }
+        let input_budget_allowance = planned
+            .input_reservation_tokens
+            .saturating_add(ledger.observed_framing_margin_tokens);
+        let hard_budget_output_tokens = max_total_tokens
+            .saturating_sub(ledger.tokens_charged_or_reserved)
+            .saturating_sub(input_budget_allowance);
 
         let auth = match credential_for_post() {
             Ok(credential) => credential,
@@ -309,7 +322,17 @@ where
         receipt.dispatch_unix_ms = Some(unix_millis());
         ledger.posts_sent = ledger.posts_sent.saturating_add(1);
         let dispatch = Instant::now();
-        let attempt = http.execute(&wire, RequestDeadlines::from_environment());
+        let limited = http.execute_with_output_limits(
+            &wire,
+            RequestDeadlines::from_environment(),
+            StreamOutputLimits {
+                output_tokens: OUTPUT_CANCEL_THRESHOLD_TOKENS,
+                reasoning_tokens: REASONING_CANCEL_THRESHOLD_TOKENS,
+                hard_budget_output_tokens,
+            },
+        );
+        let limit_exceeded = limited.limit_exceeded;
+        let attempt = limited.attempt;
         let terminal = Instant::now();
         let terminal_ms = dispatch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         previous_terminal = Some(terminal);
@@ -345,14 +368,23 @@ where
             .as_ref()
             .err()
             .map(|failure| failure.kind.as_str().to_owned());
-        receipt.output_cap_compliant = counters.output.map(|output| output <= OUTPUT_TOKEN_CAP);
+        let threshold_exceeded = limit_exceeded.or_else(|| stream_limit_exceeded(&counters));
+        receipt.truncated = threshold_exceeded.is_some();
+        receipt.truncation_reason = threshold_exceeded.map(|reason| reason.as_str().to_owned());
+        receipt.output_limit_compliant = counters
+            .output
+            .map(|output| output <= planned.output_limit_tokens);
 
         let accounted_input = counters.input.unwrap_or_else(|| {
             planned
                 .input_reservation_tokens
                 .saturating_add(ledger.observed_framing_margin_tokens)
         });
-        let accounted_output = counters.output.unwrap_or(planned.output_reservation_tokens);
+        let accounted_output = counters.output.unwrap_or_else(|| {
+            planned
+                .output_reservation_tokens
+                .max(counters.reasoning.unwrap_or_default())
+        });
         let accounted_tokens = accounted_input.saturating_add(accounted_output);
         receipt.charged_tokens = Some(if counters.input.is_some() && counters.output.is_some() {
             accounted_tokens
@@ -374,21 +406,16 @@ where
                 .max(input.saturating_sub(planned.input_reservation_tokens));
         }
 
-        if counters.valid == Some(false) {
+        if limit_exceeded == Some(StreamLimitExceeded::GlobalBudget) {
+            stop_reason = Some(
+                "hard total-token cap reached during response streaming; no further request dispatched"
+                    .to_owned(),
+            );
+        } else if counters.valid == Some(false) {
             stop_reason = Some("provider usage counters failed integrity checks".to_owned());
-        } else if counters
-            .output
-            .is_some_and(|output| output > OUTPUT_TOKEN_CAP)
-        {
-            stop_reason = Some(format!(
-                "provider output exceeded the {OUTPUT_TOKEN_CAP}-token hard cap"
-            ));
         } else if input_overrun {
             stop_reason =
                 Some("provider input exceeded the reserved per-request input allowance".to_owned());
-        } else if attempt.response.is_ok() && counters.output.is_none() {
-            stop_reason =
-                Some("output usage is missing; the 256-token cap cannot be verified".to_owned());
         } else if attempt
             .response_model
             .as_deref()
@@ -410,7 +437,7 @@ where
                 Some("provider rejected login, usage allowance, or request capability".to_owned());
         }
 
-        if planned.phase == "primer" && attempt.response.is_err() {
+        if planned.phase == "primer" && (attempt.response.is_err() || receipt.truncated) {
             failed_primers.insert(planned.episode_id.clone());
         }
         journal(&receipt)?;
@@ -420,7 +447,11 @@ where
     Ok(ledger)
 }
 
-fn receipt_for(planned: &PlannedAttempt, framing_margin: u64) -> AttemptReceipt {
+fn receipt_for(
+    planned: &PlannedAttempt,
+    framing_margin: u64,
+    policy: &AdmissionPolicy,
+) -> AttemptReceipt {
     AttemptReceipt {
         attempt_id: planned.attempt_id.clone(),
         episode_id: planned.episode_id.clone(),
@@ -448,6 +479,11 @@ fn receipt_for(planned: &PlannedAttempt, framing_margin: u64) -> AttemptReceipt 
         gap_within_tolerance: None,
         request_body_sha256: planned.body_sha256.clone(),
         request_body_bytes: planned.body_bytes,
+        output_limit_field: planned.output_limit_field.clone(),
+        requested_output_limit_tokens: planned.output_limit_tokens,
+        admission_policy_name: policy.name.clone(),
+        output_cancel_threshold_tokens: policy.output_cancel_threshold_tokens,
+        reasoning_cancel_threshold_tokens: policy.reasoning_cancel_threshold_tokens,
         cache_key_fingerprint: sha256_hex(planned.cache_key.as_bytes()),
         thread_id_fingerprint: sha256_hex(planned.thread_id.as_bytes()),
         sent_header_names: Vec::new(),
@@ -474,7 +510,25 @@ fn receipt_for(planned: &PlannedAttempt, framing_margin: u64) -> AttemptReceipt 
             .saturating_add(framing_margin)
             .saturating_add(planned.output_reservation_tokens),
         error_kind: None,
-        output_cap_compliant: None,
+        output_limit_compliant: None,
+        truncated: false,
+        truncation_reason: None,
+    }
+}
+
+fn stream_limit_exceeded(counters: &RawCounters) -> Option<StreamLimitExceeded> {
+    if counters
+        .output
+        .is_some_and(|output| output > OUTPUT_CANCEL_THRESHOLD_TOKENS)
+    {
+        Some(StreamLimitExceeded::OutputTokens)
+    } else if counters
+        .reasoning
+        .is_some_and(|reasoning| reasoning > REASONING_CANCEL_THRESHOLD_TOKENS)
+    {
+        Some(StreamLimitExceeded::ReasoningTokens)
+    } else {
+        None
     }
 }
 
@@ -588,7 +642,7 @@ mod tests {
 
     fn test_plan() -> ReplayPlan {
         let manifest = FixtureManifest {
-            schema_version: 1,
+            schema_version: 2,
             fixtures: vec![fixture("builder"), fixture("shaper")],
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
@@ -611,26 +665,45 @@ mod tests {
             source_model: "gpt-6-luna".to_owned(),
             source_effort: "medium".to_owned(),
             instructions: "Sanitized local fixture instructions.".to_owned(),
+            tool_schemas: tool_schemas_for(id),
             input_excerpt: "Safe synthetic excerpt.".to_owned(),
+            continuation: crate::CONTINUATION.to_owned(),
         }
     }
 
+    fn tool_schemas_for(id: &str) -> Vec<Value> {
+        let allowed: &[&str] = if id == "builder" {
+            &["finish", "shell", "tool_output"]
+        } else {
+            &["read", "search", "write"]
+        };
+        kogen_core::provider::tools::canonical_tool_schemas()
+            .into_iter()
+            .filter(|schema| {
+                schema
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| allowed.contains(&name))
+            })
+            .collect()
+    }
+
     #[test]
-    fn execute_enforces_output_cap_and_journals_against_a_fake_server() {
+    fn execute_cancels_and_records_output_overflow_against_a_fake_server() {
         let plan = test_plan();
         let fake = FakeServer {
             requests: Mutex::new(Vec::new()),
             raw_usage: json!({
                 "input_tokens": 100,
                 "input_tokens_details": {"cached_tokens": 20},
-                "output_tokens": 257,
+                "output_tokens": 513,
                 "output_tokens_details": {"reasoning_tokens": 4}
             }),
         };
         let mut journaled = Vec::new();
         let ledger = execute_plan_inner(
             &plan,
-            360,
+            1,
             MAX_TOTAL_TOKENS,
             "test_injected",
             &fake,
@@ -648,20 +721,52 @@ mod tests {
         assert_eq!(journaled.len(), 360);
         assert_eq!(
             ledger.attempts[0].raw_usage.as_ref().unwrap()["output_tokens"],
-            257
+            513
         );
-        assert_eq!(ledger.attempts[0].output_cap_compliant, Some(false));
-        assert!(
-            ledger
-                .aborted_reason
-                .as_deref()
-                .unwrap()
-                .contains("exceeded the 256-token hard cap")
+        assert_eq!(ledger.attempts[0].output_limit_compliant, Some(false));
+        assert_eq!(
+            ledger.attempts[0].admission_policy_name,
+            "coordinator_cancel_on_overflow_v1"
+        );
+        assert_eq!(ledger.attempts[0].output_cancel_threshold_tokens, 512);
+        assert_eq!(ledger.attempts[0].reasoning_cancel_threshold_tokens, 1_024);
+        assert!(ledger.attempts[0].truncated);
+        assert_eq!(
+            ledger.attempts[0].truncation_reason.as_deref(),
+            Some("output_tokens_exceeded_512")
         );
         assert!(!ledger.attempts[1].dispatched);
+        assert!(ledger.attempts[1].unexecuted_reason.is_some());
+    }
+
+    #[test]
+    fn execute_cancels_and_records_reasoning_overflow_against_a_fake_server() {
+        let plan = test_plan();
+        let fake = FakeServer {
+            requests: Mutex::new(Vec::new()),
+            raw_usage: json!({
+                "input_tokens": 100,
+                "input_tokens_details": {"cached_tokens": 20},
+                "output_tokens": 80,
+                "output_tokens_details": {"reasoning_tokens": 1_025}
+            }),
+        };
+        let ledger = execute_plan_inner(
+            &plan,
+            1,
+            MAX_TOTAL_TOKENS,
+            "test_owned",
+            &fake,
+            true,
+            || Ok(planning_credential()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(ledger.posts_sent, 1);
+        assert!(ledger.attempts[0].truncated);
         assert_eq!(
-            ledger.attempts[1].unexecuted_reason.as_deref(),
-            ledger.aborted_reason.as_deref()
+            ledger.attempts[0].truncation_reason.as_deref(),
+            Some("reasoning_tokens_exceeded_1024")
         );
     }
 
@@ -691,6 +796,45 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("would be exceeded before dispatch")
+        );
+    }
+
+    #[test]
+    fn execute_charges_provider_totals_then_stops_before_the_next_worst_case_reservation() {
+        let plan = test_plan();
+        let first = &plan.attempts[0];
+        let second = &plan.attempts[1];
+        let first_reservation = first.input_reservation_tokens + first.output_reservation_tokens;
+        let second_reservation = second.input_reservation_tokens + second.output_reservation_tokens;
+        let max_total_tokens = first_reservation + second_reservation - 1;
+        let fake = FakeServer {
+            requests: Mutex::new(Vec::new()),
+            raw_usage: json!({
+                "input_tokens": first.input_reservation_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": first.output_reservation_tokens
+            }),
+        };
+        let ledger = execute_plan_inner(
+            &plan,
+            360,
+            max_total_tokens,
+            "test_owned",
+            &fake,
+            true,
+            || Ok(planning_credential()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(ledger.posts_sent, 1);
+        assert_eq!(fake.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            ledger.tokens_charged_or_reserved,
+            first.input_reservation_tokens + first.output_reservation_tokens
+        );
+        assert_eq!(
+            ledger.attempts[1].unexecuted_reason.as_deref(),
+            Some("hard total-token cap would be exceeded before dispatch")
         );
     }
 
@@ -734,21 +878,18 @@ mod tests {
     }
 
     #[test]
-    fn unverified_endpoint_blocks_before_auth_or_http() {
-        let manifest = FixtureManifest {
-            schema_version: 1,
-            fixtures: vec![fixture("builder"), fixture("shaper")],
-        };
-        let bytes = serde_json::to_vec(&manifest).unwrap();
-        let plan = build_plan(&manifest, &bytes, "fake-server-seed").unwrap();
+    fn admitted_policy_does_not_require_a_verified_hard_request_cap() {
+        let plan = test_plan();
+        assert!(plan.admission.admitted);
+        assert!(!plan.admission.policy.per_request_output_cap_required);
         let fake = FakeServer {
             requests: Mutex::new(Vec::new()),
             raw_usage: json!({"input_tokens": 1, "output_tokens": 1}),
         };
         let mut loaded_credentials = false;
-        let result = execute_plan(
+        let ledger = execute_plan(
             &plan,
-            360,
+            1,
             MAX_TOTAL_TOKENS,
             "kogen_owned_account_selection",
             &fake,
@@ -757,24 +898,28 @@ mod tests {
                 Ok(planning_credential())
             },
             |_| Ok(()),
+        )
+        .unwrap();
+        assert!(loaded_credentials);
+        assert_eq!(ledger.posts_sent, 1);
+        assert_eq!(fake.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            ledger.admission.policy.name,
+            "coordinator_cancel_on_overflow_v1"
         );
-        assert!(
-            result
-                .unwrap_err()
-                .contains("no verified 256-token output-cap contract")
-        );
-        assert!(!loaded_credentials);
-        assert!(fake.requests.lock().unwrap().is_empty());
     }
 
     #[test]
     fn unadmitted_ledger_records_every_slot_without_usage_or_dispatch() {
         let manifest = FixtureManifest {
-            schema_version: 1,
+            schema_version: 2,
             fixtures: vec![fixture("builder"), fixture("shaper")],
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let plan = build_plan(&manifest, &bytes, "blocked-ledger-seed").unwrap();
+        let mut plan = build_plan(&manifest, &bytes, "blocked-ledger-seed").unwrap();
+        plan.admission.admitted = false;
+        plan.admission.blockers = vec!["test admission blocker".to_owned()];
+        plan.plan_sha256 = crate::plan_digest(&plan).unwrap();
         let reason = plan.admission.blockers.join("; ");
         let ledger =
             unadmitted_ledger(&plan, 360, MAX_TOTAL_TOKENS, "kogen_owned", &reason).unwrap();

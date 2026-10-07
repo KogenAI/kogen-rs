@@ -1,8 +1,10 @@
 //! Tokio-backed streaming HTTP effect for the Responses client.
 
-use super::{HttpAttempt, HttpPort, RequestDeadlines};
+use super::{HttpAttempt, HttpPort, LimitedHttpAttempt, RequestDeadlines};
 use crate::provider::http::wire::{ResponseMode, WireRequest};
-use crate::provider::sse::{MAX_RESPONSE_BYTES, SseAssembler};
+use crate::provider::sse::{
+    MAX_RESPONSE_BYTES, SseAssembler, StreamLimitExceeded, StreamOutputLimits,
+};
 use crate::provider::{ProviderErrorKind, ProviderFailure};
 use futures_util::StreamExt as _;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -49,7 +51,26 @@ impl ReqwestPort {
 impl HttpPort for ReqwestPort {
     fn execute(&self, request: &WireRequest, deadlines: RequestDeadlines) -> HttpAttempt {
         self.runtime
-            .block_on(execute_async(&self.client, request, deadlines))
+            .block_on(execute_async(&self.client, request, deadlines, None))
+            .0
+    }
+
+    fn execute_with_output_limits(
+        &self,
+        request: &WireRequest,
+        deadlines: RequestDeadlines,
+        limits: StreamOutputLimits,
+    ) -> LimitedHttpAttempt {
+        let (attempt, limit_exceeded) = self.runtime.block_on(execute_async(
+            &self.client,
+            request,
+            deadlines,
+            Some(limits),
+        ));
+        LimitedHttpAttempt {
+            attempt,
+            limit_exceeded,
+        }
     }
 }
 
@@ -57,7 +78,8 @@ async fn execute_async(
     client: &reqwest::Client,
     request: &WireRequest,
     deadlines: RequestDeadlines,
-) -> HttpAttempt {
+    output_limits: Option<StreamOutputLimits>,
+) -> (HttpAttempt, Option<StreamLimitExceeded>) {
     let start = TokioInstant::now();
     let total_deadline = start + deadlines.total;
     let first_deadline = std::cmp::min(start + deadlines.first_byte, total_deadline);
@@ -67,18 +89,21 @@ async fn execute_async(
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(value),
         ) else {
-            return failed_attempt(
-                ProviderFailure::new(
-                    ProviderErrorKind::Malformed,
-                    if request.mode == ResponseMode::Grok {
-                        "Could not encode Grok request."
-                    } else {
-                        "Could not encode ChatGPT request."
-                    },
+            return (
+                failed_attempt(
+                    ProviderFailure::new(
+                        ProviderErrorKind::Malformed,
+                        if request.mode == ResponseMode::Grok {
+                            "Could not encode Grok request."
+                        } else {
+                            "Could not encode ChatGPT request."
+                        },
+                    ),
+                    start,
+                    Vec::new(),
+                    0,
                 ),
-                start,
-                Vec::new(),
-                0,
+                None,
             );
         };
         headers.insert(name, value);
@@ -95,10 +120,23 @@ async fn execute_async(
     let response = match sent {
         Ok(Ok(response)) => response,
         Ok(Err(error)) if error.is_timeout() => {
-            return failed_attempt(timeout_failure(request.mode), start, Vec::new(), 0);
+            return (
+                failed_attempt(timeout_failure(request.mode), start, Vec::new(), 0),
+                None,
+            );
         }
-        Ok(Err(_)) => return failed_attempt(transport_failure(request.mode), start, Vec::new(), 0),
-        Err(_) => return failed_attempt(timeout_failure(request.mode), start, Vec::new(), 0),
+        Ok(Err(_)) => {
+            return (
+                failed_attempt(transport_failure(request.mode), start, Vec::new(), 0),
+                None,
+            );
+        }
+        Err(_) => {
+            return (
+                failed_attempt(timeout_failure(request.mode), start, Vec::new(), 0),
+                None,
+            );
+        }
     };
     let sticky_routing_token = if request.mode == ResponseMode::Grok {
         None
@@ -143,18 +181,21 @@ async fn execute_async(
                         ),
                     )
                 };
-                return failed_attempt_with_routing_token(
-                    failure,
-                    start,
-                    parser.collected_items().to_vec(),
-                    body_bytes,
-                    AttemptObservation {
-                        status_code: Some(status),
-                        sticky_routing_token: sticky_routing_token.clone(),
-                        raw_usage: parser.raw_usage().cloned(),
-                        response_model: parser.response_model().map(str::to_owned),
-                        first_byte_ms,
-                    },
+                return (
+                    failed_attempt_with_routing_token(
+                        failure,
+                        start,
+                        parser.collected_items().to_vec(),
+                        body_bytes,
+                        AttemptObservation {
+                            status_code: Some(status),
+                            sticky_routing_token: sticky_routing_token.clone(),
+                            raw_usage: parser.raw_usage().cloned(),
+                            response_model: parser.response_model().map(str::to_owned),
+                            first_byte_ms,
+                        },
+                    ),
+                    None,
                 );
             }
             Ok(Some(Err(error))) => {
@@ -171,18 +212,21 @@ async fn execute_async(
                 } else {
                     transport_failure(request.mode)
                 };
-                return failed_attempt_with_routing_token(
-                    failure,
-                    start,
-                    parser.collected_items().to_vec(),
-                    body_bytes,
-                    AttemptObservation {
-                        status_code: Some(status),
-                        sticky_routing_token: sticky_routing_token.clone(),
-                        raw_usage: parser.raw_usage().cloned(),
-                        response_model: parser.response_model().map(str::to_owned),
-                        first_byte_ms,
-                    },
+                return (
+                    failed_attempt_with_routing_token(
+                        failure,
+                        start,
+                        parser.collected_items().to_vec(),
+                        body_bytes,
+                        AttemptObservation {
+                            status_code: Some(status),
+                            sticky_routing_token: sticky_routing_token.clone(),
+                            raw_usage: parser.raw_usage().cloned(),
+                            response_model: parser.response_model().map(str::to_owned),
+                            first_byte_ms,
+                        },
+                    ),
+                    None,
                 );
             }
             Ok(None) => break,
@@ -197,7 +241,33 @@ async fn execute_async(
                 last_byte = TokioInstant::now();
                 body_bytes = body_bytes.saturating_add(chunk.len() as u64);
                 if (200..300).contains(&status) {
-                    if parser.feed(&chunk).is_err() {
+                    let feed_error = match parser.feed_with_output_limits(&chunk, output_limits) {
+                        Ok(Some(reason)) => {
+                            let failure = ProviderFailure::new(
+                                ProviderErrorKind::Incomplete,
+                                "Cache replay cancelled the response stream after an output threshold was crossed.",
+                            );
+                            return (
+                                failed_attempt_with_routing_token(
+                                    failure,
+                                    start,
+                                    parser.collected_items().to_vec(),
+                                    body_bytes,
+                                    AttemptObservation {
+                                        status_code: Some(status),
+                                        sticky_routing_token: sticky_routing_token.clone(),
+                                        raw_usage: parser.raw_usage().cloned(),
+                                        response_model: parser.response_model().map(str::to_owned),
+                                        first_byte_ms,
+                                    },
+                                ),
+                                Some(reason),
+                            );
+                        }
+                        Ok(None) => false,
+                        Err(_) => true,
+                    };
+                    if feed_error {
                         let failure = if request.mode == ResponseMode::Grok
                             && body_bytes as usize > MAX_RESPONSE_BYTES
                         {
@@ -208,18 +278,21 @@ async fn execute_async(
                                 request.mode,
                             )
                         };
-                        return failed_attempt_with_routing_token(
-                            failure,
-                            start,
-                            parser.collected_items().to_vec(),
-                            body_bytes,
-                            AttemptObservation {
-                                status_code: Some(status),
-                                sticky_routing_token: sticky_routing_token.clone(),
-                                raw_usage: parser.raw_usage().cloned(),
-                                response_model: parser.response_model().map(str::to_owned),
-                                first_byte_ms,
-                            },
+                        return (
+                            failed_attempt_with_routing_token(
+                                failure,
+                                start,
+                                parser.collected_items().to_vec(),
+                                body_bytes,
+                                AttemptObservation {
+                                    status_code: Some(status),
+                                    sticky_routing_token: sticky_routing_token.clone(),
+                                    raw_usage: parser.raw_usage().cloned(),
+                                    response_model: parser.response_model().map(str::to_owned),
+                                    first_byte_ms,
+                                },
+                            ),
+                            None,
                         );
                     }
                 } else {
@@ -242,47 +315,56 @@ async fn execute_async(
             .ok()
             .and_then(|body| body.get("usage").cloned())
             .or_else(|| parser.raw_usage().cloned());
-        return failed_attempt_with_routing_token(
-            failure,
-            start,
-            Vec::new(),
-            body_bytes,
-            AttemptObservation {
-                status_code: Some(status),
-                sticky_routing_token,
-                raw_usage,
-                response_model: parser.response_model().map(str::to_owned),
-                first_byte_ms,
-            },
+        return (
+            failed_attempt_with_routing_token(
+                failure,
+                start,
+                Vec::new(),
+                body_bytes,
+                AttemptObservation {
+                    status_code: Some(status),
+                    sticky_routing_token,
+                    raw_usage,
+                    response_model: parser.response_model().map(str::to_owned),
+                    first_byte_ms,
+                },
+            ),
+            None,
         );
     }
     let response = parser.finish();
     let raw_usage = parser.raw_usage().cloned();
     let response_model = parser.response_model().map(str::to_owned);
     match response {
-        Ok(response) => HttpAttempt {
-            received_items: response.raw_items.clone(),
-            response: Ok(response),
-            elapsed_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            body_bytes_received: body_bytes,
-            first_byte_ms,
-            status_code: Some(status),
-            raw_usage,
-            response_model,
-            sticky_routing_token,
-        },
-        Err(failure) => failed_attempt_with_routing_token(
-            normalize_failure(failure, request.mode),
-            start,
-            parser.collected_items().to_vec(),
-            body_bytes,
-            AttemptObservation {
+        Ok(response) => (
+            HttpAttempt {
+                received_items: response.raw_items.clone(),
+                response: Ok(response),
+                elapsed_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                body_bytes_received: body_bytes,
+                first_byte_ms,
                 status_code: Some(status),
-                sticky_routing_token,
                 raw_usage,
                 response_model,
-                first_byte_ms,
+                sticky_routing_token,
             },
+            None,
+        ),
+        Err(failure) => (
+            failed_attempt_with_routing_token(
+                normalize_failure(failure, request.mode),
+                start,
+                parser.collected_items().to_vec(),
+                body_bytes,
+                AttemptObservation {
+                    status_code: Some(status),
+                    sticky_routing_token,
+                    raw_usage,
+                    response_model,
+                    first_byte_ms,
+                },
+            ),
+            None,
         ),
     }
 }

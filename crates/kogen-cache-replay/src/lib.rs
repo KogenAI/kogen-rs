@@ -20,7 +20,9 @@ use url::Url;
 
 pub const MODEL: &str = "gpt-6-luna";
 pub const EFFORT: &str = "medium";
-pub const OUTPUT_TOKEN_CAP: u64 = 256;
+pub const OUTPUT_TOKEN_LIMIT: u64 = 256;
+pub const OUTPUT_CANCEL_THRESHOLD_TOKENS: u64 = 512;
+pub const REASONING_CANCEL_THRESHOLD_TOKENS: u64 = 1_024;
 pub const MAX_POSTS: u64 = 360;
 pub const MAX_TOTAL_TOKENS: u64 = 2_000_000;
 pub const PLANNED_TOKEN_RESERVATION: u64 = 1_941_504;
@@ -39,7 +41,7 @@ pub const ROUTING_HEADERS: [&str; 6] = [
     "x-codex-turn-state",
 ];
 
-const CONTINUATION: &str =
+pub const CONTINUATION: &str =
     "Continue the frozen replay fixture with one brief neutral response. Reply OK.";
 const FIXED_INSTRUCTIONS: &str = "Follow the frozen replay instructions. Reply with exactly OK.";
 const INPUT_EXCERPT_LIMIT: usize = 384;
@@ -62,7 +64,9 @@ pub struct ReplayFixture {
     pub source_model: String,
     pub source_effort: String,
     pub instructions: String,
+    pub tool_schemas: Vec<Value>,
     pub input_excerpt: String,
+    pub continuation: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -101,6 +105,26 @@ impl Endpoint {
 pub struct Admission {
     pub admitted: bool,
     pub blockers: Vec<String>,
+    pub policy: AdmissionPolicy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct AdmissionPolicy {
+    pub name: String,
+    pub per_request_output_cap_required: bool,
+    pub output_cancel_threshold_tokens: u64,
+    pub reasoning_cancel_threshold_tokens: u64,
+    pub global_max_posts_hard: bool,
+    pub global_total_tokens_hard: bool,
+    pub predispatch_reservation: String,
+    pub endpoint_output_limits: Vec<EndpointOutputLimit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct EndpointOutputLimit {
+    pub endpoint: Endpoint,
+    pub field: String,
+    pub tokens: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -117,7 +141,7 @@ pub struct ReplayPlan {
     pub body_profile: String,
     pub wire_adapter: String,
     pub local_tokenizer: String,
-    pub output_token_cap: u64,
+    pub output_token_limit: u64,
     pub maximum_posts: u64,
     pub maximum_total_tokens: u64,
     pub scheduled_posts: u64,
@@ -166,6 +190,8 @@ pub struct PlannedAttempt {
     pub body: String,
     pub body_sha256: String,
     pub body_bytes: u64,
+    pub output_limit_field: String,
+    pub output_limit_tokens: u64,
     pub planned_header_names: Vec<String>,
     pub conditional_header_names: Vec<String>,
     pub input_reservation_tokens: u64,
@@ -279,12 +305,8 @@ pub fn build_plan(
         .sum::<u64>();
     let scheduled_total_reservation =
         scheduled_input_reservation.saturating_add(scheduled_output_reservation);
-    let blockers = vec![format!(
-        "{} has no versioned Kogen generation-cap contract for max_output_tokens={OUTPUT_TOKEN_CAP}; the cap is present in the frozen body, but endpoint enforcement is unverified, so execute is not admitted",
-        CHATGPT_BACKEND_ENDPOINT
-    )];
     let mut plan = ReplayPlan {
-        schema_version: 1,
+        schema_version: 2,
         seed: seed.to_owned(),
         prng: "ChaCha20Rng rand_chacha-0.3.1".to_owned(),
         source_revision: "unresolved".to_owned(),
@@ -294,9 +316,10 @@ pub fn build_plan(
         model: MODEL.to_owned(),
         effort: EFFORT.to_owned(),
         body_profile: "owned_responses_common_v1".to_owned(),
-        wire_adapter: "kogen-core::provider::http::wire/owned-common-v1".to_owned(),
+        wire_adapter: "kogen-core::provider::http::wire/owned-common-v1+stream-budget-v1"
+            .to_owned(),
         local_tokenizer: LOCAL_TOKENIZER_ID.to_owned(),
-        output_token_cap: OUTPUT_TOKEN_CAP,
+        output_token_limit: OUTPUT_TOKEN_LIMIT,
         maximum_posts: MAX_POSTS,
         maximum_total_tokens: MAX_TOTAL_TOKENS,
         scheduled_posts: attempts.len() as u64,
@@ -304,8 +327,9 @@ pub fn build_plan(
         scheduled_output_reservation,
         scheduled_total_reservation,
         admission: Admission {
-            admitted: blockers.is_empty(),
-            blockers,
+            admitted: true,
+            blockers: Vec::new(),
+            policy: admission_policy(),
         },
         attempts,
         plan_sha256: String::new(),
@@ -314,9 +338,35 @@ pub fn build_plan(
     Ok(plan)
 }
 
+fn admission_policy() -> AdmissionPolicy {
+    AdmissionPolicy {
+        name: "coordinator_cancel_on_overflow_v1".to_owned(),
+        per_request_output_cap_required: false,
+        output_cancel_threshold_tokens: OUTPUT_CANCEL_THRESHOLD_TOKENS,
+        reasoning_cancel_threshold_tokens: REASONING_CANCEL_THRESHOLD_TOKENS,
+        global_max_posts_hard: true,
+        global_total_tokens_hard: true,
+        predispatch_reservation:
+            "input allowance plus the endpoint's requested output limit and observed framing margin"
+                .to_owned(),
+        endpoint_output_limits: vec![
+            EndpointOutputLimit {
+                endpoint: Endpoint::OpenAiResponses,
+                field: "max_output_tokens".to_owned(),
+                tokens: OUTPUT_TOKEN_LIMIT,
+            },
+            EndpointOutputLimit {
+                endpoint: Endpoint::ChatgptBackend,
+                field: "max_output_tokens".to_owned(),
+                tokens: OUTPUT_TOKEN_LIMIT,
+            },
+        ],
+    }
+}
+
 pub fn validate_manifest(manifest: &FixtureManifest) -> Result<(), String> {
-    if manifest.schema_version != 1 {
-        return Err("fixture manifest schema_version must be 1".to_owned());
+    if manifest.schema_version != 2 {
+        return Err("fixture manifest schema_version must be 2".to_owned());
     }
     if manifest.fixtures.len() != 2 {
         return Err("fixture manifest must contain exactly builder and shaper fixtures".to_owned());
@@ -359,33 +409,89 @@ pub fn validate_manifest(manifest: &FixtureManifest) -> Result<(), String> {
                 fixture.id
             ));
         }
+        if fixture.continuation != CONTINUATION {
+            return Err(format!(
+                "fixture {} continuation does not match the frozen deterministic continuation",
+                fixture.id
+            ));
+        }
+        let allowed_tools: &[&str] = match fixture.id.as_str() {
+            "builder" => &["finish", "shell", "tool_output"],
+            "shaper" => &["read", "search", "write"],
+            _ => return Err("fixture ID is not a supported Kogen prompt role".to_owned()),
+        };
+        let expected_schemas = kogen_core::provider::tools::canonical_tool_schemas()
+            .into_iter()
+            .filter(|schema| {
+                schema
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| allowed_tools.contains(&name))
+            })
+            .collect::<Vec<_>>();
+        if fixture.tool_schemas != expected_schemas {
+            return Err(format!(
+                "fixture {} tool schemas differ from Kogen's canonical role schemas",
+                fixture.id
+            ));
+        }
     }
     Ok(())
 }
 
 pub fn verify_plan(plan: &ReplayPlan) -> Result<(), String> {
-    if plan.schema_version != 1 {
+    if plan.schema_version != 2 {
         return Err("unsupported replay plan schema_version".to_owned());
     }
     if plan.model != MODEL || plan.effort != EFFORT {
         return Err("plan model or reasoning effort does not match the frozen design".to_owned());
     }
     if plan.body_profile != "owned_responses_common_v1"
-        || plan.wire_adapter != "kogen-core::provider::http::wire/owned-common-v1"
+        || plan.wire_adapter != "kogen-core::provider::http::wire/owned-common-v1+stream-budget-v1"
     {
         return Err("plan body or wire adapter profile is unsupported".to_owned());
     }
     if plan.adapter_source_sha256 != adapter_source_sha256() {
         return Err("wire adapter source hash differs from the frozen plan".to_owned());
     }
-    if plan.output_token_cap != OUTPUT_TOKEN_CAP {
-        return Err("plan output cap does not match the frozen 256-token cap".to_owned());
+    if plan.output_token_limit != OUTPUT_TOKEN_LIMIT {
+        return Err(
+            "plan output limit does not match the frozen 256-token request field".to_owned(),
+        );
     }
-    if plan.maximum_posts != MAX_POSTS || plan.scheduled_posts != plan.attempts.len() as u64 {
+    if plan.admission.policy != admission_policy() {
+        return Err(
+            "plan admission does not match the coordinator cancel-on-overflow policy".to_owned(),
+        );
+    }
+    if plan.maximum_posts != MAX_POSTS
+        || plan.scheduled_posts != MAX_POSTS
+        || plan.scheduled_posts != plan.attempts.len() as u64
+    {
         return Err("plan request allocation is invalid".to_owned());
     }
     if plan.maximum_total_tokens != MAX_TOTAL_TOKENS {
         return Err("plan total-token cap is invalid".to_owned());
+    }
+    let input_reservation = plan
+        .attempts
+        .iter()
+        .map(|attempt| attempt.input_reservation_tokens)
+        .sum::<u64>();
+    let output_reservation = plan
+        .attempts
+        .iter()
+        .map(|attempt| attempt.output_reservation_tokens)
+        .sum::<u64>();
+    let total_reservation = input_reservation.saturating_add(output_reservation);
+    if input_reservation != plan.scheduled_input_reservation
+        || output_reservation != plan.scheduled_output_reservation
+        || total_reservation != plan.scheduled_total_reservation
+    {
+        return Err("plan token reservations do not match the frozen requests".to_owned());
+    }
+    if total_reservation > plan.maximum_total_tokens {
+        return Err("plan worst-case token estimate exceeds the global hard budget".to_owned());
     }
     if plan_digest(plan)? != plan.plan_sha256 {
         return Err("replay plan SHA-256 does not match its contents".to_owned());
@@ -405,7 +511,7 @@ pub fn verify_plan(plan: &ReplayPlan) -> Result<(), String> {
         let body: Value = serde_json::from_str(&attempt.body)
             .map_err(|_| format!("request body is invalid JSON for {}", attempt.attempt_id))?;
         if body.get("model").and_then(Value::as_str) != Some(MODEL)
-            || body.get("max_output_tokens").and_then(Value::as_u64) != Some(OUTPUT_TOKEN_CAP)
+            || body.get("max_output_tokens").and_then(Value::as_u64) != Some(OUTPUT_TOKEN_LIMIT)
             || body.get("stream").and_then(Value::as_bool) != Some(true)
             || body.get("store").and_then(Value::as_bool) != Some(false)
             || body.get("tool_choice").and_then(Value::as_str) != Some("none")
@@ -422,6 +528,11 @@ pub fn verify_plan(plan: &ReplayPlan) -> Result<(), String> {
             return Err("plan contains an endpoint outside the allowlist".to_owned());
         }
         if attempt.body_profile != plan.body_profile
+            || attempt.output_limit_field != endpoint_output_limit(attempt.endpoint).0
+            || attempt.output_limit_tokens != endpoint_output_limit(attempt.endpoint).1
+            || attempt.output_reservation_tokens != attempt.output_limit_tokens
+            || attempt.input_reservation_tokens
+                != attempt.prefix_tokens.saturating_add(INPUT_OVERHEAD_TOKENS)
             || !is_sha256(&attempt.source_body_sha256)
             || attempt.source_run.trim().is_empty()
             || attempt.source_request_ordinal == 0
@@ -439,11 +550,19 @@ pub fn verify_plan(plan: &ReplayPlan) -> Result<(), String> {
 #[must_use]
 pub fn adapter_source_sha256() -> String {
     let mut digest = Sha256::new();
-    digest.update(b"kogen-cache-replay-adapter-source-v1\0");
+    digest.update(b"kogen-cache-replay-adapter-source-v2\0");
     digest.update(include_bytes!("../../kogen-core/src/provider/http/wire.rs"));
     digest.update(include_bytes!(
         "../../kogen-core/src/provider/http/wire/body.rs"
     ));
+    digest.update(include_bytes!(
+        "../../kogen-core/src/provider/http/client.rs"
+    ));
+    digest.update(include_bytes!("../../kogen-core/src/provider/http.rs"));
+    digest.update(include_bytes!(
+        "../../kogen-core/src/provider/http/client/transport.rs"
+    ));
+    digest.update(include_bytes!("../../kogen-core/src/provider/sse.rs"));
     digest.update(include_bytes!("execute.rs"));
     digest.update(include_bytes!("lib.rs"));
     hex_digest(&digest.finalize())
@@ -482,7 +601,9 @@ pub fn dry_run_rows(plan: &ReplayPlan) -> Vec<Value> {
                 "header_names": attempt.planned_header_names,
                 "conditional_header_names": attempt.conditional_header_names,
                 "input_reservation_tokens": attempt.input_reservation_tokens,
-                "output_reservation_tokens": attempt.output_reservation_tokens
+                "output_reservation_tokens": attempt.output_reservation_tokens,
+                "output_limit_field": attempt.output_limit_field,
+                "output_limit_tokens": attempt.output_limit_tokens
             })
         })
         .collect()
@@ -877,11 +998,13 @@ fn build_episode_attempts(
         draft.prefix_tokens,
         &draft.primer_nonce,
         &fixture.instructions,
+        &fixture.tool_schemas,
     )?;
     let prefix_probe = make_prefix(
         draft.prefix_tokens,
         &draft.probe_nonce,
         &fixture.instructions,
+        &fixture.tool_schemas,
     )?;
     let first = build_one_attempt(
         draft,
@@ -932,6 +1055,7 @@ fn build_one_attempt(
         input: replay_input_items(
             input_text,
             phase == "probe" || draft.cache_condition == "cold",
+            &fixture.continuation,
         ),
         tools: Vec::new(),
         callable_tools: Vec::new(),
@@ -954,7 +1078,7 @@ fn build_one_attempt(
     let mut base_wire = build_wire_request(&context, &planning_credential(), &config)
         .map_err(|failure| failure.message)?;
     let base_body_sha256 = sha256_hex(&base_wire.body);
-    let frozen_body = add_output_cap(&base_wire.body)?;
+    let frozen_body = add_output_limit(&base_wire.body, draft.endpoint)?;
     let body_sha256 = sha256_hex(&frozen_body);
     base_wire.body = frozen_body.clone();
     base_wire.headers.retain(|(name, _)| {
@@ -1032,34 +1156,59 @@ fn build_one_attempt(
         body: String::from_utf8(frozen_body).map_err(|error| error.to_string())?,
         body_sha256,
         body_bytes: base_wire.body.len() as u64,
+        output_limit_field: "max_output_tokens".to_owned(),
+        output_limit_tokens: OUTPUT_TOKEN_LIMIT,
         planned_header_names,
         conditional_header_names,
         input_reservation_tokens,
-        output_reservation_tokens: OUTPUT_TOKEN_CAP,
+        output_reservation_tokens: OUTPUT_TOKEN_LIMIT,
     })
 }
 
-fn add_output_cap(base_body: &[u8]) -> Result<Vec<u8>, String> {
+fn add_output_limit(base_body: &[u8], endpoint: Endpoint) -> Result<Vec<u8>, String> {
     let mut body: Value = serde_json::from_slice(base_body)
         .map_err(|error| format!("Kogen produced invalid JSON request body: {error}"))?;
     let object = body
         .as_object_mut()
         .ok_or_else(|| "Kogen request body is not a JSON object".to_owned())?;
-    object.insert("max_output_tokens".to_owned(), json!(OUTPUT_TOKEN_CAP));
+    let (field, tokens) = endpoint_output_limit(endpoint);
+    object.insert(field.to_owned(), json!(tokens));
     serde_json::to_vec(&body).map_err(|error| error.to_string())
 }
 
-fn make_prefix(target: u64, nonce: &str, instructions: &str) -> Result<String, String> {
+fn endpoint_output_limit(endpoint: Endpoint) -> (&'static str, u64) {
+    match endpoint {
+        Endpoint::OpenAiResponses | Endpoint::ChatgptBackend => {
+            ("max_output_tokens", OUTPUT_TOKEN_LIMIT)
+        }
+    }
+}
+
+fn make_prefix(
+    target: u64,
+    nonce: &str,
+    instructions: &str,
+    tool_schemas: &[Value],
+) -> Result<String, String> {
     let target = usize::try_from(target).map_err(|_| "prefix token target is too large")?;
     let mut tokens = vec![format!("nonce={nonce}")];
     tokens.extend(FIXED_INSTRUCTIONS.split_whitespace().map(str::to_owned));
-    let available = target.saturating_sub(tokens.len());
+    let schemas = serde_json::to_string(tool_schemas)
+        .map_err(|error| format!("could not serialize canonical tool schemas: {error}"))?;
+    let schema_tokens = format!("Kogen role tool schemas: {schemas}")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let available = target
+        .saturating_sub(tokens.len())
+        .saturating_sub(schema_tokens.len());
     tokens.extend(
         instructions
             .split_whitespace()
             .take(available)
             .map(str::to_owned),
     );
+    tokens.extend(schema_tokens);
     if tokens.len() > target {
         tokens.truncate(target);
     }
@@ -1079,10 +1228,10 @@ fn bounded_excerpt(input: &str) -> String {
         .join(" ")
 }
 
-fn replay_input_items(input: &str, include_continuation: bool) -> Vec<Value> {
+fn replay_input_items(input: &str, include_continuation: bool, continuation: &str) -> Vec<Value> {
     let mut items = vec![user_message(input)];
     if include_continuation {
-        items.push(user_message(CONTINUATION));
+        items.push(user_message(continuation));
     }
     items
 }
@@ -1150,7 +1299,7 @@ mod tests {
 
     fn fixture_manifest() -> (FixtureManifest, Vec<u8>) {
         let manifest = FixtureManifest {
-            schema_version: 1,
+            schema_version: 2,
             fixtures: vec![
                 fixture("builder", "Instructions for the frozen builder fixture."),
                 fixture("shaper", "Instructions for the frozen shaper fixture."),
@@ -1172,8 +1321,27 @@ mod tests {
             source_model: "gpt-6-luna".to_owned(),
             source_effort: "medium".to_owned(),
             instructions: instructions.to_owned(),
+            tool_schemas: tool_schemas_for(id),
             input_excerpt: "A short sanitized fixture excerpt.".to_owned(),
+            continuation: CONTINUATION.to_owned(),
         }
+    }
+
+    fn tool_schemas_for(id: &str) -> Vec<Value> {
+        let allowed: &[&str] = if id == "builder" {
+            &["finish", "shell", "tool_output"]
+        } else {
+            &["read", "search", "write"]
+        };
+        kogen_core::provider::tools::canonical_tool_schemas()
+            .into_iter()
+            .filter(|schema| {
+                schema
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| allowed.contains(&name))
+            })
+            .collect()
     }
 
     #[test]
@@ -1187,8 +1355,14 @@ mod tests {
         assert_eq!(first.scheduled_input_reservation, 1_849_344);
         assert_eq!(first.scheduled_output_reservation, 92_160);
         assert_eq!(first.scheduled_total_reservation, PLANNED_TOKEN_RESERVATION);
-        assert!(!first.admission.admitted);
-        assert!(first.admission.blockers[0].contains("enforcement is unverified"));
+        assert!(first.admission.admitted);
+        assert!(first.admission.blockers.is_empty());
+        assert!(!first.admission.policy.per_request_output_cap_required);
+        assert_eq!(first.admission.policy.output_cancel_threshold_tokens, 512);
+        assert_eq!(
+            first.admission.policy.reasoning_cancel_threshold_tokens,
+            1_024
+        );
         verify_plan(&first).unwrap();
 
         for primer in first

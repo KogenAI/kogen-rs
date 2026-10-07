@@ -1,6 +1,7 @@
 use super::{ReqwestPort, classify_grok_http_error, normalize_failure, size_limit_failure};
-use crate::provider::http::client::{HttpPort, RequestDeadlines};
+use crate::provider::http::client::{HttpPort, LimitedHttpAttempt, RequestDeadlines};
 use crate::provider::http::wire::{ResponseMode, WireRequest};
+use crate::provider::sse::{StreamLimitExceeded, StreamOutputLimits};
 use crate::provider::{ProviderErrorKind, ProviderFailure};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -151,6 +152,104 @@ fn single_attempt_transport_does_not_follow_redirects() {
     assert_eq!(attempt.status_code, Some(307));
     assert!(attempt.response.is_err());
     assert!(!server.join().unwrap(), "transport followed the redirect");
+}
+
+#[test]
+fn replay_transport_cancels_a_fake_server_stream_on_output_overflow() {
+    let words = std::iter::repeat_n("word", 513)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let attempt = run_fake_replay_stream(serde_json::json!({
+        "type": "response.output_text.delta",
+        "delta": words
+    }));
+    assert_eq!(
+        attempt.limit_exceeded,
+        Some(StreamLimitExceeded::OutputTokens)
+    );
+}
+
+#[test]
+fn replay_transport_cancels_a_fake_server_stream_on_reasoning_overflow() {
+    let words = std::iter::repeat_n("thought", 1_025)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let attempt = run_fake_replay_stream(serde_json::json!({
+        "type": "response.reasoning_summary_text.delta",
+        "delta": words
+    }));
+    assert_eq!(
+        attempt.limit_exceeded,
+        Some(StreamLimitExceeded::ReasoningTokens)
+    );
+}
+
+#[test]
+fn replay_transport_keeps_provider_usage_from_the_frame_that_triggers_cancellation() {
+    let attempt = run_fake_replay_stream(serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "model": "gpt-6-luna",
+            "status": "completed",
+            "usage": {
+                "input_tokens": 200,
+                "output_tokens": 513,
+                "input_tokens_details": {"cached_tokens": 50},
+                "output_tokens_details": {"reasoning_tokens": 12}
+            },
+            "output": []
+        }
+    }));
+    assert_eq!(
+        attempt.limit_exceeded,
+        Some(StreamLimitExceeded::OutputTokens)
+    );
+    assert_eq!(attempt.attempt.raw_usage.unwrap()["input_tokens"], 200);
+}
+
+fn run_fake_replay_stream(event: serde_json::Value) -> LimitedHttpAttempt {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        let frame = format!("data: {}\n\n", event);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+            frame.len()
+        )
+        .unwrap();
+        stream.write_all(frame.as_bytes()).unwrap();
+        stream.write_all(b"\r\n").unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(150));
+    });
+
+    let request = WireRequest {
+        endpoint: Url::parse(&endpoint).unwrap(),
+        mode: ResponseMode::Owned,
+        headers: Vec::new(),
+        body: br#"{"model":"gpt-6-luna"}"#.to_vec(),
+    };
+    let port = ReqwestPort::new_without_redirects().unwrap();
+    let result = port.execute_with_output_limits(
+        &request,
+        RequestDeadlines {
+            first_byte: Duration::from_secs(2),
+            idle: Duration::from_secs(2),
+            total: Duration::from_secs(3),
+            unscaled_idle_ms: 2_000,
+        },
+        StreamOutputLimits {
+            output_tokens: 512,
+            reasoning_tokens: 1_024,
+            hard_budget_output_tokens: 2_048,
+        },
+    );
+    server.join().unwrap();
+    assert!(result.attempt.response.is_err());
+    result
 }
 
 fn read_request(stream: &mut TcpStream) {
