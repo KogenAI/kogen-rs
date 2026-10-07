@@ -23,21 +23,39 @@ pub(super) fn selected_account(
 
 pub(super) fn role_config(
     config: Option<&crate::project::ProjectConfig>,
+    home: &Path,
     role: &str,
     default: (&str, &str),
-) -> (String, String) {
-    let values = config
-        .and_then(|config| config.raw["build"]["roles"][role].as_mapping())
-        .and_then(|mapping| {
-            Some((
-                mapping.get("model")?.as_str()?,
-                mapping.get("effort")?.as_str()?,
-            ))
-        });
-    values.map_or_else(
-        || (default.0.to_owned(), default.1.to_owned()),
-        |(model, effort)| (model.to_owned(), effort.to_owned()),
-    )
+) -> Result<(String, String), CoreError> {
+    let mut effective = (default.0.to_owned(), default.1.to_owned());
+    let machine_path = home.join(".kogen/config.yaml");
+    let machine = match std::fs::read(&machine_path) {
+        Ok(bytes) => Some(
+            crate::project::yaml::parse(&bytes)
+                .map_err(|error| super::files::io_error("config_invalid", error.message))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(super::files::io_error("config_unavailable", error)),
+    };
+    for raw in [machine.as_ref(), config.map(|config| &config.raw)]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(model) = raw["build"]["roles"][role]["model"].as_str() {
+            effective.0 = model.to_owned();
+        }
+        if let Some(effort) = raw["build"]["roles"][role]["effort"].as_str() {
+            effective.1 = effort.to_owned();
+        }
+    }
+    let grok = default.0.starts_with("grok-");
+    if grok != effective.0.starts_with("grok-") {
+        return Err(super::files::io_error(
+            "config_invalid",
+            format!("{role} model does not belong to selected provider"),
+        ));
+    }
+    Ok(effective)
 }
 
 pub(super) fn domains(config: Option<&crate::project::ProjectConfig>) -> Vec<String> {

@@ -1,5 +1,6 @@
 //! Public core entry point for `intent shape`.
 
+pub(super) mod accounting;
 mod checkout_lock;
 mod config;
 mod execute;

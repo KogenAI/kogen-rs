@@ -22,9 +22,9 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const SHAPER_DEFAULT: (&str, &str) = ("gpt-6.1-sol", "high");
-const FALLBACK_SHAPER: (&str, &str) = ("gpt-6.1-sol", "high");
 
 pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
+    let started = std::time::Instant::now();
     if !valid_slug(&options.slug) {
         return Err(shape_error(
             ErrorClass::Intent,
@@ -75,10 +75,32 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         .map_err(|error| io_error("shape_scratch_unavailable", error))?;
     secure_file(&transcript_path)?;
 
+    let mut receipt = super::accounting::Receipt {
+        accounting: Default::default(),
+        success: false,
+        path: project
+            .state_root
+            .join("shaping")
+            .join(run_dir.file_name().expect("Shape run identity"))
+            .join("shape-accounting.json"),
+        started,
+    };
+    if let Some(parent) = receipt.path.parent() {
+        fs::create_dir_all(parent).map_err(|error| io_error("shape_scratch_unavailable", error))?;
+    }
     let commands = ShapeCommands::new(&project.checkout, &run_dir, config)?;
     commands.setup(&project.checkout, config)?;
     let account = selected_account(&options.home, &project)?;
-    let provider = ShapeProvider::new(&options.home, account)?;
+    let default = if account.provider == "grok" {
+        (
+            crate::provider::grok::DEFAULT_MODEL,
+            crate::provider::grok::DEFAULT_EFFORT,
+        )
+    } else {
+        SHAPER_DEFAULT
+    };
+    let mut provider = ShapeProvider::new(&options.home, account)?;
+    provider.accounting = receipt.accounting.clone();
     let domains = domains(config);
     let gate_paths = gate_paths(config);
     let initial = prompts::first_message(
@@ -89,11 +111,9 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         &intent_rel,
         &acceptance_rel,
     );
-    let shaper_role = role_config(config, "shaper", SHAPER_DEFAULT);
-    // §3.2 fixes the fallback conversation to Sol/high. A project role override
-    // for `fallback_shaper` must not turn the fallback into another Luna pass.
-    let fallback_role = (FALLBACK_SHAPER.0.to_owned(), FALLBACK_SHAPER.1.to_owned());
-    let auditor_role = role_config(config, "auditor", SHAPER_DEFAULT);
+    let shaper_role = role_config(config, &options.home, "shaper", default)?;
+    let fallback_role = shaper_role.clone();
+    let auditor_role = role_config(config, &options.home, "auditor", default)?;
     let result_tokens = config
         .and_then(|config| config.raw["build"]["tool_result_tokens"].as_u64())
         .unwrap_or(2_000);
@@ -129,12 +149,15 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         concern_seen: BTreeSet::new(),
     };
     let mut conversation_style_repairs = 0;
-    for pass in 1..=6 {
+    let mut pass = 1;
+    while pass <= 6 {
         state
             .warnings
             .retain(|warning| warning.code == "feasibility_concern");
         if pass == 1 || pass == 4 {
             conversation_style_repairs = 0;
+            state.coverage_repaired = false;
+            state.audit_repaired = false;
         }
         let role = if pass <= 3 {
             "shaper"
@@ -198,8 +221,19 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
             }
         }
 
+        let mut turn_exhausted = false;
         let validation = loop {
-            let final_text = state.drive_shaper(role, &model, &effort, pass)?;
+            let final_text = match state.drive_shaper(role, &model, &effort, pass) {
+                Ok(text) => text,
+                Err(error) if error.reason == "shape_turn_limit" => {
+                    turn_exhausted = true;
+                    break Err(ValidationFailure {
+                        reason: "shape_turn_limit",
+                        detail: error.detail,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             let result = validate_pass(
                 &mut state,
                 pass,
@@ -209,6 +243,7 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
             )?;
             match result {
                 PassResult::StyleRepair(findings) => {
+                    receipt.accounting.borrow_mut().repair("style");
                     debug_assert!(conversation_style_repairs < 2);
                     state
                         .progress
@@ -222,8 +257,14 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                         .append_user(feedback);
                     conversation_style_repairs += 1;
                 }
-                PassResult::Failure(failure) => break Err(failure),
-                PassResult::Complete => break Ok(()),
+                PassResult::Failure(failure) => {
+                    receipt.accounting.borrow_mut().validation();
+                    break Err(failure);
+                }
+                PassResult::Complete => {
+                    receipt.accounting.borrow_mut().validation();
+                    break Ok(());
+                }
             }
         };
         let turns = state.session.as_ref().map_or(0, ShapeSession::turn_count);
@@ -246,10 +287,22 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                 "shaper pass={pass} role={role} validation_failed reason={}",
                 failure.reason
             ));
-            if pass == 6 {
+            if pass == 6 || (pass >= 4 && turn_exhausted) {
                 return Err(repair_limit_error(failure, pass, state.calls.len()));
             }
+            receipt.accounting.borrow_mut().repair(failure.reason);
             state.last_failure = Some(failure);
+            if pass <= 3
+                && (turn_exhausted
+                    || state
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.turn_count() >= 60))
+            {
+                pass = 4;
+            } else {
+                pass += 1;
+            }
             continue;
         }
         state
@@ -296,6 +349,8 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         } else {
             "not checked".to_owned()
         };
+        receipt.success = true;
+        receipt.publish()?;
         return Ok(ShapeReport {
             intent_path: state.intent_path,
             acceptance_path: state.acceptance_path,
@@ -385,6 +440,7 @@ impl RunState {
                 .into_iter()
                 .any(|path| fs::read(path).is_err());
             if missing {
+                self.provider.accounting.borrow_mut().finish_guards += 1;
                 self.session
                     .as_mut()
                     .expect("shaper session exists")

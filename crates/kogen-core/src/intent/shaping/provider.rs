@@ -24,6 +24,7 @@ pub(super) struct ShapeProvider {
     account: RunAccount,
     http: ReqwestPort,
     clock: SystemClock,
+    pub accounting: super::runner::accounting::SharedAccounting,
 }
 
 impl ShapeProvider {
@@ -34,6 +35,7 @@ impl ShapeProvider {
             account,
             http,
             clock: SystemClock::default(),
+            accounting: Default::default(),
         })
     }
 
@@ -53,8 +55,17 @@ impl ShapeProvider {
         )
         .map_err(provider_io_error)?;
         configure_tools(&mut context, spec.tools);
+        if spec.tools {
+            self.accounting.borrow_mut().start_conversation(
+                &context.thread_id,
+                spec.output_role,
+                spec.model,
+                spec.effort,
+            );
+        }
         Ok(ShapeSession {
             output_role: spec.output_role.to_owned(),
+            accounting_role: spec.stage.to_owned(),
             context,
             previous_input_items: 0,
             turns: 0,
@@ -79,6 +90,10 @@ impl ShapeProvider {
         let fallback_effort = session.context.effort.clone();
         let start = Instant::now();
         let started_at_ms = unix_ms();
+        session.turns += 1;
+        self.accounting
+            .borrow_mut()
+            .turn(&session.context.thread_id, &session.accounting_role);
         let result = respond(
             &mut session.context,
             &mut request_credential,
@@ -98,6 +113,13 @@ impl ShapeProvider {
             Some(&self.account.label),
         );
         let ended_at_ms = unix_ms().max(started_at_ms);
+        let usages = match &result {
+            Ok(call) => &call.usages,
+            Err(failure) => &failure.usages,
+        };
+        self.accounting
+            .borrow_mut()
+            .attempts(&session.accounting_role, usages);
         let call = result.map_err(call_failure)?;
         let wire = call.attempts.last().ok_or_else(|| {
             CoreError::new(
@@ -117,7 +139,6 @@ impl ShapeProvider {
         );
         session.previous_input_items =
             super::journal::input_item_count(&wire.body).unwrap_or_default();
-        session.turns += 1;
         let response = call.response;
         session
             .context
@@ -149,6 +170,7 @@ pub(super) struct ShapeSessionSpec<'a> {
 
 pub(super) struct ShapeSession {
     output_role: String,
+    accounting_role: String,
     context: RequestContext,
     previous_input_items: usize,
     turns: usize,
@@ -178,18 +200,13 @@ impl ShapeSession {
 }
 
 fn configure_tools(context: &mut RequestContext, enabled: bool) {
+    context.tools = tools::canonical_tool_schemas();
     if enabled {
-        let allowed = ToolRole::Shaper.allowed();
-        context.tools = tools::canonical_tool_schemas()
-            .into_iter()
-            .filter(|schema| {
-                schema
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| allowed.contains(&name))
-            })
+        context.callable_tools = ToolRole::Shaper
+            .allowed()
+            .iter()
+            .map(|name| (*name).to_owned())
             .collect();
-        context.callable_tools = allowed.iter().map(|name| (*name).to_owned()).collect();
     } else {
         context.tool_choice = "none".to_owned();
     }
@@ -352,7 +369,18 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(shaper_tools, ["read", "search", "write"]);
+        assert_eq!(
+            shaper_tools,
+            [
+                "edit",
+                "finish",
+                "read",
+                "search",
+                "shell",
+                "tool_output",
+                "write"
+            ]
+        );
 
         let mut fallback = provider
             .session(ShapeSessionSpec {

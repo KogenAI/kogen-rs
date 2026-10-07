@@ -126,6 +126,7 @@ pub(super) fn record_call(
         .with("rung", json!(rung))
         .with("model", model)
         .with("effort", effort)
+        .with("attempt_usage", json!(call.usages))
         .with("tokens", usage_value(&call.response.usage))
         .with("wall_ms", json!(wall_ms))
         .with("prompt_cache_key", prompt_cache_key.clone())
@@ -306,6 +307,7 @@ mod tests {
             .create(&snapshot)
             .expect("create provider run journal");
         let call = ProviderCall {
+            usages: Vec::new(),
             response: ModelResponse {
                 id: "response".to_owned(),
                 text: String::new(),

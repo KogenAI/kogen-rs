@@ -18,6 +18,7 @@ pub struct ReqwestPort {
 impl ReqwestPort {
     pub fn new() -> Result<Self, ProviderFailure> {
         let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|_| transport_failure(ResponseMode::Owned))?;
