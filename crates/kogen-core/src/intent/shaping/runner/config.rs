@@ -37,6 +37,19 @@ pub(super) fn role_config(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(super::files::io_error("config_unavailable", error)),
     };
+    let demotion = config
+        .and_then(|config| config.raw["build"]["auditor_demotion"].as_bool())
+        .or_else(|| {
+            machine
+                .as_ref()
+                .and_then(|raw| raw["build"]["auditor_demotion"].as_bool())
+        });
+    if demotion == Some(true) {
+        return Err(super::files::io_error(
+            "config_invalid",
+            "build.auditor_demotion has no admitted calibration",
+        ));
+    }
     for raw in [machine.as_ref(), config.map(|config| &config.raw)]
         .into_iter()
         .flatten()

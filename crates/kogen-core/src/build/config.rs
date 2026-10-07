@@ -51,6 +51,12 @@ impl BuildOptions {
         project: &ProjectResolution,
         machine: &Option<Value>,
     ) -> Result<Self, CoreError> {
+        if bool_value(project, machine, "auditor_demotion") == Some(true) {
+            return Err(config_error(
+                "build_config_invalid",
+                "build.auditor_demotion has no admitted calibration",
+            ));
+        }
         let planner = role(project, machine, "planner", "gpt-6.1-sol", "high");
         let auditor = role(project, machine, "auditor", "gpt-6.1-sol", "high");
         let builder = role(project, machine, "builder", "gpt-6-luna", "max");
@@ -332,4 +338,36 @@ fn config_error(reason: &str, detail: impl std::fmt::Display) -> CoreError {
         detail.to_string(),
         ExitCode::Environment,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn machine_demotion_is_refused_without_calibration_but_can_be_explicitly_disabled() {
+        let path =
+            std::env::temp_dir().join(format!("kogen-machine-policy-{}", rand::random::<u64>()));
+        let mut project = ProjectResolution {
+            checkout: path.clone(),
+            origin: path.clone(),
+            state_root: path,
+            base: "main".to_owned(),
+            config: None,
+        };
+        let machine = Some(serde_yaml::from_str("auditor_demotion: true\n").unwrap());
+        let error = BuildOptions::load_with_machine(&project, &machine).unwrap_err();
+        assert_eq!(error.exit_code, ExitCode::Environment);
+        assert!(error.detail.contains("no admitted calibration"));
+        project.config = Some(crate::project::ProjectConfig {
+            name: "fixture".to_owned(),
+            base: None,
+            raw: serde_yaml::from_str("build:\n  auditor_demotion: false\n").unwrap(),
+        });
+        assert_eq!(
+            BuildOptions::load_with_machine(&project, &machine)
+                .unwrap()
+                .land_policy,
+            "green"
+        );
+    }
 }
