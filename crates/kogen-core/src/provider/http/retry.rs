@@ -87,7 +87,7 @@ impl RetryReplay {
         let role = str_field(value, "role").unwrap_or_default();
         let model = str_field(value, "model").unwrap_or_default();
         let mode = str_field(value, "mode").unwrap_or_default();
-        let fallback = bool_field(value, "fallbackOn");
+        let requested_fallback = bool_field(value, "fallbackOn");
         let bounded = bool_field(value, "bounded");
         let Some(wall) = value.get("wall").and_then(Value::as_u64) else {
             self.last = "bad_open".to_owned();
@@ -104,7 +104,10 @@ impl RetryReplay {
         self.mode = mode.to_owned();
         self.role = role.to_owned();
         self.model = model.to_owned();
-        self.fallback_on = fallback;
+        // The Grok Responses backend has no Luna-to-Sol fallback. Keep this
+        // provider boundary in the shared retry transition used by the CLI
+        // and xspec, even when an injected event requests fallback.
+        self.fallback_on = requested_fallback && model != "grok";
         self.bounded = bounded;
         self.wall = wall;
         self.attempt = 1;
@@ -399,5 +402,29 @@ mod tests {
         assert_eq!(replay.decision, "pause");
         assert_eq!(replay.delay, 300_000);
         assert_eq!(replay.waited, 300_000);
+    }
+
+    #[test]
+    fn grok_does_not_enable_model_fallback_from_a_requested_flag() {
+        let mut replay = RetryReplay::default();
+        replay.apply(
+            "Open",
+            Some(&json!({
+                "role":"builder",
+                "model":"grok",
+                "mode":"build",
+                "fallbackOn":true,
+                "refreshable":true,
+                "bounded":true,
+                "wall":100_000
+            })),
+        );
+
+        assert!(!replay.fallback_on);
+        replay.apply("Result", Some(&json!({"kind":"overload"})));
+        replay.apply("Result", Some(&json!({"kind":"overload"})));
+        assert_eq!(replay.model, "grok");
+        assert_eq!(replay.decision, "retry");
+        assert_eq!(replay.overloads, 2);
     }
 }
