@@ -16,13 +16,13 @@ use super::validate::validate_pass;
 use super::{ShapeOptions, ShapeReport};
 use crate::error::{CoreError, ErrorClass};
 use crate::project::{ProjectOptions as CoreProjectOptions, ProjectResolution, valid_slug};
-use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
 
 const SHAPER_DEFAULT: (&str, &str) = ("gpt-6.1-sol", "high");
+const FALLBACK_SHAPER: (&str, &str) = ("gpt-6.1-sol", "high");
 
 pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
     if !valid_slug(&options.slug) {
@@ -52,18 +52,9 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
     let config = project.config.as_ref();
     let intent_rel = format!(".kogen/intents/{}/intent.md", options.slug);
     let intent_path = project.checkout.join(&intent_rel);
-    let acceptance_ext = config
-        .and_then(|config| config.raw["acceptance"]["ext"].as_str())
-        .unwrap_or(".t.sh");
-    let acceptance_rel = format!(".kogen/acceptance/{}{acceptance_ext}", options.slug);
+    let (acceptance_rel, candidate_rel) =
+        ShapeCommands::acceptance_paths(config, &project.checkout, &options.slug);
     let acceptance_path = project.checkout.join(&acceptance_rel);
-    let candidate_rel = format!(
-        "{}/{}{acceptance_ext}",
-        config
-            .and_then(|config| config.raw["acceptance"]["candidate_dir"].as_str())
-            .unwrap_or("test/acceptance"),
-        options.slug
-    );
     let intent_dir = intent_path.parent().expect("intent path has parent");
     fs::create_dir_all(intent_dir).map_err(|error| io_error("shape_output_unavailable", error))?;
     fs::create_dir_all(
@@ -99,7 +90,9 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         &acceptance_rel,
     );
     let shaper_role = role_config(config, "shaper", SHAPER_DEFAULT);
-    let fallback_role = role_config(config, "fallback_shaper", SHAPER_DEFAULT);
+    // §3.2 fixes the fallback conversation to Sol/high. A project role override
+    // for `fallback_shaper` must not turn the fallback into another Luna pass.
+    let fallback_role = (FALLBACK_SHAPER.0.to_owned(), FALLBACK_SHAPER.1.to_owned());
     let auditor_role = role_config(config, "auditor", SHAPER_DEFAULT);
     let result_tokens = config
         .and_then(|config| config.raw["build"]["tool_result_tokens"].as_u64())
@@ -232,7 +225,7 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
         if let Err(failure) = validation {
             if matches!(
                 failure.reason,
-                "acceptance_check_unavailable" | "acceptance_adapter_unavailable"
+                "acceptance_check_unavailable" | "tool_missing"
             ) {
                 return Err(CoreError::new(
                     ErrorClass::Environment,
@@ -418,14 +411,7 @@ impl RunState {
 
     fn record_call(&mut self, call: &super::super::ShapeModelCall) {
         self.calls.push(call.clone());
-        let value = json!({
-            "kind": "model_call",
-            "role": call.role,
-            "model": call.model,
-            "effort": call.effort,
-            "usage": call.usage,
-            "wall_ms": call.wall_ms
-        });
+        let value = call.transcript_value();
         if let Ok(mut file) = OpenOptions::new().append(true).open(&self.transcript_path) {
             let _ = writeln!(file, "{}", value);
         }

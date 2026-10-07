@@ -24,6 +24,15 @@ pub(super) struct ShapeCommands {
     pub process: ProcessSupervisor,
     pub environment: ChildEnvironment,
     pub runner_dir: PathBuf,
+    acceptance: ShapeAcceptance,
+}
+
+struct ShapeAcceptance {
+    adapter: String,
+    extension: String,
+    candidate_dir: String,
+    command: Vec<OsString>,
+    timeout: Duration,
 }
 
 impl ShapeCommands {
@@ -55,7 +64,25 @@ impl ShapeCommands {
             process,
             environment,
             runner_dir: run_dir.to_path_buf(),
+            acceptance: shape_acceptance(config, checkout),
         })
+    }
+
+    pub fn acceptance_paths(
+        config: Option<&ProjectConfig>,
+        checkout: &Path,
+        slug: &str,
+    ) -> (String, String) {
+        let acceptance = shape_acceptance(config, checkout);
+        (
+            format!(".kogen/acceptance/{slug}{}", acceptance.extension),
+            format!(
+                "{}/{}{extension}",
+                acceptance.candidate_dir,
+                slug,
+                extension = acceptance.extension
+            ),
+        )
     }
 
     pub fn setup(
@@ -157,33 +184,34 @@ impl ShapeCommands {
     pub fn base_acceptance(
         &self,
         checkout: &Path,
-        config: Option<&ProjectConfig>,
         slug: &str,
         source_rel: &str,
         report_path: &Path,
         item_ids: impl IntoIterator<Item = String>,
     ) -> Result<BTreeSet<String>, ValidationFailure> {
-        let Some(acceptance) = config.and_then(|config| config.raw.get("acceptance")) else {
-            return Err(ValidationFailure {
-                reason: "acceptance_adapter_unavailable",
-                detail: "project has no acceptance adapter".to_owned(),
-            });
+        let use_mise = std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("mise").is_file()));
+        let command_argv0 = match self.acceptance.adapter.as_str() {
+            "exunit" if use_mise => "mise".to_owned(),
+            "exunit" => "elixir".to_owned(),
+            "rails" => "bundle".to_owned(),
+            _ => self.acceptance.command.first().map_or_else(
+                || "acceptance runner".to_owned(),
+                |argv0| argv0.to_string_lossy().into_owned(),
+            ),
         };
-        let command = acceptance
-            .get("run")
-            .and_then(Value::as_sequence)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(OsString::from)
-            .collect::<Vec<_>>();
-        let timeout = Duration::from_millis(
-            acceptance
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(600_000),
-        );
+        let command = match self.acceptance.adapter.as_str() {
+            "exunit" => Vec::new(),
+            "rails" => crate::gate::adapters::rails::runner_command(),
+            _ => self.acceptance.command.clone(),
+        };
         let expected_items = item_ids.into_iter().collect();
+        let mut environment = self.environment.clone();
+        if self.acceptance.adapter == "rails" {
+            environment.extend(crate::gate::adapters::rails::child_environment(
+                &checkout.join("vendor/cache"),
+            ));
+        }
         let request = CommandAcceptanceRequest {
             slug: slug.to_owned(),
             command,
@@ -191,25 +219,34 @@ impl ShapeCommands {
             workdir: checkout.to_path_buf(),
             run_dir: self.runner_dir.clone(),
             report_path: report_path.to_path_buf(),
-            env: self.environment.clone(),
-            timeout,
+            env: environment,
+            timeout: self.acceptance.timeout,
             expected_items,
             adapter_unavailable: false,
         };
-        let result =
+        let result = if self.acceptance.adapter == "exunit" {
+            crate::gate::adapters::exunit::run_acceptance(
+                &self.process,
+                &GitSnapshot,
+                request,
+                use_mise,
+            )
+            .map_err(|error| ValidationFailure {
+                reason: "acceptance_failed",
+                detail: error.to_string(),
+            })?
+        } else {
             run_command_acceptance(&self.process, &GitSnapshot, request).map_err(|error| {
                 ValidationFailure {
                     reason: "acceptance_failed",
                     detail: error.to_string(),
                 }
-            })?;
+            })?
+        };
         if result.process.unavailable || matches!(result.process.exit_status, Some(126 | 127)) {
             return Err(ValidationFailure {
-                reason: "acceptance_adapter_unavailable",
-                detail: format!(
-                    "acceptance adapter is unavailable; log: {}",
-                    result.process.log_path.display()
-                ),
+                reason: "tool_missing",
+                detail: format!("{command_argv0} is not available"),
             });
         }
         if result
@@ -348,5 +385,101 @@ impl ShapeCommands {
             .with_integrity_check(false);
         let sandbox = SandboxedProcessPort::new(&self.process, policy, None);
         sandbox.run(request).map_err(|error| error.to_string())
+    }
+}
+
+fn shape_acceptance(config: Option<&ProjectConfig>, checkout: &Path) -> ShapeAcceptance {
+    let acceptance = config.and_then(|config| config.raw.get("acceptance"));
+    let adapter = acceptance
+        .and_then(|acceptance| acceptance.get("adapter"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if crate::gate::adapters::rails::detected(checkout) {
+                "rails".to_owned()
+            } else {
+                "exunit".to_owned()
+            }
+        });
+    let extension = acceptance
+        .and_then(|acceptance| acceptance.get("ext"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| match adapter.as_str() {
+            "command" => ".test".to_owned(),
+            "rails" => crate::gate::adapters::rails::ACCEPTANCE_EXTENSION.to_owned(),
+            _ => crate::gate::adapters::exunit::ACCEPTANCE_EXTENSION.to_owned(),
+        });
+    let candidate_dir = acceptance
+        .and_then(|acceptance| acceptance.get("candidate_dir"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| match adapter.as_str() {
+            "command" => "test/acceptance".to_owned(),
+            "rails" => crate::gate::adapters::rails::CANDIDATE_DIRECTORY.to_owned(),
+            _ => crate::gate::adapters::exunit::CANDIDATE_DIRECTORY.to_owned(),
+        });
+    let command = acceptance
+        .and_then(|acceptance| acceptance.get("run"))
+        .and_then(Value::as_sequence)
+        .and_then(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    let timeout = Duration::from_millis(
+        acceptance
+            .and_then(|acceptance| acceptance.get("timeout_ms"))
+            .and_then(Value::as_u64)
+            .unwrap_or(600_000),
+    );
+    ShapeAcceptance {
+        adapter,
+        extension,
+        candidate_dir,
+        command,
+        timeout,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShapeCommands;
+    use crate::project::ProjectConfig;
+
+    #[test]
+    fn shape_paths_follow_builtin_and_command_acceptance_adapters() {
+        let checkout = std::env::temp_dir().join(format!(
+            "kogen-shape-acceptance-paths-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&checkout).unwrap();
+
+        assert_eq!(
+            ShapeCommands::acceptance_paths(None, &checkout, "greet"),
+            (
+                ".kogen/acceptance/greet_test.exs".to_owned(),
+                "test/acceptance/greet_test.exs".to_owned(),
+            )
+        );
+
+        let config = ProjectConfig {
+            name: "test".to_owned(),
+            base: None,
+            raw: serde_yaml::from_str(
+                "acceptance:\n  adapter: command\n  ext: .t.sh\n  candidate_dir: test/acceptance\n  run: [sh, run.sh, '{path}']\n",
+            )
+            .unwrap(),
+        };
+        assert_eq!(
+            ShapeCommands::acceptance_paths(Some(&config), &checkout, "greet"),
+            (
+                ".kogen/acceptance/greet.t.sh".to_owned(),
+                "test/acceptance/greet.t.sh".to_owned(),
+            )
+        );
+
+        std::fs::remove_dir_all(checkout).unwrap();
     }
 }

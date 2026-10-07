@@ -94,7 +94,6 @@ pub(super) fn validate_pass(
         .collect::<Vec<_>>();
     let base_results = match state.commands.base_acceptance(
         &state.checkout,
-        state.config.as_ref(),
         &state.options.slug,
         &state.acceptance_rel,
         &state.run_dir.join("base-acceptance.jsonl"),
@@ -148,14 +147,14 @@ pub(super) fn validate_pass(
         .expect("intent directory")
         .join("ledger.json");
     write_json(&ledger_path, &audit::encode_ledger(&hash, &ledger))?;
-    if !gaps.is_empty() {
-        if !state.coverage_repaired {
-            state.coverage_repaired = true;
-            return Ok(PassResult::Failure(ValidationFailure {
-                reason: "coverage_gap",
-                detail: gaps.join("\n"),
-            }));
-        }
+    let coverage_failure = if gaps.is_empty() {
+        None
+    } else if !state.coverage_repaired {
+        Some(ValidationFailure {
+            reason: "coverage_gap",
+            detail: gaps.join("\n"),
+        })
+    } else {
         state.warnings.push(super::super::ShapeWarning {
             code: "coverage_gap".to_owned(),
             item_ids: ledger
@@ -165,7 +164,8 @@ pub(super) fn validate_pass(
                 .collect(),
             message: gaps.join("; "),
         });
-    }
+        None
+    };
 
     let base_outputs = item_ids
         .iter()
@@ -209,6 +209,13 @@ pub(super) fn validate_pass(
         .filter(|item| audit::valid_citation(&item.citation, &state.request))
         .copied()
         .collect::<Vec<_>>();
+
+    // Coverage repair is still the step-7 result, but step 8 must run on every
+    // pass that reaches the core audits, including a pass with a coverage gap.
+    if let Some(failure) = coverage_failure {
+        state.coverage_repaired = true;
+        return Ok(PassResult::Failure(failure));
+    }
     if !repairable.is_empty() && !state.audit_repaired {
         state.audit_repaired = true;
         let detail = repairable
