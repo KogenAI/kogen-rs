@@ -46,9 +46,13 @@ pub(super) fn baseline_key(
         let Ok(bytes) = fs::read(&path) else {
             return Ok(None);
         };
+        let executable_identity = path.strip_prefix(checkout).map_or_else(
+            |_| path.to_string_lossy().into_owned(),
+            |relative| format!("checkout:{}", relative.display()),
+        );
         toolchain.insert(
             program.to_owned(),
-            json!({"path":path,"sha256":format!("{:x}",Sha256::digest(bytes))}),
+            json!({"path":executable_identity,"sha256":format!("{:x}",Sha256::digest(bytes))}),
         );
         // mix/exunit depend on both runtimes, not just the launcher script.
         if matches!(
@@ -91,5 +95,43 @@ fn executable(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         path.is_file()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn scratch_paths_do_not_change_identity_and_unknown_or_changed_tools_miss() {
+        let root =
+            std::env::temp_dir().join(format!("kogen-baseline-identity-{}", rand::random::<u64>()));
+        let first = root.join("first");
+        let second = root.join("second");
+        for path in [&first, &second] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("check"), b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path.join("check"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env = BTreeMap::new();
+        let setup = SetupCacheKey::from_project(None, &first, "tree", &env).unwrap();
+        let checks = json!([{"name":"check","argv":["./check"],"timeout_ms":1000}]);
+        let key = baseline_key(&setup, "tree", &checks, &first, &env).unwrap();
+        assert!(key.is_some());
+        assert_eq!(
+            key,
+            baseline_key(&setup, "tree", &checks, &second, &env).unwrap()
+        );
+        fs::write(second.join("check"), b"#!/bin/sh\nexit 1\n").unwrap();
+        assert_ne!(
+            key,
+            baseline_key(&setup, "tree", &checks, &second, &env).unwrap()
+        );
+        fs::remove_file(second.join("check")).unwrap();
+        assert_eq!(
+            baseline_key(&setup, "tree", &checks, &second, &env).unwrap(),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
