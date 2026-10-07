@@ -151,13 +151,14 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                 state
                     .progress
                     .push(format!("shaper pass={pass} role={role} fallback_started"));
-                prompts::fallback_message(
-                    &state.initial,
+                let feedback = prompts::validation_feedback(
                     state
                         .last_failure
                         .as_ref()
                         .expect("fallback has last failure"),
-                )
+                );
+                state.record_feedback(pass, "validation", &feedback);
+                prompts::fallback_message(&state.initial, &feedback)
             } else {
                 state
                     .progress
@@ -179,7 +180,12 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
             state
                 .progress
                 .push(format!("shaper pass={pass} role={role} started"));
-            if let Some(failure) = &state.last_failure {
+            if let Some(feedback) = state
+                .last_failure
+                .as_ref()
+                .map(prompts::validation_feedback)
+            {
+                state.record_feedback(pass, "validation", &feedback);
                 state
                     .session
                     .as_mut()
@@ -187,7 +193,7 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                     .append_user(prompts::repair_message(
                         &state.intent_path,
                         &state.acceptance_path,
-                        failure,
+                        &feedback,
                     ));
             }
         }
@@ -207,11 +213,13 @@ pub(super) fn run(options: ShapeOptions) -> Result<ShapeReport, CoreError> {
                     state
                         .progress
                         .push(format!("shaper pass={pass} role={role} style_repair"));
+                    let feedback = prompts::style_message(&findings);
+                    state.record_feedback(pass, "style", &feedback);
                     state
                         .session
                         .as_mut()
                         .expect("shaper conversation exists")
-                        .append_user(prompts::style_message(&findings));
+                        .append_user(feedback);
                     conversation_style_repairs += 1;
                 }
                 PassResult::Failure(failure) => break Err(failure),
@@ -339,6 +347,13 @@ pub(super) enum PassResult {
 }
 
 impl RunState {
+    fn record_feedback(&self, pass_index: usize, kind: &str, feedback: &str) {
+        let value = super::super::journal::feedback_value(pass_index, kind, feedback);
+        if let Ok(mut file) = OpenOptions::new().append(true).open(&self.transcript_path) {
+            let _ = writeln!(file, "{value}");
+        }
+    }
+
     fn drive_shaper(
         &mut self,
         role: &str,

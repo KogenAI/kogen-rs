@@ -2,7 +2,7 @@
 
 use super::ShapeRequestJournal;
 use crate::provider::http::WireRequest;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
@@ -70,6 +70,15 @@ pub(super) fn request_metadata(
         started_at_ms,
         ended_at_ms,
     }
+}
+
+pub(super) fn feedback_value(pass_index: usize, feedback_kind: &str, feedback: &str) -> Value {
+    json!({
+        "kind": "shape_feedback",
+        "pass_index": pass_index,
+        "feedback_kind": feedback_kind,
+        "feedback": feedback,
+    })
 }
 
 pub(super) fn input_item_count(body: &[u8]) -> Option<usize> {
@@ -173,7 +182,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{input_item_count, request_metadata};
+    use super::{feedback_value, input_item_count, request_metadata};
     use crate::intent::shaping::ShapeModelCall;
     use crate::provider::ModelUsage;
     use crate::provider::http::{ResponseMode, WireRequest};
@@ -249,5 +258,19 @@ mod tests {
             second_row.previous_input_prefix_sha256
         );
         assert_eq!(input_item_count(&second.body), Some(2));
+    }
+
+    #[test]
+    fn feedback_journal_records_pass_and_only_the_feedback_text() {
+        let feedback =
+            "candidate/intent_parse_failed: line 2: frontmatter is missing required key `size`";
+        let row = feedback_value(2, "validation", feedback);
+
+        assert_eq!(row["kind"], "shape_feedback");
+        assert_eq!(row["pass_index"], 2);
+        assert_eq!(row["feedback_kind"], "validation");
+        assert_eq!(row["feedback"], feedback);
+        assert!(row.get("instructions").is_none());
+        assert!(row.get("prompt").is_none());
     }
 }

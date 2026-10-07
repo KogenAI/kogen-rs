@@ -4,7 +4,40 @@ use crate::intent::shaping::validation::ValidationFailure;
 use std::fs;
 use std::path::Path;
 
-pub(super) const SHAPER_SYSTEM: &str = "You are Kogen Intent shaper. Write and repair the Intent and its acceptance test. Use only the read, search, and write tools. Do not change files outside the two required paths.";
+pub(super) const SHAPER_SYSTEM: &str = r#"You are Kogen Intent shaper. Read the project and task, then shape a short, actionable Intent and its acceptance test. Do not implement the task.
+
+Write exactly the two paths supplied by the user. Use only the read, search, and write tools. Do not change any other path.
+
+Use this Intent structure. Replace every placeholder with real content. Do not write a `## Brief` or `## Request` heading; Kogen appends the original Request verbatim after shaping.
+
+```markdown
+---
+title: <plain title, at most 72 characters>
+size: <small|medium|large>
+domains: [<one or more configured domain names>]
+---
+<one concise prose paragraph describing the problem, scope, and behavior to preserve>
+
+## Acceptance
+- A1: <one observable, testable outcome in at most 25 words>
+- A2: <one observable, testable outcome in at most 25 words>
+
+## Verify
+- A1: test domain=<configured-domain>
+- A2: test keep domain=<configured-domain>
+
+## Notes
+Approach: <name the relevant code path and implementation mechanism, then state important behavior or constraints to preserve>
+```
+
+Intent format rules:
+- The opening and closing `---` lines enclose a YAML map. Include all three required keys: `title` (string), `size` (`small`, `medium`, or `large`), and `domains` (a list of strings). The title belongs in frontmatter; a body heading does not replace it. Never leave the map empty or omit a required key. The only other allowed keys are `changes_gate` (boolean), `limits` (list of strings), `blocks_on` (list of slugs), `priority` (integer), `assumptions` and `shared_contracts` (lists of `{name, path, contains}` maps), and `source` (string). Include optional keys only when needed.
+- Set `changes_gate: true` only when the task or planned changes require modifying an effective gate path listed in the task context. Otherwise omit it. Running or inspecting checks alone does not count.
+- Keep the Brief as prose without a heading, list, or code block. Use only configured project domain names.
+- Use the section headings `## Acceptance`, `## Verify`, and `## Notes`, at most once each. Acceptance entries use sequential ids (`- A1: ...`); reuse each id exactly once in Verify and in its acceptance-test tag.
+- Each Acceptance item states one definite, observable result and has at most 25 words. Give every item one Verify line using `test` or `test keep`; optional modifiers are `integration`, `domain=<name>`, and `after=<id>`. A `test keep` item must already pass on the unchanged checkout. At least one item must use `test`.
+- Notes must start with `Approach:` and name a code path, an implementation mechanism, and behavior to preserve. Keep the Brief, Acceptance, and Notes within the limits for the declared size: small allows 1 Brief paragraph, 90 Brief words, 3 Acceptance items, and 250 Notes words; medium allows 2 paragraphs, 200 Brief words, 6 items, and 400 Notes words; large allows 3 paragraphs, 330 Brief words, 10 items, and 600 Notes words. Every Brief or Acceptance sentence has at most 30 words.
+- Write a complete acceptance test to the exact path supplied by the user. Add one test tagged for each Acceptance id. Do not finish by only describing the files: write both required files. If validation asks for repair, preserve valid content and correct the reported failure."#;
 pub(super) const REQUIREMENT_AUDITOR_SYSTEM: &str = "You are Kogen's requirement auditor. Map every atomic Request constraint to an Acceptance item or an untestable reason. Reply with JSON only.";
 pub(super) const TEST_AUDITOR_SYSTEM: &str = "You are Kogen's acceptance test auditor. Check that each acceptance test follows the verbatim Request. Reply with JSON only.";
 
@@ -32,24 +65,24 @@ pub(super) fn first_message(
     prompt
 }
 
-pub(super) fn fallback_message(first: &str, failure: &ValidationFailure) -> String {
-    format!(
-        "{first}\n\nLast validation failure:\n\ncandidate/{}: {}",
-        failure.reason, failure.detail
-    )
+pub(super) fn fallback_message(first: &str, validation_feedback: &str) -> String {
+    format!("{first}\n\nLast validation failure:\n\n{validation_feedback}")
+}
+
+pub(super) fn validation_feedback(failure: &ValidationFailure) -> String {
+    format!("candidate/{}: {}", failure.reason, failure.detail)
 }
 
 pub(super) fn repair_message(
     intent_path: &Path,
     acceptance_path: &Path,
-    failure: &ValidationFailure,
+    validation_feedback: &str,
 ) -> String {
     format!(
-        "Validation failed. Repair the generated files in this conversation. The required paths and their current state are:\n{}\n{}\nBoth exact paths must exist after this pass. Every missing path must be written now. Do not delete required files. The available tools can read, search, and write files; they cannot remove them. Preserve present content unless the failure below requires a focused correction.\n\nExact failure output:\n\ncandidate/{}: {}",
+        "Validation failed. Repair the generated files in this conversation. The required paths and their current state are:\n{}\n{}\nBoth exact paths must exist after this pass. Every missing path must be written now. Do not delete required files. The available tools can read, search, and write files; they cannot remove them. Preserve present content unless the failure below requires a focused correction.\n\nExact failure output:\n\n{}",
         path_state(intent_path),
         path_state(acceptance_path),
-        failure.reason,
-        failure.detail
+        validation_feedback
     )
 }
 
@@ -106,4 +139,43 @@ fn path_state(path: &Path) -> String {
         "missing or unreadable. Write it during this repair pass at this exact path."
     };
     format!("- `{}`: {status}", path.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SHAPER_SYSTEM, fallback_message, repair_message, validation_feedback};
+    use crate::intent::shaping::validation::ValidationFailure;
+    use std::path::Path;
+
+    #[test]
+    fn shaper_instructions_show_required_yaml_frontmatter_and_intent_sections() {
+        for required in ["title:", "size:", "domains:", "## Acceptance", "## Verify"] {
+            assert!(SHAPER_SYSTEM.contains(required), "missing {required:?}");
+        }
+        assert!(SHAPER_SYSTEM.contains("YAML map"));
+        assert!(SHAPER_SYSTEM.contains("Never leave the map empty or omit a required key."));
+        assert!(SHAPER_SYSTEM.contains("Use this Intent structure."));
+    }
+
+    #[test]
+    fn repair_prompts_reuse_the_exact_validation_feedback() {
+        let failure = ValidationFailure {
+            reason: "intent_parse_failed",
+            detail: "line 2: frontmatter is missing required key `size`".to_owned(),
+        };
+        let feedback = validation_feedback(&failure);
+        let repair = repair_message(
+            Path::new("intent.md"),
+            Path::new("acceptance_test.exs"),
+            &feedback,
+        );
+        let fallback = fallback_message("initial task", &feedback);
+
+        assert_eq!(
+            feedback,
+            "candidate/intent_parse_failed: line 2: frontmatter is missing required key `size`"
+        );
+        assert!(repair.ends_with(&format!("Exact failure output:\n\n{feedback}")));
+        assert!(fallback.ends_with(&format!("Last validation failure:\n\n{feedback}")));
+    }
 }

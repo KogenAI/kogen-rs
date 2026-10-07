@@ -340,3 +340,65 @@ fn change_keep_modifier(line: &str, make_keep: bool) -> String {
     rebuilt.push_str(trailing_text);
     rebuilt
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize, parse_and_lint};
+    use crate::intent::Intent;
+    use crate::intent::shaping::{journal, prompts};
+    use std::path::Path;
+
+    const SYN_06_REJECTED: &str = include_str!("testdata/syn-06-rejected-intent.md");
+    const SYN_20_REJECTED: &str = include_str!("testdata/syn-20-rejected-intent.md");
+
+    #[test]
+    fn benchmark_frontmatter_errors_are_repaired_with_the_exact_parser_feedback() {
+        let cases = [
+            ("syn-06-migration-ticket-numbers", SYN_06_REJECTED, "title"),
+            ("syn-20-email-invite-flow", SYN_20_REJECTED, "size"),
+        ];
+
+        for (slug, rejected, missing_key) in cases {
+            let normalized = normalize(rejected.as_bytes(), b"benchmark request")
+                .expect("rejected benchmark file is valid UTF-8");
+            let failure =
+                parse_and_lint(slug, &normalized).expect_err("required metadata is missing");
+            let expected_detail =
+                format!("line 2: frontmatter is missing required key `{missing_key}`");
+            assert_eq!(failure.reason, "intent_parse_failed", "{slug}");
+            assert_eq!(failure.detail, expected_detail, "{slug}");
+
+            let feedback = prompts::validation_feedback(&failure);
+            let repair = prompts::repair_message(
+                Path::new(".kogen/intents/slug/intent.md"),
+                Path::new(".kogen/acceptance/slug_test.exs"),
+                &feedback,
+            );
+            assert!(
+                repair.ends_with(&format!("Exact failure output:\n\n{feedback}")),
+                "repair for {slug} must include the parser's exact feedback"
+            );
+            let journal = journal::feedback_value(2, "validation", &feedback);
+            assert_eq!(journal["pass_index"], 2, "{slug}");
+            assert_eq!(journal["feedback"], feedback, "{slug}");
+
+            let repaired = with_required_frontmatter(rejected);
+            assert!(
+                Intent::parse(slug, repaired.as_bytes()).is_ok(),
+                "valid YAML frontmatter parses for {slug}"
+            );
+        }
+    }
+
+    fn with_required_frontmatter(source: &str) -> String {
+        let after_opening = source
+            .strip_prefix("---\n")
+            .expect("fixture starts with frontmatter");
+        let (_, body) = after_opening
+            .split_once("\n---\n")
+            .expect("fixture has closing frontmatter delimiter");
+        format!(
+            "---\ntitle: Repaired benchmark Intent\nsize: medium\ndomains: [support]\n---\n{body}"
+        )
+    }
+}
