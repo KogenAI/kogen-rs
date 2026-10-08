@@ -1,4 +1,4 @@
-//! Recovery decisions shared by the production reconciler and deterministic replay effects.
+//! Pure recovery transition shared by the production reconciler and xspec.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -73,8 +73,8 @@ pub fn recovery_decision(
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecoveryEvent {
     Put(RecoveryFact),
-    PreservationResult { id: String, ok: bool },
     Recover,
+    PreservationResult { id: String, ok: bool },
     Reapprove(String),
 }
 
@@ -106,6 +106,7 @@ impl RecoveryModel {
     pub fn apply(&mut self, event: RecoveryEvent) -> RecoveryObservation {
         match event {
             RecoveryEvent::Put(fact) => self.put(fact),
+            RecoveryEvent::Recover => self.recover(),
             RecoveryEvent::PreservationResult { id, ok } => {
                 if let Some(run) = self.runs.get_mut(&id) {
                     run.preserve_ok = ok;
@@ -113,7 +114,6 @@ impl RecoveryModel {
                     self.error("unknown_run");
                 }
             }
-            RecoveryEvent::Recover => self.recover(),
             RecoveryEvent::Reapprove(id) => self.reapprove(&id),
         }
         self.observe()
@@ -215,26 +215,26 @@ impl RecoveryModel {
 
     fn finish(&mut self, id: &str, status: &str, reason: &str) {
         if let Some(run) = self.runs.get_mut(id) {
-            let needs_copy = run.work || run.incoming;
-            let preserved = run.preserved || (needs_copy && run.preserve_ok);
-            let pending = needs_copy && !preserved;
             run.status = status.to_owned();
             run.reason = reason.to_owned();
+            run.preserved |= run.work && run.preserve_ok;
+            run.cleanup_pending = run.work && !run.preserved;
+            run.work = run.cleanup_pending;
+            if !run.cleanup_pending {
+                run.incoming = false;
+            }
             run.queued = false;
-            run.preserved = preserved;
-            run.work &= pending;
-            run.incoming = run.incoming && pending;
-            run.cleanup_pending = pending;
-            self.line = if pending {
-                "cleanup_failure".to_owned()
-            } else {
-                reason.to_owned()
-            };
         }
         if self.claim == id {
             self.claim.clear();
         }
         self.last = "ok".to_owned();
+        self.line = if self.runs.get(id).is_some_and(|run| run.cleanup_pending) {
+            "cleanup_failure"
+        } else {
+            reason
+        }
+        .to_owned();
     }
 
     fn reapprove(&mut self, id: &str) {
@@ -278,45 +278,4 @@ fn known_status(status: &str) -> bool {
         status,
         "running" | "landed" | "failed" | "parked" | "stopped" | "approved"
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{RecoveryEvent, RecoveryFact, RecoveryModel};
-
-    #[test]
-    fn failed_preservation_retains_work_and_incoming_until_retry_succeeds() {
-        let mut replay = RecoveryModel::new();
-        replay.apply(RecoveryEvent::Put(RecoveryFact {
-            id: "r1".to_owned(),
-            status: "running".to_owned(),
-            alive: false,
-            on_base: false,
-            last_event: "other".to_owned(),
-            incoming: true,
-            queued: false,
-            claim: true,
-            reason: String::new(),
-            work: true,
-            preserved: false,
-            preserve_ok: false,
-        }));
-
-        let failed = replay.apply(RecoveryEvent::Recover);
-        let run = &failed.runs["r1"];
-        assert_eq!(run.status, "failed");
-        assert!(run.work && run.incoming && run.cleanup_pending);
-        assert!(!run.preserved);
-        assert!(failed.claim.is_empty());
-
-        replay.apply(RecoveryEvent::PreservationResult {
-            id: "r1".to_owned(),
-            ok: true,
-        });
-        let retried = replay.apply(RecoveryEvent::Recover);
-        let run = &retried.runs["r1"];
-        assert!(run.preserved);
-        assert!(!run.work && !run.incoming && !run.cleanup_pending);
-        assert_eq!(run.reason, "crashed");
-    }
 }

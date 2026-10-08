@@ -9,7 +9,7 @@ fn only_valid_demotions_for_the_rung_failures_are_accepted() {
     );
     assert_eq!(dispositions.len(), 2);
     assert_eq!(dispositions[0].verdict, BuildAuditVerdict::OverStrict);
-    assert!(dispositions[0].demote);
+    assert!(!dispositions[0].demote);
     assert_eq!(dispositions[1].verdict, BuildAuditVerdict::Valid);
     assert!(!dispositions[1].demote);
 }

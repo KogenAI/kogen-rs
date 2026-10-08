@@ -22,6 +22,10 @@ pub struct RunSnapshot {
     pub owner_pid: u32,
     pub owner_started_ms: i64,
     pub started_ms: i64,
+    #[serde(default)]
+    pub recovery: Vec<Value>,
+    #[serde(default)]
+    pub cleanup_pending: bool,
     #[serde(skip)]
     pub fields: BTreeMap<String, Value>,
 }
@@ -58,6 +62,8 @@ mod tests {
             owner_pid: 7,
             owner_started_ms: 1,
             started_ms: 2,
+            recovery: Vec::new(),
+            cleanup_pending: false,
             fields: BTreeMap::from([("verdict".to_owned(), json!("green"))]),
         };
 
@@ -82,6 +88,8 @@ mod tests {
                 "owner_pid",
                 "owner_started_ms",
                 "started_ms",
+                "recovery",
+                "cleanup_pending",
             ]
             .into_iter()
             .collect()
@@ -133,6 +141,8 @@ mod tests {
             owner_pid: 7,
             owner_started_ms: 1,
             started_ms: 2,
+            recovery: Vec::new(),
+            cleanup_pending: false,
             fields: BTreeMap::new(),
         };
         let store = RunStore::new(&directory);

@@ -85,10 +85,6 @@ pub struct GateReport {
     pub protection_findings: Vec<ProtectedFinding>,
     pub restored_paths: Vec<String>,
     pub demoted_items: BTreeSet<String>,
-    checks_green: bool,
-    fixes_green: bool,
-    tree_stable: bool,
-    change_items: BTreeSet<String>,
     change_item_passes: bool,
     receipt: Option<VerificationReceipt>,
 }
@@ -109,67 +105,14 @@ impl GateReport {
         self.receipt.as_ref()
     }
 
-    pub(crate) fn apply_audit_demotions(&mut self, item_ids: &[String]) -> bool {
-        self.demoted_items.extend(
-            item_ids
-                .iter()
-                .filter(|id| self.acceptance.item_pass.contains_key(*id))
-                .cloned(),
-        );
-        let failed_items_are_demoted = self
-            .acceptance
-            .item_pass
-            .iter()
-            .filter_map(|(id, passed)| (!passed).then_some(id))
-            .all(|id| self.demoted_items.contains(id));
-        let acceptance_failures_are_suites = self
-            .acceptance
-            .failures
-            .iter()
-            .all(|failure| matches!(failure, AcceptanceFailure::Suite));
-        let acceptance_green = !self.acceptance.item_pass.is_empty()
-            && failed_items_are_demoted
-            && acceptance_failures_are_suites
-            && self
-                .acceptance
-                .item_pass
-                .iter()
-                .all(|(id, passed)| *passed || self.demoted_items.contains(id));
-        let verified = self.fixes_green
-            && self.checks_green
-            && acceptance_green
-            && self.protection_findings.is_empty()
-            && self.tree_stable;
-        self.verdict = if verified {
-            GateVerdict::Green
-        } else {
-            GateVerdict::Unverified
-        };
-        self.receipt = if verified {
-            self.verified_tree
-                .as_ref()
-                .map(|tree_id| VerificationReceipt {
-                    tree_id: tree_id.clone(),
-                })
-        } else {
-            None
-        };
-        self.change_item_passes = self.change_items.iter().any(|id| {
-            self.acceptance.item_pass.get(id) == Some(&true) && !self.demoted_items.contains(id)
-        });
-        verified
-    }
-
-    /// Re-score a candidate after the Build auditor demotes failed acceptance
-    /// items. A demoted item cannot supply the passing change item needed to
-    /// land the candidate.
+    /// Auditor advice is observational until an exact policy is admitted.
+    /// Retained for callers replaying historical advice; it cannot create a receipt.
     pub fn apply_acceptance_demotions(
         &mut self,
-        demoted: &BTreeSet<String>,
-        change_items: &BTreeSet<String>,
+        _demoted: &BTreeSet<String>,
+        _change_items: &BTreeSet<String>,
     ) -> bool {
-        self.change_items.clone_from(change_items);
-        self.apply_audit_demotions(&demoted.iter().cloned().collect::<Vec<_>>())
+        self.is_verified()
     }
 }
 
@@ -404,10 +347,6 @@ pub fn run_gate(runner: &dyn ProcessPort, request: &GateRequest) -> Result<GateR
         protection_findings,
         restored_paths: support::deduplicate_paths(restored_paths),
         demoted_items: BTreeSet::new(),
-        checks_green,
-        fixes_green,
-        tree_stable,
-        change_items: request.acceptance.change_items.clone(),
         change_item_passes: changed_item_passes,
         receipt,
     })

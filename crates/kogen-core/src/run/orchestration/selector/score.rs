@@ -86,7 +86,7 @@ pub struct GateScore {
 /// the optional advisory policy.
 #[must_use]
 pub fn score_verification(
-    policy: GatePolicy,
+    _policy: GatePolicy,
     checks: &[CheckScoreInput],
     items: &[ItemResult],
 ) -> GateScore {
@@ -99,33 +99,21 @@ pub fn score_verification(
         };
     }
     let checks_green = checks.iter().all(|check| check.green || check.excused);
-    let items_green = !items.is_empty()
-        && items
-            .iter()
-            .all(|item| item.demoted || item.verdict == ItemVerdict::Pass);
-    let advisory = items
-        .iter()
-        .any(|item| item.demoted && item.verdict == ItemVerdict::Fail);
+    let items_green =
+        !items.is_empty() && items.iter().all(|item| item.verdict == ItemVerdict::Pass);
     let passing_undemoted_items = items
         .iter()
-        .filter(|item| !item.demoted && item.verdict == ItemVerdict::Pass)
+        .filter(|item| item.verdict == ItemVerdict::Pass)
         .count();
-    let has_change_pass = items.iter().any(|item| {
-        item.kind == ItemKind::Change && !item.demoted && item.verdict == ItemVerdict::Pass
-    });
+    let has_change_pass = items
+        .iter()
+        .any(|item| item.kind == ItemKind::Change && item.verdict == ItemVerdict::Pass);
     let verdict = if checks_green && items_green {
-        if advisory {
-            VerificationVerdict::GreenWithAdvisoryTests
-        } else {
-            VerificationVerdict::Green
-        }
+        VerificationVerdict::Green
     } else {
         VerificationVerdict::Unverified
     };
-    let landable = has_change_pass
-        && (verdict == VerificationVerdict::Green
-            || (verdict == VerificationVerdict::GreenWithAdvisoryTests
-                && policy == GatePolicy::GreenOrAdvisory));
+    let landable = has_change_pass && verdict == VerificationVerdict::Green;
     let identities = checks
         .iter()
         .filter(|check| !check.green && !check.excused)
@@ -136,7 +124,7 @@ pub fn score_verification(
         .count();
     let failed_items = items
         .iter()
-        .filter(|item| !item.demoted && item.verdict == ItemVerdict::Fail)
+        .filter(|item| item.verdict == ItemVerdict::Fail)
         .count();
     GateScore {
         verdict,

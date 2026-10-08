@@ -182,7 +182,7 @@ pub fn decode_build_audit(reply: &str, failed_ids: &[String]) -> Vec<AuditDispos
                 id: id.clone(),
                 verdict,
                 reason: item.map_or_else(String::new, |item| item.reason.clone()),
-                demote: verdict.demotes(),
+                demote: false,
             }
         })
         .collect()

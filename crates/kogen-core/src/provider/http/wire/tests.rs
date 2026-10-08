@@ -282,3 +282,89 @@ fn without_input(mut body: Value) -> Value {
 fn user_item(text: &str) -> Value {
     json!({"role":"user","content":[{"type":"input_text","text":text}]})
 }
+
+#[test]
+fn build_prefix_is_shared_across_stages_and_static_bytes_across_runs() {
+    let root = std::env::temp_dir().join(format!("kogen-shared-prefix-{}", rand::random::<u64>()));
+    let first = root.join("first");
+    let second = root.join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let auth = RequestCredential::Injected(InjectedCredential {
+        access_token: "fake-token".to_owned(),
+        account_id: "fake-account".to_owned(),
+        expires_at: i64::MAX,
+    });
+    for mode in [
+        ResponseMode::Injected,
+        ResponseMode::Lite,
+        ResponseMode::Owned,
+    ] {
+        let config = WireConfig {
+            mode,
+            endpoint_override: Some(Url::parse("https://example.invalid/v1/responses").unwrap()),
+            supports_generation_cap: false,
+            user_agent_version: "test".to_owned(),
+        };
+        let mut bodies = Vec::new();
+        let mut threads = Vec::new();
+        for (directory, stage) in [
+            (&first, "plan"),
+            (&first, "develop"),
+            (&first, "audit"),
+            (&second, "develop"),
+        ] {
+            let binding = ConversationBinding::new(directory, stage);
+            let mut context = RequestContext::for_conversation(
+                &binding,
+                "gpt-6-luna",
+                "medium",
+                format!("stage {stage}"),
+                vec![user_item(stage)],
+            )
+            .unwrap();
+            context.tools = crate::provider::tools::canonical_tool_schemas();
+            context.set_shared_context(if directory == &first {
+                "immutable first Build context"
+            } else {
+                "different second Build context"
+            });
+            let bytes = if mode == ResponseMode::Owned {
+                super::body::encode(&context, mode).unwrap()
+            } else {
+                build_wire_request(&context, &auth, &config).unwrap().body
+            };
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            threads.push(context.thread_id);
+            bodies.push(body);
+        }
+        assert_eq!(bodies[0]["instructions"], bodies[3]["instructions"]);
+        assert_eq!(bodies[0]["prompt_cache_key"], bodies[2]["prompt_cache_key"]);
+        assert_ne!(bodies[0]["prompt_cache_key"], bodies[3]["prompt_cache_key"]);
+        assert_ne!(threads[0], threads[1]);
+        let shared_length = match mode {
+            ResponseMode::Lite => 4,
+            ResponseMode::Owned => 3,
+            _ => 2,
+        };
+        for body in &bodies[1..3] {
+            assert_eq!(
+                &bodies[0]["input"].as_array().unwrap()[..shared_length],
+                &body["input"].as_array().unwrap()[..shared_length]
+            );
+        }
+        if mode == ResponseMode::Lite {
+            assert_eq!(
+                &bodies[0]["input"].as_array().unwrap()[..2],
+                &bodies[3]["input"].as_array().unwrap()[..2]
+            );
+            assert_eq!(bodies[0]["input"][1]["type"], "additional_tools");
+        } else if mode == ResponseMode::Owned {
+            assert_eq!(bodies[0]["input"][0], bodies[3]["input"][0]);
+            assert_eq!(bodies[0]["input"][0]["type"], "additional_tools");
+        } else {
+            assert_eq!(bodies[0]["tools"], bodies[3]["tools"]);
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

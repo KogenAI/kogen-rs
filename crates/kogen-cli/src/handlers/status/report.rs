@@ -29,7 +29,33 @@ pub(super) fn build_report(
                 .and_then(|event| event.get("base_sha").cloned())
         })
         .unwrap_or(Value::Null);
-    let cache_hit_rate = cache_hit_rate(&model_stages);
+    let attempt_events = run.map_or_else(Vec::new, |run| {
+        run.events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.get("event").and_then(Value::as_str),
+                    Some("model_stage" | "provider_attempts")
+                )
+            })
+            .cloned()
+            .collect()
+    });
+    let usages = attempt_events
+        .iter()
+        .flat_map(|event| {
+            event
+                .get("attempt_usage")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_else(|| vec![event.get("tokens").cloned().unwrap_or(Value::Null)])
+        })
+        .map(|value| {
+            serde_json::from_value::<kogen_core::provider::ModelUsage>(value).unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let cache_measurement = kogen_core::provider::cache::usage_summary(&usages);
+    let cache_hit_rate = cache_measurement["weighted_hit_rate"].clone();
     let used_ms = run.map_or(0, |run| {
         let end = finished
             .as_ref()
@@ -93,7 +119,7 @@ pub(super) fn build_report(
         start
             .as_ref()
             .and_then(|event| event.get("land").cloned())
-            .unwrap_or_else(|| json!("green-or-advisory")),
+            .unwrap_or_else(|| json!("green")),
     );
     report.insert(
         "advisory_items".to_owned(),
@@ -138,6 +164,7 @@ pub(super) fn build_report(
         );
     }
     report.insert("cache_hit_rate".to_owned(), cache_hit_rate);
+    report.insert("cache_measurement".to_owned(), cache_measurement);
     report.insert("credential".to_owned(), credential);
     report.insert("rungs".to_owned(), json!(rungs));
     report.insert(
@@ -280,32 +307,6 @@ fn findings(checks: &Value) -> Vec<Value> {
                 .unwrap_or_default()
         })
         .collect()
-}
-
-fn cache_hit_rate(stages: &[Value]) -> Value {
-    let (uncached, cached) = stages
-        .iter()
-        .fold((0_i64, 0_i64), |(uncached, cached), event| {
-            let tokens = event.get("tokens");
-            (
-                uncached
-                    + tokens
-                        .and_then(|v| v.get("input"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0),
-                cached
-                    + tokens
-                        .and_then(|v| v.get("cached_input"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0),
-            )
-        });
-    let total = uncached + cached;
-    if total == 0 {
-        Value::Null
-    } else {
-        json!(cached as f64 / total as f64)
-    }
 }
 
 fn events(run: &StatusRun, name: &str) -> Vec<Value> {

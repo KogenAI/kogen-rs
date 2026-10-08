@@ -27,6 +27,7 @@ pub(super) struct BuildProvider<'a> {
     builder_session: Option<BuilderSession>,
     rung_sessions: BTreeMap<String, BuilderSession>,
     shared_tools: Vec<Value>,
+    shared_context: String,
     usage_paused_ms: u64,
     stage_error_can_resume: bool,
     build_started: Instant,
@@ -69,6 +70,7 @@ impl<'a> BuildProvider<'a> {
         approved: &'a ApprovedBuild,
         options: &'a BuildOptions,
         store: &'a RunStore,
+        base_sha: &str,
     ) -> Result<Self, CoreError> {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -108,6 +110,7 @@ impl<'a> BuildProvider<'a> {
             http,
             clock: SystemClock::default(),
             shared_tools: shared_build_tool_schemas(tool_role),
+            shared_context: shared_build_context(project, approved, options, base_sha)?,
         })
     }
 
@@ -125,6 +128,7 @@ impl<'a> BuildProvider<'a> {
             builder_session: None,
             rung_sessions: BTreeMap::new(),
             shared_tools: self.shared_tools.clone(),
+            shared_context: self.shared_context.clone(),
             usage_paused_ms: self.usage_paused_ms,
             stage_error_can_resume: false,
             build_started: self.build_started,
@@ -273,6 +277,7 @@ impl<'a> BuildProvider<'a> {
             instructions,
             vec![user_item(&request.user_message())],
         )?;
+        context.set_shared_context(&self.shared_context);
         let before = Instant::now();
         let call = self.call(
             snapshot,
@@ -795,6 +800,7 @@ impl<'a> BuildProvider<'a> {
                 .map_err(|error| {
                     super::environment_error("conversation_identity_failed", error.to_string())
                 })?;
+        context.set_shared_context(&self.shared_context);
         configure_build_tools(&mut context, &self.shared_tools, callable_tools);
         context.tool_choice = "auto".to_owned();
         context.development_request = development;
@@ -886,6 +892,12 @@ impl<'a> BuildProvider<'a> {
                     self.account.credential_source,
                 );
                 self.record_provider_events(snapshot, mode, &failure.events)?;
+                self.record(
+                    snapshot,
+                    &RunEvent::new("provider_attempts", now_ms())
+                        .with("stage", json!(mode))
+                        .with("attempt_usage", json!(failure.usages)),
+                )?;
                 let detail = failure.failure.message.clone();
                 Err(provider_error(failure.failure.kind, detail))
             }
@@ -936,17 +948,8 @@ fn append_tool_batch_history(
     history.items().to_vec()
 }
 
-fn shared_build_tool_schemas(role: crate::provider::tools::ToolRole) -> Vec<Value> {
-    let callable = role.allowed();
+fn shared_build_tool_schemas(_role: crate::provider::tools::ToolRole) -> Vec<Value> {
     crate::provider::tools::canonical_tool_schemas()
-        .into_iter()
-        .filter(|schema| {
-            schema
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| callable.contains(&name))
-        })
-        .collect()
 }
 
 fn configure_build_tools(
@@ -956,6 +959,31 @@ fn configure_build_tools(
 ) {
     context.tools = shared_tools.to_vec();
     context.callable_tools = callable_tools;
+}
+
+fn shared_build_context(
+    project: &ProjectResolution,
+    approved: &ApprovedBuild,
+    options: &BuildOptions,
+    base_sha: &str,
+) -> Result<String, CoreError> {
+    let files = if matches!(
+        options.recipe.as_str(),
+        "direct" | "direct-escalate" | "direct-shell" | "escalate-shell"
+    ) {
+        "No repository file list was supplied.".to_owned()
+    } else {
+        crate::git::GitRepo::new(&project.origin)
+            .list_paths(base_sha)
+            .map_err(|error| super::environment_error("base_files_unavailable", error.to_string()))?
+            .join("\n")
+    };
+    Ok(format!(
+        "Approved Intent:\n{}\n\nApproved acceptance-test source:\n{}\n\nRepository files at the Build base:\n{}",
+        String::from_utf8_lossy(&approved.intent_bytes),
+        String::from_utf8_lossy(&approved.acceptance_bytes),
+        files,
+    ))
 }
 
 fn audit_request_context(
@@ -1124,7 +1152,18 @@ mod tests {
         assert!(context.callable_tools.is_empty());
         assert_eq!(body["tool_choice"], "none");
         assert_eq!(body["tools"], json!(expected));
-        assert_eq!(expected_names, ["finish", "shell", "tool_output"]);
+        assert_eq!(
+            expected_names,
+            [
+                "edit",
+                "finish",
+                "read",
+                "search",
+                "shell",
+                "tool_output",
+                "write"
+            ]
+        );
         std::fs::remove_dir_all(root).expect("remove conversation root");
     }
 

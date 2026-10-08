@@ -241,7 +241,17 @@ fn read_latest_runs(root: &Path) -> BTreeMap<String, StatusRun> {
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .collect::<Vec<_>>();
-        let last = events.last();
+        // Cleanup and preservation events do not replace the terminal outcome.
+        let last = events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.get("event").and_then(Value::as_str),
+                    Some("finished" | "reconciled")
+                )
+            })
+            .or_else(|| events.last());
         let last_event = last
             .and_then(|event| event.get("event"))
             .and_then(Value::as_str)

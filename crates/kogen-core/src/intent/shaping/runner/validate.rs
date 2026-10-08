@@ -217,22 +217,30 @@ pub(super) fn validate_pass(
         .copied()
         .collect::<Vec<_>>();
 
-    // Coverage repair is still the step-7 result, but step 8 must run on every
-    // pass that reaches the core audits, including a pass with a coverage gap.
-    if let Some(failure) = coverage_failure {
-        state.coverage_repaired = true;
-        return Ok(PassResult::Failure(failure));
-    }
-    if !repairable.is_empty() && !state.audit_repaired {
+    let audit_failure = if !repairable.is_empty() && !state.audit_repaired {
         state.audit_repaired = true;
-        let detail = repairable
-            .iter()
-            .map(|item| format!("{} {}: {}", item.id, item.verdict, item.reason))
-            .collect::<Vec<_>>()
-            .join("\n");
+        Some(
+            repairable
+                .iter()
+                .map(|item| format!("{} {}: {}", item.id, item.verdict, item.reason))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    } else {
+        None
+    };
+    if coverage_failure.is_some() || audit_failure.is_some() {
+        let mut detail = Vec::new();
+        if let Some(failure) = coverage_failure {
+            state.coverage_repaired = true;
+            detail.push(format!("coverage_gap: {}", failure.detail));
+        }
+        if let Some(failure) = audit_failure {
+            detail.push(format!("audit_over_strict: {failure}"));
+        }
         return Ok(PassResult::Failure(ValidationFailure {
-            reason: "audit_over_strict",
-            detail,
+            reason: "validation_repair",
+            detail: detail.join("\n"),
         }));
     }
     for item in invalid {

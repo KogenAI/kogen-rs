@@ -21,7 +21,7 @@ pub(super) fn run_acceptance(
             .join(&request.acceptance.candidate_path),
         workdir: request.candidate_workspace.clone(),
         run_dir: request.run_dir.clone(),
-        report_path: request.run_dir.join("reports/ledger.jsonl"),
+        report_path: request.run_dir.join("ledger.jsonl"),
         env: request.environment.clone(),
         timeout: request.acceptance.timeout,
         expected_items: request.acceptance.expected_items.clone(),

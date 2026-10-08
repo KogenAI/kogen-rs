@@ -148,6 +148,14 @@ fn run_with_scratch(
     commands.setup(&project.checkout, config)?;
     let account = selected_account(&options.home, &project)?;
     accounting.set_provider(&account.provider);
+    let default = if account.provider == "grok" {
+        (
+            crate::provider::grok::DEFAULT_MODEL,
+            crate::provider::grok::DEFAULT_EFFORT,
+        )
+    } else {
+        SHAPER_DEFAULT
+    };
     let provider = ShapeProvider::new(&options.home, account)?;
     let domains = domains(config);
     let gate_paths = gate_paths(config);
@@ -159,11 +167,11 @@ fn run_with_scratch(
         &intent_rel,
         &acceptance_rel,
     );
-    let shaper_role = role_config(config, "shaper", SHAPER_DEFAULT);
+    let shaper_role = role_config(config, &options.home, "shaper", default)?;
     // §3.2 resolves the fresh fallback conversation from the effective shaper
     // profile; provider-specific selection is preserved.
     let fallback_role = shaper_role.clone();
-    let auditor_role = role_config(config, "auditor", SHAPER_DEFAULT);
+    let auditor_role = role_config(config, &options.home, "auditor", default)?;
     accounting.set_role("shaper", "shaper", &shaper_role.0, &shaper_role.1);
     accounting.set_role(
         "fallback_shaper",

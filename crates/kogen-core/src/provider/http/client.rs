@@ -9,7 +9,7 @@ use super::wire::{RequestContext, WireConfig, WireRequest, build_wire_request};
 use crate::provider::auth::{self, RequestCredential};
 use crate::provider::session::ConversationHistory;
 use crate::provider::sse::{StreamLimitExceeded, StreamOutputLimits};
-use crate::provider::{ModelResponse, ProviderFailure};
+use crate::provider::{ModelResponse, ModelUsage, ProviderFailure};
 use rand::Rng as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -162,12 +162,14 @@ pub struct ProviderCallFailure {
     pub failure: Box<ProviderFailure>,
     pub events: Vec<RequestEvent>,
     pub attempts: Vec<WireRequest>,
+    pub usages: Vec<ModelUsage>,
 }
 
 pub struct ProviderCall {
     pub response: ModelResponse,
     pub events: Vec<RequestEvent>,
     pub attempts: Vec<WireRequest>,
+    pub usages: Vec<ModelUsage>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +206,7 @@ pub fn respond(
     }
     let mut events = Vec::new();
     let mut attempts = Vec::new();
+    let mut usages = Vec::new();
     let mut spent = 0_u64;
     let open = serde_json::json!({
         "role": options.role,
@@ -223,7 +226,7 @@ pub fn respond(
     loop {
         let wire = match build_wire_request(request, auth, wire_config) {
             Ok(wire) => wire,
-            Err(failure) => return Err(call_error(failure, events, attempts)),
+            Err(failure) => return Err(call_error(failure, events, attempts, usages)),
         };
         attempts.push(wire.clone());
         let request_start = clock.now_ms();
@@ -239,6 +242,10 @@ pub fn respond(
             .elapsed_ms
             .max(clock.now_ms().saturating_sub(request_start));
         spent = spent.saturating_add(elapsed);
+        usages.push(match &attempt.response {
+            Ok(response) => response.usage.clone(),
+            Err(failure) => failure.usage.as_deref().cloned().unwrap_or_default(),
+        });
         match attempt.response {
             Ok(response) => {
                 update_wall(policy, options.wall_budget_ms, spent);
@@ -254,6 +261,7 @@ pub fn respond(
                     response,
                     events,
                     attempts,
+                    usages,
                 });
             }
             Err(failure) => {
@@ -297,6 +305,7 @@ pub fn respond(
                         refresh_failure.unwrap_or(failure),
                         events,
                         attempts,
+                        usages,
                     ));
                 }
                 if policy.phase == "stopped" || policy.decision == "incomplete" {
@@ -304,6 +313,7 @@ pub fn respond(
                         refresh_failure.unwrap_or(failure),
                         events,
                         attempts,
+                        usages,
                     ));
                 }
                 if policy.decision == "switch" {
@@ -344,7 +354,7 @@ pub fn respond(
                     clock.sleep_ms(delay);
                     continue;
                 }
-                return Err(call_error(failure, events, attempts));
+                return Err(call_error(failure, events, attempts, usages));
             }
         }
     }
@@ -388,11 +398,13 @@ fn call_error(
     failure: ProviderFailure,
     events: Vec<RequestEvent>,
     attempts: Vec<WireRequest>,
+    usages: Vec<ModelUsage>,
 ) -> ProviderCallFailure {
     ProviderCallFailure {
         failure: Box::new(failure),
         events,
         attempts,
+        usages,
     }
 }
 

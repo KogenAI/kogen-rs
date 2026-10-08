@@ -210,9 +210,57 @@ fn build_policy_grants_only_scratch_and_report_write_access_in_the_run_tree() {
         &EnvironmentMap::new(),
     );
     assert!(!policy.writable_paths.contains(&run_dir));
-    for name in ["logs", "tmp", "reports", "mise-state", "mise-cache"] {
+    for name in [
+        "logs",
+        "tmp",
+        "reports",
+        "ledger.jsonl",
+        "mise-state",
+        "mise-cache",
+    ] {
         assert!(policy.writable_paths.contains(&run_dir.join(name)));
     }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_build_policy_allows_root_ledger_but_not_sibling_run_state() {
+    // Keep this fixture outside the general writable /tmp subtree.
+    let root = PathBuf::from("/var/tmp").join(format!(
+        "kogen-sandbox-root-ledger-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let workspace = root.join("workspace");
+    let run_dir = root.join("run");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&run_dir).unwrap();
+    let ledger = run_dir.join("ledger.jsonl");
+    fs::write(&ledger, "").unwrap();
+    let state = run_dir.join("run.json");
+    let mut request = ProcessRequest::new("/bin/sh", &workspace, &run_dir);
+    request.args = vec![
+        "-c".into(),
+        format!(
+            "printf ledger > '{}' && if printf forbidden > '{}'; then exit 43; fi",
+            ledger.display(),
+            state.display()
+        )
+        .into(),
+    ];
+    request.env = ChildEnvironment::from([("PATH".into(), "/bin:/usr/bin".into())]);
+    let policy = SandboxPolicy::for_build(true, &workspace, &run_dir, &EnvironmentMap::new());
+    let supervisor = ProcessSupervisor;
+    let sandboxed = SandboxedProcessPort::new(&supervisor, policy, None);
+    let result = sandboxed.run(request).unwrap();
+    assert_eq!(result.exit_status, Some(0), "{:?}", result.output_tail);
+    assert_eq!(fs::read_to_string(ledger).unwrap(), "ledger");
+    assert!(!state.exists());
+    assert_eq!(result.sandbox.unwrap().status, SandboxStatus::Confined);
     let _ = fs::remove_dir_all(root);
 }
 

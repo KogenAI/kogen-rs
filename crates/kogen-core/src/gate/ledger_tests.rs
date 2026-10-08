@@ -31,6 +31,49 @@ impl ProcessPort for ScriptedRunner {
 
 struct ScriptedTree(Mutex<VecDeque<String>>);
 
+struct MountableReportRunner(ScriptedRunner);
+
+impl ProcessPort for MountableReportRunner {
+    fn run(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
+        let report = request
+            .env
+            .get(std::ffi::OsStr::new("KOGEN_LEDGER_REPORT"))
+            .unwrap();
+        assert!(fs::metadata(report).unwrap().is_file());
+        assert!(
+            fs::read(report).unwrap().is_empty(),
+            "stale rows reached the runner"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(report).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        self.0.run(request)
+    }
+}
+
+#[test]
+fn root_report_is_private_and_mountable_without_stale_rows_before_spawn() {
+    let root = test_dir("mountable");
+    let mut request = request(&root);
+    request.report_path = request.run_dir.join("ledger.jsonl");
+    fs::write(&request.report_path, "stale invalid row\n").unwrap();
+    let runner = MountableReportRunner(ScriptedRunner {
+        bytes: Some(b"{\"tag\":\"greet/A1\",\"test\":\"new\",\"status\":\"passed\"}\n".to_vec()),
+        exit_status: Some(0),
+        unavailable: false,
+    });
+    let tree = ScriptedTree(Mutex::new(["base".to_owned(), "base".to_owned()].into()));
+    let result = run_command_acceptance(&runner, &tree, request).unwrap();
+    assert!(result.item_pass["A1"]);
+    assert!(result.failures.is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
 impl TreeSnapshotPort for ScriptedTree {
     fn snapshot(&self, _workdir: &Path) -> Result<String, String> {
         self.0
@@ -47,6 +90,13 @@ struct SymlinkReportRunner {
 
 impl ProcessPort for SymlinkReportRunner {
     fn run(&self, request: ProcessRequest) -> Result<ProcessResult, ProcessError> {
+        fs::remove_file(
+            request
+                .env
+                .get(std::ffi::OsStr::new("KOGEN_LEDGER_REPORT"))
+                .unwrap(),
+        )
+        .expect("remove prepared report");
         let reports = request.run_dir.join("reports");
         fs::remove_dir(&reports).expect("remove report directory");
         #[cfg(unix)]

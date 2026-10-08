@@ -57,7 +57,7 @@ impl GateReplay {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            policy: "green-or-advisory".to_owned(),
+            policy: "green".to_owned(),
             last: "ok".to_owned(),
             ..Self::default_without_recursion()
         }

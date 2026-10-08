@@ -35,6 +35,11 @@ fn green_verification_receipt_binds_the_candidate_tree_and_change_items_land() {
         fs::read(fixture.candidate.join("test/acceptance/greet.t.sh")).unwrap(),
         fixture.acceptance
     );
+    let ledger = fs::read_to_string(fixture.run.join("ledger.jsonl")).unwrap();
+    let row: serde_json::Value = serde_json::from_str(ledger.trim()).unwrap();
+    assert_eq!(row["tag"], "greet/A1");
+    assert_eq!(row["status"], "passed");
+    assert_eq!(row.as_object().unwrap().len(), 3);
     fixture.remove();
 }
 
@@ -83,11 +88,14 @@ fn demoting_a_failed_change_item_rescores_but_does_not_land_it_alone() {
     let runner = Runner::new(Some(0), LedgerStatus::Failed);
     let mut report =
         run_gate(&runner, &fixture.request(BTreeSet::from(["A1".to_owned()]))).unwrap();
-    report.apply_audit_demotions(&["A1".to_owned()]);
-    assert_eq!(report.verdict, GateVerdict::Green);
-    assert!(report.is_verified());
+    report.apply_acceptance_demotions(
+        &BTreeSet::from(["A1".to_owned()]),
+        &BTreeSet::from(["A1".to_owned()]),
+    );
+    assert_eq!(report.verdict, GateVerdict::Unverified);
+    assert!(!report.is_verified());
     assert!(!report.is_landable());
-    assert!(report.demoted_items.contains("A1"));
+    assert!(report.demoted_items.is_empty());
     fixture.remove();
 }
 
@@ -116,19 +124,15 @@ fn audit_demotion_allows_advisory_failure_but_never_supplies_the_change_pass() {
         protection_findings: Vec::new(),
         restored_paths: Vec::new(),
         demoted_items: BTreeSet::new(),
-        checks_green: true,
-        fixes_green: true,
-        tree_stable: true,
-        change_items: BTreeSet::from(["A1".to_owned()]),
         change_item_passes: false,
         receipt: None,
     };
-    assert!(report.apply_acceptance_demotions(
+    assert!(!report.apply_acceptance_demotions(
         &BTreeSet::from(["A2".to_owned()]),
         &BTreeSet::from(["A1".to_owned()]),
     ));
-    assert!(report.is_verified());
-    assert!(report.is_landable());
+    assert!(!report.is_verified());
+    assert!(!report.is_landable());
 
     let mut demoted_change = GateReport {
         verdict: GateVerdict::Unverified,
@@ -153,14 +157,10 @@ fn audit_demotion_allows_advisory_failure_but_never_supplies_the_change_pass() {
         protection_findings: Vec::new(),
         restored_paths: Vec::new(),
         demoted_items: BTreeSet::new(),
-        checks_green: true,
-        fixes_green: true,
-        tree_stable: true,
-        change_items: BTreeSet::from(["A1".to_owned()]),
         change_item_passes: false,
         receipt: None,
     };
-    assert!(demoted_change.apply_acceptance_demotions(
+    assert!(!demoted_change.apply_acceptance_demotions(
         &BTreeSet::from(["A1".to_owned()]),
         &BTreeSet::from(["A1".to_owned()]),
     ));

@@ -229,7 +229,7 @@ pub(crate) fn run_check_excluding(
             .map_err(|error| CheckRunError::Restore(error.to_string()))?;
     }
     let process = process.map_err(CheckRunError::Process)?;
-    Ok(check_result(command, process, changed_paths))
+    Ok(check_result(command, process, changed_paths, workdir))
 }
 
 pub(crate) fn run_fix(
@@ -265,9 +265,10 @@ pub(crate) fn check_result(
     command: &CheckCommand,
     process: ProcessResult,
     changed_paths: Vec<String>,
+    workdir: &Path,
 ) -> CheckResult {
     let output = std::fs::read(&process.log_path).unwrap_or_else(|_| process.output_tail.clone());
-    let findings = parse_gnu_findings(&output);
+    let findings = parse_check_findings(&output, workdir);
     let unavailable = process.unavailable
         || process
             .exit_status
@@ -319,6 +320,15 @@ pub fn is_excused(baseline: &CheckBaseline, current: &CheckResult) -> bool {
 
 fn identities(findings: &[CheckFinding]) -> BTreeSet<(&str, &str, &str)> {
     findings.iter().map(CheckFinding::identity).collect()
+}
+
+/// Use the same finding identities for approval baselines and candidates.
+pub(crate) fn parse_check_findings(output: &[u8], workdir: &Path) -> Vec<CheckFinding> {
+    let mut findings = parse_gnu_findings(output);
+    if workdir.join("mix.exs").is_file() {
+        findings.extend(super::adapters::exunit::parse_findings(output, workdir));
+    }
+    findings
 }
 
 fn parse_gnu_findings(output: &[u8]) -> Vec<CheckFinding> {

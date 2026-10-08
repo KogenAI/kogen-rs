@@ -283,6 +283,20 @@ fn audit_acceptance(
     provider.record_event(
         snapshot,
         &RunEvent::new("audit", now_ms())
+            .with("mode", json!("observational"))
+            .with(
+                "warnings",
+                json!(
+                    dispositions
+                        .iter()
+                        .filter(|item| item.reason.is_empty())
+                        .map(|item| format!(
+                            "audit warning: invalid or missing judgment for {}",
+                            item.id
+                        ))
+                        .collect::<Vec<_>>()
+                ),
+            )
             .with("rung", json!(rung))
             .with(
                 "items",
@@ -298,31 +312,22 @@ fn audit_acceptance(
                 ),
             ),
     )?;
-    let demoted_ids = dispositions
-        .iter()
-        .filter(|item| item.demote)
-        .map(|item| item.id.clone())
-        .collect::<Vec<_>>();
-    let had_demotion = !demoted_ids.is_empty();
-    demoted.extend(demoted_ids.iter().cloned());
-    report.apply_audit_demotions(&demoted_ids);
+    let _ = demoted;
     for item in dispositions {
-        let event = if item.demote {
-            "acceptance_demoted"
+        let event = if item.reason.is_empty() {
+            "audit_warning"
         } else {
             "acceptance_upheld"
         };
         provider.record_event(
             snapshot,
             &RunEvent::new(event, now_ms())
+                .with("mode", json!("observational"))
                 .with("rung", json!(rung))
                 .with("id", json!(item.id))
                 .with("verdict", json!(item.verdict.as_str()))
                 .with("reason", json!(item.reason)),
         )?;
-    }
-    if had_demotion {
-        record_verification(provider, snapshot, report, rung, demoted)?;
     }
     Ok(())
 }
@@ -382,7 +387,7 @@ fn run_rung(
         .fields
         .insert("sandbox_warning".to_owned(), json!(sandbox_warning));
     let run_id = snapshot.run_id.clone();
-    let mut provider = BuildProvider::new(project, approved, options, store)?;
+    let mut provider = BuildProvider::new(project, approved, options, store, base_sha)?;
     let account = provider.account().clone();
     record_started(
         &mut provider,
@@ -1587,7 +1592,7 @@ pub(super) fn run_witness_build(
     let child_env = support::child_environment(project, run_dir, candidate.workspace(), options)?;
     let base_env = support::child_environment(project, run_dir, base.workspace(), options)?;
     let sandbox = probe_sandbox(&builder_runner, candidate.workspace(), run_dir, &child_env)?;
-    let mut provider = BuildProvider::new(project, approved, options, store)?;
+    let mut provider = BuildProvider::new(project, approved, options, store, base_sha)?;
     let account = provider.account().clone();
     record_started(
         &mut provider,
@@ -1742,6 +1747,7 @@ pub(super) fn run_witness_build(
             provider.record_event(
                 snapshot,
                 &RunEvent::new("audit", now_ms())
+                    .with("mode", json!("observational"))
                     .with("rung", json!("R1"))
                     .with(
                         "items",

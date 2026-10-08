@@ -743,6 +743,8 @@ mod tests {
             owner_pid: 1,
             owner_started_ms: 1,
             started_ms: 1,
+            recovery: Vec::new(),
+            cleanup_pending: false,
             fields: Default::default(),
         };
         store.create(&snapshot).unwrap();
@@ -804,6 +806,8 @@ mod tests {
             owner_pid: 1,
             owner_started_ms: 1,
             started_ms: 1,
+            recovery: Vec::new(),
+            cleanup_pending: false,
             fields: Default::default(),
         };
         let store = RunStore::new(&run_dir);

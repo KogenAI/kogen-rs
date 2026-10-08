@@ -100,13 +100,13 @@ fn drain(project: &ProjectResolution) -> Result<CliOutput, CoreError> {
                     BuildStatus::Landed => {
                         if build.advisory_items.is_empty() {
                             emit_line(&format!(
-                                "~landed {slug} {} (Build {})\n",
+                                "landed {slug} {} (Build {})\n",
                                 short(&build.commit),
                                 short(&build.run_id),
                             ));
                         } else {
                             emit_line(&format!(
-                                "~landed {slug} {} (advisory: {}) (Build {})\n",
+                                "landed {slug} {} (advisory: {}) (Build {})\n",
                                 short(&build.commit),
                                 build.advisory_items.join(", "),
                                 short(&build.run_id),

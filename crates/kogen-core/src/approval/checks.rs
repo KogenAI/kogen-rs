@@ -1,8 +1,9 @@
 use super::model::{BaselineCache, BaselineRow, Finding};
 mod acceptance;
 mod cache;
+mod identity;
 
-use crate::gate::is_test_rule;
+use crate::gate::parse_check_findings;
 use crate::git::GitRepo;
 use crate::project::ProjectResolution;
 use crate::run::setup_cache::{SetupCacheKey, SetupCacheRequest, run_setup as run_cached_setup};
@@ -30,6 +31,28 @@ pub(super) fn run_setup_and_baseline(
     base_sha: &str,
     run_dir: PathBuf,
 ) -> Result<CheckOutcome, CheckError> {
+    // Never label a dirty or stale checkout as the resolved base.
+    let checkout_repo = GitRepo::new(&project.checkout);
+    let exact = checkout_repo.resolve_commit("HEAD").ok().as_deref() == Some(base_sha)
+        && checkout_repo
+            .text(&["status", "--porcelain=v1", "--untracked-files=no"])
+            .is_ok_and(|status| status.is_empty());
+    if !exact {
+        let workspace = run_dir.join("baseline-base");
+        let repository = crate::git::landing::LandingRepository::clone_fresh(
+            &project.origin,
+            &workspace,
+            base_sha,
+        )
+        .map_err(|error| CheckError::Internal(error.to_string()))?;
+        let mut checked = project.clone();
+        checked.checkout = workspace.clone();
+        let result = run_setup_and_baseline(&checked, base_sha, run_dir);
+        drop(repository);
+        crate::git::forget_workspace(&workspace);
+        let _ = fs::remove_dir_all(workspace);
+        return result;
+    }
     let runner = ProcessSupervisor;
     fs::create_dir_all(&run_dir).map_err(|error| CheckError::Internal(error.to_string()))?;
     #[cfg(unix)]
@@ -54,15 +77,21 @@ pub(super) fn run_setup_and_baseline(
     let setup_key =
         SetupCacheKey::from_project(project.config.as_ref(), &project.checkout, &base_tree, &env)
             .map_err(|error| CheckError::Internal(error.to_string()))?;
-    let key = setup_key
-        .digest_with_checks(&checks_value(project)?)
-        .map_err(|error| CheckError::Internal(error.to_string()))?;
+    let checks = checks_value(project)?;
+    let identity =
+        identity::baseline_key(&setup_key, &base_tree, &checks, &project.checkout, &env)?;
+    // Unknown check toolchains are a miss, rather than a reusable empty identity.
+    let key = identity
+        .clone()
+        .unwrap_or_else(|| format!("uncached-{}", rand::random::<u64>()));
     let setup_key = setup_key.digest();
     let cache_path = project
         .state_root
         .join("approval-cache")
         .join(format!("{key}.json"));
-    if let Some(cache) = read_cache(&cache_path, &key) {
+    if identity.is_some()
+        && let Some(cache) = read_cache(&cache_path, &key)
+    {
         return Ok(CheckOutcome {
             rows: cache.rows,
             run_dir,
@@ -87,13 +116,15 @@ pub(super) fn run_setup_and_baseline(
         || run_setup(project, &runner, &run_dir, &env),
     )?;
     let rows = run_checks(project, &runner, &run_dir, &env)?;
-    write_cache(
-        &cache_path,
-        &BaselineCache {
-            key,
-            rows: rows.clone(),
-        },
-    )?;
+    if identity.is_some() {
+        write_cache(
+            &cache_path,
+            &BaselineCache {
+                key,
+                rows: rows.clone(),
+            },
+        )?;
+    }
     Ok(CheckOutcome { rows, run_dir, env })
 }
 
@@ -189,12 +220,17 @@ fn run_checks(
         let after = repo
             .output(&["status", "--porcelain=v1", "--untracked-files=all"])
             .map_err(|error| CheckError::Internal(error.to_string()))?;
-        rows.push(baseline_row(name, result, before != after));
+        rows.push(baseline_row(
+            name,
+            result,
+            before != after,
+            &project.checkout,
+        ));
     }
     Ok(rows)
 }
 
-fn baseline_row(name: String, result: ProcessResult, changed: bool) -> BaselineRow {
+fn baseline_row(name: String, result: ProcessResult, changed: bool, workdir: &Path) -> BaselineRow {
     let failed = result.exit_status.is_some_and(|status| status != 0);
     let status = if changed {
         "mutating"
@@ -211,46 +247,20 @@ fn baseline_row(name: String, result: ProcessResult, changed: bool) -> BaselineR
         name,
         status: status.to_owned(),
         exit_status: result.exit_status,
-        findings: parse_findings(&result.output_tail),
+        findings: {
+            let output = fs::read(&result.log_path).unwrap_or(result.output_tail);
+            parse_check_findings(&output, workdir)
+                .into_iter()
+                .map(|finding| Finding {
+                    path: finding.path,
+                    rule: finding.rule,
+                    symbol: finding.symbol,
+                    message: finding.message,
+                    line: finding.line,
+                })
+                .collect()
+        },
     }
-}
-
-fn parse_findings(output: &[u8]) -> Vec<Finding> {
-    String::from_utf8_lossy(output)
-        .lines()
-        .filter_map(parse_finding)
-        .collect()
-}
-
-fn parse_finding(line: &str) -> Option<Finding> {
-    let (path, rest) = line.split_once(':')?;
-    let (line_number, rest) = rest.split_once(':')?;
-    let line_number = line_number.parse::<u32>().ok()?;
-    let rest = if let Some((column, after_column)) = rest.split_once(':')
-        && column.parse::<u32>().is_ok()
-    {
-        after_column.trim_start()
-    } else {
-        rest.trim_start()
-    };
-    let rest = rest
-        .strip_prefix("error: ")
-        .or_else(|| rest.strip_prefix("warning: "))
-        .or_else(|| rest.strip_prefix("note: "))?;
-    let rest = rest.strip_prefix('[')?;
-    let (rule, rest) = rest.split_once("] ")?;
-    let (symbol, message) = if is_test_rule(rule) {
-        rest.split_once(": ").unwrap_or(("", rest))
-    } else {
-        ("", rest)
-    };
-    Some(Finding {
-        path: path.to_owned(),
-        rule: rule.to_owned(),
-        symbol: symbol.to_owned(),
-        message: message.to_owned(),
-        line: Some(line_number),
-    })
 }
 
 struct ProcessInvocation<'a> {
@@ -375,18 +385,76 @@ fn safe_log_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_finding;
+    use super::*;
+
+    fn result(log_path: PathBuf, tail: &[u8]) -> ProcessResult {
+        ProcessResult {
+            exit_status: Some(2),
+            timed_out: false,
+            unavailable: false,
+            output_tail: tail.to_vec(),
+            log_path,
+            duration_ms: 1,
+            sandbox: None,
+        }
+    }
 
     #[test]
     fn approval_baselines_only_extract_symbols_for_test_failures() {
-        let lint = parse_finding("lib/old.txt:2:1: error: [lint/todo] old.txt: TODO found")
-            .expect("parse lint finding");
-        assert_eq!(lint.symbol, "");
-        assert_eq!(lint.message, "old.txt: TODO found");
+        let row = baseline_row("unit".to_owned(), result(PathBuf::new(), b"lib/old.txt:2:1: error: [lint/todo] old.txt: TODO found\ntest/unit/greet.t.sh:1:1: error: [kt/test] alpha: failed\n"), false, Path::new("/nonexistent"));
+        assert_eq!(row.findings[0].symbol, "");
+        assert_eq!(row.findings[0].message, "old.txt: TODO found");
+        assert_eq!(row.findings[1].symbol, "alpha");
+        assert_eq!(row.findings[1].message, "failed");
+    }
 
-        let test = parse_finding("test/unit/greet.t.sh:1:1: error: [kt/test] alpha: failed")
-            .expect("parse kt test finding");
-        assert_eq!(test.symbol, "alpha");
-        assert_eq!(test.message, "failed");
+    #[test]
+    fn exunit_baseline_reads_full_log_and_candidates_reject_new_failure_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "kogen-exunit-baseline-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("mix.exs"), b"# ExUnit project").unwrap();
+        let output = b"  1) test legacy is broken (HelloTest)\n     test/hello_test.exs:4\n     Assertion with == failed\nFinished in 0.02 seconds\nResult: 0/1 passed\nFailed: 1 test\n";
+        let log = root.join("check.log");
+        fs::write(&log, output).unwrap();
+        let row = baseline_row(
+            "unit".to_owned(),
+            result(log, b"Failed: 1 test\n"),
+            false,
+            &root,
+        );
+        assert_eq!(row.findings.len(), 1);
+        assert_eq!(row.findings[0].path, "test/hello_test.exs");
+        assert_eq!(row.findings[0].symbol, "legacy is broken");
+        let baseline = crate::gate::CheckBaseline {
+            name: "unit".to_owned(),
+            status: crate::gate::CheckStatus::Red,
+            exit_status: Some(2),
+            findings: parse_check_findings(output, &root),
+        };
+        let mut candidate = crate::gate::CheckResult {
+            name: "unit".to_owned(),
+            program: "mix".to_owned(),
+            status: crate::gate::CheckStatus::Red,
+            exit_status: Some(2),
+            findings: parse_check_findings(output, &root),
+            changed_paths: vec![],
+            log_path: PathBuf::new(),
+            duration_ms: 1,
+            timeout: Duration::from_secs(1),
+            excused: false,
+        };
+        assert!(crate::gate::is_excused(&baseline, &candidate));
+        candidate.findings = parse_check_findings(
+            &String::from_utf8_lossy(output)
+                .replace("legacy is broken", "new regression")
+                .into_bytes(),
+            &root,
+        );
+        assert!(!crate::gate::is_excused(&baseline, &candidate));
+        fs::remove_dir_all(root).unwrap();
     }
 }

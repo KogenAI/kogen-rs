@@ -492,6 +492,8 @@ impl TempProject {
             owner_pid: std::process::id(),
             owner_started_ms: 1,
             started_ms: i64::try_from(sequence).unwrap_or(i64::MAX),
+            recovery: Vec::new(),
+            cleanup_pending: false,
             fields: Default::default(),
         };
         let directory = project.state_root.join("runs").join(&id);

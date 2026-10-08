@@ -44,7 +44,7 @@ build:
   recipe: ladder
   roles:
     builder: {model: gpt-6-luna, effort: max}
-    fallback_shaper: {model: gpt-6.1-sol, effort: high}
+    shaper: {model: gpt-6.1-sol, effort: high}
     rung2: {model: gpt-6.1-sol, effort: medium}
     rung3: {model: gpt-6.1-sol, effort: high}
   ladder: {max_rungs: 3, experimental_r4: false}

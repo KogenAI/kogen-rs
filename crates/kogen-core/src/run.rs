@@ -13,6 +13,7 @@ mod sandbox;
 mod script;
 pub mod setup_cache;
 mod watchdog;
+pub(crate) use watchdog::stop_recovery_writers;
 
 pub(crate) use diagnostics::{failure_detail, prepare_private_run_dir};
 pub use environment::{

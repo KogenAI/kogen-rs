@@ -12,6 +12,7 @@ pub(super) fn validate(value: &Value, issues: &mut Vec<String>) {
         "wall_minutes",
         "edge_tests",
         "model_fallback",
+        "auditor_demotion",
         "context_bytes",
         "plan_max_words",
         "tool_result_tokens",
@@ -47,7 +48,15 @@ pub(super) fn validate(value: &Value, issues: &mut Vec<String>) {
     {
         issues.push("plan_max_words must be an integer from 300 to 2000".to_owned());
     }
-    for field in ["edge_tests", "model_fallback", "context_packet"] {
+    if get(map, "auditor_demotion").and_then(Value::as_bool) == Some(true) {
+        issues.push("build.auditor_demotion has no admitted calibration".to_owned());
+    }
+    for field in [
+        "edge_tests",
+        "model_fallback",
+        "context_packet",
+        "auditor_demotion",
+    ] {
         if let Some(value) = get(map, field)
             && !matches!(value, Value::Bool(_))
         {
@@ -92,7 +101,6 @@ fn validate_roles(value: &Value, issues: &mut Vec<String>) {
                 | "auditor"
                 | "reviewer"
                 | "context"
-                | "fallback_shaper"
                 | "rung2"
                 | "rung3"
         ) {

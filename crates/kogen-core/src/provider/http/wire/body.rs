@@ -15,14 +15,19 @@ pub(super) fn encode(
 fn input_items(request: &RequestContext, mode: ResponseMode) -> Vec<Value> {
     if mode == ResponseMode::Lite {
         let schemas = sorted_tools(&request.tools);
-        let tools_id = stable_id(&request.lite_session_id, "additional_tools");
-        let shared_id = stable_id(&request.lite_session_id, "shared_instructions");
+        let tools_id = stable_id(
+            &serde_json::to_string(&schemas).expect("schemas"),
+            "additional_tools",
+        );
+        let shared_id = stable_id(&request.shared_instructions, "shared_instructions");
         let role_id = stable_id(&request.thread_id, "role_instructions");
         let mut items = vec![
-            json!({"id": tools_id, "type":"additional_tools", "role":"developer", "tools":schemas}),
             developer_item(shared_id, &request.shared_instructions),
-            developer_item(role_id, &request.role_instructions),
+            json!({"id": tools_id, "type":"additional_tools", "role":"developer", "tools":schemas}),
         ];
+        if request.instructions != request.shared_instructions {
+            items.push(developer_item(role_id, &request.role_instructions));
+        }
         items.extend(request.input.iter().cloned());
         return items;
     }

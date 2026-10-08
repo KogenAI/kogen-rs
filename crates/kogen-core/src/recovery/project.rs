@@ -18,6 +18,8 @@ const CLAIM_REF: &str = "refs/kogen/claim";
 #[cfg(test)]
 mod tests;
 
+mod preservation;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RecoveryReport {
     pub reconciled: Vec<ReconciledRun>,
@@ -66,8 +68,8 @@ pub fn reconcile(project: &ProjectResolution) -> Result<RecoveryReport, CoreErro
             .cleanup_pending(&snapshot.run_id)
             .map_err(|error| recovery_error("cleanup_obligation_read_failed", error))?;
         if snapshot.status != "running" {
-            if cleanup_pending {
-                retry_cleanup(&origin, &project.state_root, &store, &snapshot)?;
+            if cleanup_pending || snapshot.cleanup_pending {
+                retry_cleanup(&origin, &project.state_root, &store, &mut snapshot)?;
             }
             continue;
         }
@@ -113,7 +115,7 @@ pub fn reconcile(project: &ProjectResolution) -> Result<RecoveryReport, CoreErro
         store
             .record(&event, &snapshot)
             .map_err(|error| recovery_error("run_reconcile_failed", error))?;
-        retry_cleanup(&origin, &project.state_root, &store, &snapshot)?;
+        retry_cleanup(&origin, &project.state_root, &store, &mut snapshot)?;
         report.reconciled.push(ReconciledRun {
             run_id: snapshot.run_id,
             slug: snapshot.slug,
@@ -128,23 +130,32 @@ fn retry_cleanup(
     origin: &GitRepo,
     state_root: &Path,
     store: &RunStore,
-    snapshot: &RunSnapshot,
+    snapshot: &mut RunSnapshot,
 ) -> Result<(), CoreError> {
+    snapshot.cleanup_pending = true;
+    store
+        .prepare_cleanup(snapshot)
+        .map_err(|error| recovery_error("cleanup_obligation_write_failed", error))?;
+    store
+        .write_snapshot(snapshot)
+        .map_err(|error| recovery_error("run_reconcile_failed", error))?;
+    let preserved = preservation::preserve_workspaces(origin, state_root, store, snapshot)?;
     let mut failures = Vec::new();
     if let Err(error) = release_claim_for_run(origin, &snapshot.run_id) {
         failures.push(("release origin claim", render_recovery_error(&error)));
     }
-    if let Err(error) = remove_incoming(origin, &snapshot.run_id) {
+    // An incoming ref may be the only candidate when preservation fails.
+    if preserved && let Err(error) = remove_incoming(origin, &snapshot.run_id) {
         failures.push(("delete incoming ref", render_recovery_error(&error)));
     }
-    if let Err(error) = remove_run_workspaces(state_root, &snapshot.run_id) {
-        failures.push(("remove run workspaces", render_recovery_error(&error)));
-    }
-    if failures.is_empty() {
+    if preserved && failures.is_empty() {
         store
             .clear_cleanup()
             .map_err(|error| recovery_error("cleanup_obligation_clear_failed", error))?;
-        return Ok(());
+        snapshot.cleanup_pending = false;
+        store
+            .write_snapshot(snapshot)
+            .map_err(|error| recovery_error("run_reconcile_failed", error))?;
     }
     for (operation, detail) in failures {
         store
@@ -232,32 +243,6 @@ fn remove_incoming(origin: &GitRepo, run_id: &str) -> Result<(), CoreError> {
         origin
             .delete_ref_cas(&name, &commit)
             .map_err(|error| recovery_error("incoming_ref_cleanup_failed", error))?;
-    }
-    Ok(())
-}
-
-fn remove_run_workspaces(state_root: &Path, run_id: &str) -> Result<(), CoreError> {
-    let entries = match fs::read_dir(state_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(recovery_error("workspace_cleanup_failed", error)),
-    };
-    let prefix = format!("{run_id}-");
-    for entry in entries {
-        let entry = entry.map_err(|error| recovery_error("workspace_cleanup_failed", error))?;
-        let name = entry.file_name();
-        let metadata = entry
-            .file_type()
-            .map_err(|error| recovery_error("workspace_cleanup_failed", error))?;
-        if name.to_string_lossy().starts_with(&prefix)
-            && metadata.is_dir()
-            && !metadata.is_symlink()
-        {
-            let workspace = entry.path();
-            crate::git::forget_workspace(&workspace);
-            fs::remove_dir_all(&workspace)
-                .map_err(|error| recovery_error("workspace_cleanup_failed", error))?;
-        }
     }
     Ok(())
 }
