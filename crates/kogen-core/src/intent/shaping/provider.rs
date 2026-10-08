@@ -51,6 +51,7 @@ impl ShapeProvider {
             })],
         )
         .map_err(provider_io_error)?;
+        context.set_shared_context("");
         configure_tools(&mut context, spec.tools);
         Ok(ShapeSession {
             output_role: spec.output_role.to_owned(),
@@ -358,6 +359,18 @@ mod tests {
             .unwrap();
         assert_eq!(shaper.context.tools.len(), 7);
         assert_eq!(shaper.context.callable_tools, ["read", "search", "write"]);
+        assert_eq!(
+            shaper.context.instructions,
+            shaper.context.shared_instructions
+        );
+        assert_eq!(
+            shaper.context.input[0],
+            json!({"role":"developer","content":[{"type":"input_text","text":shaper.context.shared_instructions}]})
+        );
+        assert_eq!(
+            shaper.context.input[1],
+            json!({"role":"developer","content":[{"type":"input_text","text":"stable shaper instructions"}]})
+        );
         let first = build_wire_request(&shaper.context, &auth, &config).unwrap();
         let shaper_cache_key = shaper.context.cache_key.clone();
         let shaper_thread_id = shaper.context.thread_id.clone();
