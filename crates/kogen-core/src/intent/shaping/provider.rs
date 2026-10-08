@@ -209,17 +209,9 @@ impl ShapeSession {
 }
 
 fn configure_tools(context: &mut RequestContext, enabled: bool) {
+    context.tools = tools::canonical_tool_schemas();
     if enabled {
         let allowed = ToolRole::Shaper.allowed();
-        context.tools = tools::canonical_tool_schemas()
-            .into_iter()
-            .filter(|schema| {
-                schema
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| allowed.contains(&name))
-            })
-            .collect();
         context.callable_tools = allowed.iter().map(|name| (*name).to_owned()).collect();
     } else {
         context.tool_choice = "none".to_owned();
@@ -364,6 +356,8 @@ mod tests {
                 initial_user: "stable first request".to_owned(),
             })
             .unwrap();
+        assert_eq!(shaper.context.tools.len(), 7);
+        assert_eq!(shaper.context.callable_tools, ["read", "search", "write"]);
         let first = build_wire_request(&shaper.context, &auth, &config).unwrap();
         let shaper_cache_key = shaper.context.cache_key.clone();
         let shaper_thread_id = shaper.context.thread_id.clone();
@@ -397,7 +391,18 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(shaper_tools, ["read", "search", "write"]);
+        assert_eq!(
+            shaper_tools,
+            [
+                "edit",
+                "finish",
+                "read",
+                "search",
+                "shell",
+                "tool_output",
+                "write"
+            ]
+        );
 
         let mut fallback = provider
             .session(ShapeSessionSpec {
