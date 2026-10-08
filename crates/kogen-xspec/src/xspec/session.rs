@@ -499,10 +499,19 @@ impl SessionReplay {
             .clone()
             .unwrap_or_else(|| ConversationBinding::new(&self.run_dir, "develop"));
         let body = self.production_wire(&binding, false, instructions, Some(model))?;
-        body.get("instructions")
+        let serialized = body
+            .get("instructions")
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| "production wire body omitted request instructions".to_owned())
+            .ok_or_else(|| "production wire body omitted request instructions".to_owned())?;
+        let context =
+            RequestContext::for_conversation(&binding, model, "medium", instructions, Vec::new())
+                .map_err(|error| error.to_string())?;
+        if serialized != context.instructions {
+            return Err("production wire changed the reusable instructions".to_owned());
+        }
+        // The session slice names the role-specific reusable bytes; the
+        // universal system prelude is verified in the serialized request.
+        Ok(context.role_instructions)
     }
 
     fn production_wire(
