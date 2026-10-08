@@ -215,26 +215,26 @@ impl RecoveryModel {
 
     fn finish(&mut self, id: &str, status: &str, reason: &str) {
         if let Some(run) = self.runs.get_mut(id) {
+            let needs_copy = run.work || run.incoming;
+            let preserved = run.preserved || (needs_copy && run.preserve_ok);
+            let pending = needs_copy && !preserved;
             run.status = status.to_owned();
             run.reason = reason.to_owned();
-            run.preserved |= run.work && run.preserve_ok;
-            run.cleanup_pending = run.work && !run.preserved;
-            run.work = run.cleanup_pending;
-            if !run.cleanup_pending {
-                run.incoming = false;
-            }
             run.queued = false;
+            run.preserved = preserved;
+            run.work &= pending;
+            run.incoming = run.incoming && pending;
+            run.cleanup_pending = pending;
+            self.line = if pending {
+                "cleanup_failure".to_owned()
+            } else {
+                reason.to_owned()
+            };
         }
         if self.claim == id {
             self.claim.clear();
         }
         self.last = "ok".to_owned();
-        self.line = if self.runs.get(id).is_some_and(|run| run.cleanup_pending) {
-            "cleanup_failure"
-        } else {
-            reason
-        }
-        .to_owned();
     }
 
     fn reapprove(&mut self, id: &str) {

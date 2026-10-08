@@ -261,8 +261,32 @@ impl TempProject {
             .resolution
             .clone()
             .ok_or_else(|| "temporary project resolution is not initialized".to_owned())?;
-        project.config =
-            Some(ProjectConfig::load(&self.checkout).map_err(|error| error.to_string())?);
+        let config_path = self.checkout.join(".kogen/project.yaml");
+        let mut source = fs::read_to_string(&config_path).map_err(|error| error.to_string())?;
+        // Baseline checks run on a fresh clone of the origin base. Keep the
+        // symbolic control scripts available there without copying draft
+        // source files into that base, and bind their current cache identity.
+        for script in ["setup.sh", "baseline.sh", "acceptance.sh"] {
+            source = source.replace(
+                &format!(".kogen/xspec/{script}"),
+                &self
+                    .checkout
+                    .join(".kogen/xspec")
+                    .join(script)
+                    .to_string_lossy(),
+            );
+        }
+        let identity = fs::read(self.checkout.join(".kogen/xspec/cache-key"))
+            .map_err(|error| error.to_string())?;
+        let identity_hex = identity
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        source.push_str(&format!("env:\n  XSPEC_CACHE_KEY: '{identity_hex}'\n"));
+        project.config = Some(
+            ProjectConfig::from_bytes(&config_path, source.as_bytes())
+                .map_err(|error| error.to_string())?,
+        );
         Ok(project)
     }
 
