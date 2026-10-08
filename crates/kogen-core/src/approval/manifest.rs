@@ -142,8 +142,13 @@ pub(super) fn witness(
     } else {
         "PROVEN"
     };
+    let feasibility = if warnings_have_concern {
+        "PROVEN with concerns"
+    } else {
+        "PROVEN"
+    };
     Ok((
-        verdict.replace('_', " "),
+        feasibility.to_owned(),
         Some(Witness {
             verdict: verdict.to_owned(),
             commit,

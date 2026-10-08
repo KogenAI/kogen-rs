@@ -6,6 +6,31 @@ use super::{ModelResponse, ModelToolCall, ModelUsage, ProviderErrorKind, Provide
 
 pub const MAX_RESPONSE_BYTES: usize = 16_000_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamOutputLimits {
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub hard_budget_output_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamLimitExceeded {
+    OutputTokens,
+    ReasoningTokens,
+    GlobalBudget,
+}
+
+impl StreamLimitExceeded {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutputTokens => "output_tokens_exceeded_512",
+            Self::ReasoningTokens => "reasoning_tokens_exceeded_1024",
+            Self::GlobalBudget => "global_token_budget_output_allowance_reached",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SseError {
     BodyTooLarge,
@@ -20,9 +45,17 @@ pub struct SseAssembler {
     pending_cr: bool,
     collected_items: Vec<Value>,
     completed: Option<Value>,
+    raw_usage: Option<Value>,
+    response_model: Option<String>,
     failure: Option<ProviderFailure>,
     malformed: bool,
     finished: bool,
+    stream_output_limits: Option<StreamOutputLimits>,
+    stream_limit_exceeded: Option<StreamLimitExceeded>,
+    output_text_tokens: u64,
+    reasoning_text_tokens: u64,
+    output_in_word: bool,
+    reasoning_in_word: bool,
 }
 
 impl SseAssembler {
@@ -32,9 +65,25 @@ impl SseAssembler {
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> Result<(), SseError> {
+        self.feed_with_output_limits(chunk, None).map(|_| ())
+    }
+
+    /// Feed one transport chunk and stop parsing as soon as a configured
+    /// streamed-output threshold is crossed. Text is measured with the
+    /// replay tool's whitespace tokenizer; provider usage fields take
+    /// precedence whenever the stream supplies them.
+    pub fn feed_with_output_limits(
+        &mut self,
+        chunk: &[u8],
+        limits: Option<StreamOutputLimits>,
+    ) -> Result<Option<StreamLimitExceeded>, SseError> {
         if self.finished {
-            return Ok(());
+            return Ok(self.stream_limit_exceeded);
         }
+        if self.stream_limit_exceeded.is_some() {
+            return Ok(self.stream_limit_exceeded);
+        }
+        self.stream_output_limits = limits;
         self.consumed = self.consumed.saturating_add(chunk.len());
         if self.consumed > MAX_RESPONSE_BYTES {
             self.malformed = true;
@@ -53,8 +102,11 @@ impl SseAssembler {
                 b'\n' => self.emit_line(),
                 _ => self.line.push(*byte),
             }
+            if self.stream_limit_exceeded.is_some() {
+                break;
+            }
         }
-        Ok(())
+        Ok(self.stream_limit_exceeded)
     }
 
     /// Flush an unterminated final line/frame and assemble the response.
@@ -91,6 +143,19 @@ impl SseAssembler {
     #[must_use]
     pub fn collected_items(&self) -> &[Value] {
         &self.collected_items
+    }
+
+    /// The provider's unnormalized usage object, including when assembly later
+    /// fails after the usage event arrived.
+    #[must_use]
+    pub fn raw_usage(&self) -> Option<&Value> {
+        self.raw_usage.as_ref()
+    }
+
+    /// Model name reported by the completed response, when present.
+    #[must_use]
+    pub fn response_model(&self) -> Option<&str> {
+        self.response_model.as_deref()
     }
 
     fn emit_line(&mut self) {
@@ -135,6 +200,11 @@ impl SseAssembler {
             self.malformed = true;
             return;
         };
+        self.observe_response_metadata(object.get("response"));
+        if let Some(usage) = object.get("usage") {
+            self.raw_usage = Some(usage.clone());
+        }
+        self.observe_stream_limits(object);
         let kind = object
             .get("type")
             .and_then(Value::as_str)
@@ -142,6 +212,7 @@ impl SseAssembler {
         if object.get("error").is_some_and(|error| !error.is_null())
             || matches!(kind, "error" | "response.failed" | "response.incomplete")
         {
+            self.observe_response_metadata(object.get("response"));
             let usage = response_usage(object.get("response"));
             let failure = event_failure(kind, &event, usage);
             if self.failure.is_none() {
@@ -161,12 +232,123 @@ impl SseAssembler {
                 if self.completed.is_some() {
                     self.malformed = true;
                 } else if let Some(response) = object.get("response") {
+                    self.observe_response_metadata(Some(response));
                     self.completed = Some(response.clone());
                 } else {
                     self.malformed = true;
                 }
             }
             _ => {}
+        }
+    }
+
+    fn observe_stream_limits(&mut self, event: &Map<String, Value>) {
+        let Some(limits) = self.stream_output_limits else {
+            return;
+        };
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match kind {
+            "response.output_text.delta" => {
+                count_whitespace_tokens(
+                    delta,
+                    &mut self.output_text_tokens,
+                    &mut self.output_in_word,
+                );
+                if self
+                    .output_text_tokens
+                    .saturating_add(self.reasoning_text_tokens)
+                    >= limits.hard_budget_output_tokens
+                {
+                    self.stream_limit_exceeded = Some(StreamLimitExceeded::GlobalBudget);
+                    return;
+                }
+                if self.output_text_tokens > limits.output_tokens {
+                    self.stream_limit_exceeded = Some(StreamLimitExceeded::OutputTokens);
+                    return;
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning.delta" => {
+                count_whitespace_tokens(
+                    delta,
+                    &mut self.reasoning_text_tokens,
+                    &mut self.reasoning_in_word,
+                );
+                if self
+                    .output_text_tokens
+                    .saturating_add(self.reasoning_text_tokens)
+                    >= limits.hard_budget_output_tokens
+                {
+                    self.stream_limit_exceeded = Some(StreamLimitExceeded::GlobalBudget);
+                    return;
+                }
+                if self.reasoning_text_tokens > limits.reasoning_tokens {
+                    self.stream_limit_exceeded = Some(StreamLimitExceeded::ReasoningTokens);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        let usage = event
+            .get("response")
+            .and_then(|response| response.get("usage"))
+            .or_else(|| event.get("usage"));
+        let Some(usage) = usage else {
+            return;
+        };
+        if usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count >= limits.hard_budget_output_tokens)
+        {
+            self.stream_limit_exceeded = Some(StreamLimitExceeded::GlobalBudget);
+            return;
+        }
+        if usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > limits.output_tokens)
+        {
+            self.stream_limit_exceeded = Some(StreamLimitExceeded::OutputTokens);
+            return;
+        }
+        if usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > limits.reasoning_tokens)
+        {
+            self.stream_limit_exceeded = Some(StreamLimitExceeded::ReasoningTokens);
+        }
+    }
+
+    fn observe_response_metadata(&mut self, response: Option<&Value>) {
+        let Some(response) = response else {
+            return;
+        };
+        if let Some(usage) = response.get("usage") {
+            self.raw_usage = Some(usage.clone());
+        }
+        if let Some(model) = response.get("model").and_then(Value::as_str) {
+            self.response_model = Some(model.to_owned());
+        }
+    }
+}
+
+fn count_whitespace_tokens(text: &str, count: &mut u64, in_word: &mut bool) {
+    for character in text.chars() {
+        if character.is_whitespace() {
+            *in_word = false;
+        } else if !*in_word {
+            *count = count.saturating_add(1);
+            *in_word = true;
         }
     }
 }

@@ -8,6 +8,7 @@ use super::retry::RetryReplay;
 use super::wire::{RequestContext, WireConfig, WireRequest, build_wire_request};
 use crate::provider::auth::{self, RequestCredential};
 use crate::provider::session::ConversationHistory;
+use crate::provider::sse::{StreamLimitExceeded, StreamOutputLimits};
 use crate::provider::{ModelResponse, ProviderFailure};
 use rand::Rng as _;
 use std::path::Path;
@@ -50,13 +51,63 @@ fn time_scale() -> f64 {
 pub struct HttpAttempt {
     pub response: Result<ModelResponse, ProviderFailure>,
     pub received_items: Vec<serde_json::Value>,
+    /// Milliseconds from dispatch until the first nonempty response chunk.
+    pub first_byte_ms: Option<u64>,
     pub elapsed_ms: u64,
     pub body_bytes_received: u64,
+    /// HTTP status, even when the response stream later fails.
+    pub status_code: Option<u16>,
+    /// Provider usage before normalization, retained on partial/error streams.
+    pub raw_usage: Option<serde_json::Value>,
+    /// Provider-reported model, when the response stream supplied one.
+    pub response_model: Option<String>,
     pub sticky_routing_token: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct LimitedHttpAttempt {
+    pub attempt: HttpAttempt,
+    pub limit_exceeded: Option<StreamLimitExceeded>,
 }
 
 pub trait HttpPort: Send + Sync {
     fn execute(&self, request: &WireRequest, deadlines: RequestDeadlines) -> HttpAttempt;
+
+    /// Execute once and stop a streaming response when the supplied output
+    /// thresholds are crossed. Non-streaming test ports receive a conservative
+    /// post-response check; streaming transports should override this method
+    /// and cancel their body stream immediately.
+    fn execute_with_output_limits(
+        &self,
+        request: &WireRequest,
+        deadlines: RequestDeadlines,
+        limits: StreamOutputLimits,
+    ) -> LimitedHttpAttempt {
+        let attempt = self.execute(request, deadlines);
+        let usage = attempt.raw_usage.as_ref();
+        let limit_exceeded = usage.and_then(|usage| {
+            let output = usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64);
+            let reasoning = usage
+                .get("output_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(serde_json::Value::as_u64);
+            if output.is_some_and(|count| count >= limits.hard_budget_output_tokens) {
+                Some(StreamLimitExceeded::GlobalBudget)
+            } else if output.is_some_and(|count| count > limits.output_tokens) {
+                Some(StreamLimitExceeded::OutputTokens)
+            } else if reasoning.is_some_and(|count| count > limits.reasoning_tokens) {
+                Some(StreamLimitExceeded::ReasoningTokens)
+            } else {
+                None
+            }
+        });
+        LimitedHttpAttempt {
+            attempt,
+            limit_exceeded,
+        }
+    }
 }
 
 pub trait ClockPort: Send + Sync {

@@ -1,18 +1,3 @@
-/// Translate a model prefix into the corresponding real digest prefix when
-/// the model treats `model_digest` as a symbolic name for `actual_digest`.
-pub(super) fn model_prefix(actual_digest: &str, model_digest: &str, prefix: &str) -> String {
-    if actual_digest.starts_with(prefix) {
-        return prefix.to_owned();
-    }
-    if model_digest.starts_with(prefix) {
-        return actual_digest
-            .get(..prefix.len())
-            .unwrap_or(prefix)
-            .to_owned();
-    }
-    prefix.to_owned()
-}
-
 /// Translate a symbolic claim into a real claim that has the same modeled
 /// match result, then let the caller check that result against the real hash.
 pub(super) fn modeled_claim(actual_digest: &str, symbolic_claim: &str, matches: bool) -> String {

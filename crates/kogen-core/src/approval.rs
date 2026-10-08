@@ -15,7 +15,7 @@ use crate::ExitCode;
 use crate::error::{CliOutput, CoreError};
 use crate::git::GitRepo;
 use crate::intent::{Intent, approval_sha256, intent_sha256};
-use crate::project::{ProjectResolution, valid_slug};
+use crate::project::{CheckoutLock, ProjectResolution, valid_slug};
 use checks::{check_error, run_setup_and_baseline, stage_and_check};
 use manifest::{baseline_warning, protected_manifest, witness};
 use model::ApprovalDocument;
@@ -51,7 +51,49 @@ pub fn approve(
     given_hash: Option<&str>,
     by: Option<&str>,
 ) -> CliOutput {
-    match approve_inner(project, slug, given_hash, by) {
+    approve_with_effects(project, slug, given_hash, by, &mut NoApprovalEffects)
+}
+
+/// Effect port used to inject source changes and ref races in deterministic
+/// adapter replays. Production callers use [`approve`], which supplies a
+/// no-op implementation.
+pub trait ApprovalEffects {
+    fn before_late_read(
+        &mut self,
+        _project: &ProjectResolution,
+        _slug: &str,
+        _attempt: u8,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn before_ref_cas(
+        &mut self,
+        _project: &ProjectResolution,
+        _slug: &str,
+        _attempt: u8,
+        _expected: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct NoApprovalEffects;
+
+impl ApprovalEffects for NoApprovalEffects {}
+
+/// Run the production approval decision with injected effects immediately
+/// before the late source read and at the ref-CAS boundary. The policy, source
+/// reread, retry count, and CAS remain in the same command path used by
+/// [`approve`].
+pub fn approve_with_effects(
+    project: &ProjectResolution,
+    slug: &str,
+    given_hash: Option<&str>,
+    by: Option<&str>,
+    effects: &mut dyn ApprovalEffects,
+) -> CliOutput {
+    match approve_inner(project, slug, given_hash, by, effects) {
         Ok(output) => output,
         Err(error) => error.into_cli_output(),
     }
@@ -67,6 +109,7 @@ fn approve_inner(
     slug: &str,
     given_hash: Option<&str>,
     by: Option<&str>,
+    effects: &mut dyn ApprovalEffects,
 ) -> Result<CliOutput, CoreError> {
     if !valid_slug(slug) {
         return Err(intent_error(
@@ -177,12 +220,15 @@ fn approve_inner(
 
     let candidate_relative = acceptance_candidate_path(project, slug);
     let candidate = project.checkout.join(&candidate_relative);
-    if fs::symlink_metadata(&candidate).is_ok() {
-        return Err(environment_error(
-            "acceptance_check_path_conflict",
-            candidate_relative,
-            ExitCode::Environment,
-        ));
+    {
+        let _lock = CheckoutLock::acquire(&project.state_root, &project.checkout)?;
+        if fs::symlink_metadata(&candidate).is_ok() {
+            return Err(environment_error(
+                "acceptance_check_path_conflict",
+                candidate_relative,
+                ExitCode::Environment,
+            ));
+        }
     }
 
     let check_outcome =
@@ -234,14 +280,6 @@ fn approve_inner(
         });
     }
 
-    if project_uses_witness(project) && witness_doc.is_none() {
-        return Err(intent_error(
-            "unproven",
-            "the witness is not proven",
-            ExitCode::Negative,
-        ));
-    }
-
     let ledger = matching_ledger(project, slug, &actual_hash);
     let approval = ApprovalDocument {
         schema: 2,
@@ -289,6 +327,9 @@ fn approve_inner(
             },
         )
         .map_err(|error| environment_git("approval_commit_failed", error))?;
+        effects
+            .before_late_read(project, slug, tries)
+            .map_err(|detail| controller_error("approval_effect_failed", detail))?;
         let late_intent = read_source(&intent_path)
             .map_err(|_| hash_mismatch(slug, "unavailable", given_hash.unwrap_or_default()))?;
         let late_acceptance = read_source(&source_path)
@@ -307,6 +348,16 @@ fn approve_inner(
                 given_hash.unwrap_or_default(),
             ));
         }
+        if project_uses_witness(project) && approval.witness.is_none() {
+            return Err(intent_error(
+                "unproven",
+                "the witness is not proven",
+                ExitCode::Negative,
+            ));
+        }
+        effects
+            .before_ref_cas(project, slug, tries, parent.as_deref())
+            .map_err(|detail| controller_error("approval_effect_failed", detail))?;
         if origin
             .cas_ref(&ref_name, &commit, parent.as_deref())
             .map_err(|error| environment_git("approval_ref_update_failed", error))?

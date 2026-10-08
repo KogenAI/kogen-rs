@@ -456,6 +456,30 @@ pub(super) fn base_acceptance(
     Ok(result)
 }
 
+pub(super) fn base_acceptance_environment_error(
+    options: &BuildOptions,
+    result: &crate::gate::CommandAcceptanceResult,
+) -> Option<CoreError> {
+    if options.adapter == "exunit"
+        && !result.process.timed_out
+        && (result.process.unavailable
+            || result.process.exit_status.is_some_and(|status| status != 0))
+        && let Some(failure) =
+            crate::gate::adapters::exunit::process_environment_failure(&result.process, true)
+    {
+        return Some(environment_error(failure.reason, failure.detail));
+    }
+    result
+        .failures
+        .contains(&crate::gate::AcceptanceFailure::ToolMissing)
+        .then(|| {
+            environment_error(
+                "tool_missing",
+                "acceptance runner is unavailable on the build base",
+            )
+        })
+}
+
 pub(super) fn protected_workspace(
     project: &ProjectResolution,
     approved: &ApprovedBuild,

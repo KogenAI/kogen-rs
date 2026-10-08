@@ -579,14 +579,8 @@ fn run_rung(
         run_dir,
         &base_env,
     )?;
-    if base_acceptance
-        .failures
-        .contains(&crate::gate::AcceptanceFailure::ToolMissing)
-    {
-        return Err(environment_error(
-            "tool_missing",
-            "acceptance runner is unavailable on the build base",
-        ));
+    if let Some(error) = support::base_acceptance_environment_error(options, &base_acceptance) {
+        return Err(error);
     }
     let acceptance_text = base_acceptance_text(approved, &base_acceptance);
     provider.record_event(snapshot,
@@ -1663,16 +1657,10 @@ pub(super) fn run_witness_build(
         run_dir,
         &base_env,
     )?;
-    if base_acceptance
-        .failures
-        .contains(&crate::gate::AcceptanceFailure::ToolMissing)
-    {
+    if let Some(error) = support::base_acceptance_environment_error(options, &base_acceptance) {
         cleanup_path(base.workspace());
         cleanup_path(candidate.workspace());
-        return Err(environment_error(
-            "tool_missing",
-            "acceptance runner is unavailable on the build base",
-        ));
+        return Err(error);
     }
     let acceptance_text = base_acceptance_text(approved, &base_acceptance);
     provider.record_event(snapshot,

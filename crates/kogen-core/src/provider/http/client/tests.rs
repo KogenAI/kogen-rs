@@ -57,8 +57,12 @@ fn attempt(response: Result<ModelResponse, ProviderFailure>, items: Vec<Value>) 
     HttpAttempt {
         response,
         received_items: items,
+        first_byte_ms: None,
         elapsed_ms: 7,
         body_bytes_received: 32,
+        status_code: None,
+        raw_usage: None,
+        response_model: None,
         sticky_routing_token: None,
     }
 }

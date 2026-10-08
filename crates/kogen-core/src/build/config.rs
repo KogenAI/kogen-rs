@@ -25,6 +25,7 @@ pub(super) struct BuildOptions {
     pub rung3_model: String,
     pub rung3_effort: String,
     pub fallback_on: bool,
+    pub context_packet: bool,
     pub wall_ms: u64,
     pub tool_tokens: u64,
     pub model_generation_tokens: Option<u64>,
@@ -75,6 +76,7 @@ impl BuildOptions {
             .unwrap_or("green-or-advisory")
             .to_owned();
         let fallback_on = bool_value(project, machine, "model_fallback").unwrap_or(true);
+        let context_packet = bool_value(project, machine, "context_packet").unwrap_or(false);
         let wall_ms = integer_value(project, machine, "budget_ms")
             .or_else(|| integer_value(project, machine, "wall_minutes").map(|m| m * 60_000))
             .unwrap_or(3_600_000);
@@ -118,6 +120,7 @@ impl BuildOptions {
             rung3_model: rung3.0,
             rung3_effort: rung3.1,
             fallback_on,
+            context_packet,
             wall_ms,
             tool_tokens,
             model_generation_tokens,

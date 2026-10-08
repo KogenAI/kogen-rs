@@ -1,7 +1,6 @@
 mod xspec;
 
 use kogen_core::provider::http::retry::RetryReplay;
-use kogen_core::provider::session::replay::SessionReplay;
 use serde::Serialize;
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
@@ -31,7 +30,7 @@ fn main() {
 
     match slice.as_str() {
         "stream" => run_replay(RetryReplay::default()),
-        "session" => run_replay(SessionReplay::default()),
+        "session" => run_replay(xspec::SessionReplay::default()),
         "intent" | "approve" | "queue" | "setup-cache" | "status" | "recovery" | "rebase"
         | "orchestration" | "gate" => run_private(&slice),
         _ => legacy_fail(&format!("unsupported slice {slice:?}")),
@@ -47,16 +46,18 @@ fn run_replay<S: Transition>(state: S) {
 }
 
 trait Transition: Default + Serialize {
-    fn apply(&mut self, tag: &str, value: Option<&Value>);
-    fn reset(&mut self) {
+    fn apply(&mut self, tag: &str, value: Option<&Value>) -> Result<(), String>;
+    fn reset(&mut self) -> Result<(), String> {
         *self = Self::default();
+        Ok(())
     }
     fn known_tag(tag: &str) -> bool;
 }
 
 impl Transition for RetryReplay {
-    fn apply(&mut self, tag: &str, value: Option<&Value>) {
+    fn apply(&mut self, tag: &str, value: Option<&Value>) -> Result<(), String> {
         RetryReplay::apply(self, tag, value);
+        Ok(())
     }
 
     fn known_tag(tag: &str) -> bool {
@@ -64,9 +65,13 @@ impl Transition for RetryReplay {
     }
 }
 
-impl Transition for SessionReplay {
-    fn apply(&mut self, tag: &str, value: Option<&Value>) {
-        SessionReplay::apply(self, tag, value);
+impl Transition for xspec::SessionReplay {
+    fn apply(&mut self, tag: &str, value: Option<&Value>) -> Result<(), String> {
+        xspec::SessionReplay::apply(self, tag, value)
+    }
+
+    fn reset(&mut self) -> Result<(), String> {
+        xspec::SessionReplay::reset(self)
     }
 
     fn known_tag(tag: &str) -> bool {
@@ -85,6 +90,8 @@ impl Transition for SessionReplay {
                 | "Previous"
                 | "Lite"
                 | "NewRun"
+                | "AffinityScope"
+                | "Prefix"
         )
     }
 }
@@ -100,7 +107,7 @@ where
         let request: Value = serde_json::from_str(&line)
             .map_err(|error| format!("invalid JSON on line {}: {error}", line_number + 1))?;
         match request.get("op").and_then(Value::as_str) {
-            Some("reset") => state.reset(),
+            Some("reset") => state.reset()?,
             Some("apply") => {
                 let event = request
                     .get("event")
@@ -115,7 +122,7 @@ where
                         line_number + 1
                     ));
                 }
-                state.apply(tag, event.get("value"));
+                state.apply(tag, event.get("value"))?;
             }
             Some(operation) => {
                 return Err(format!(

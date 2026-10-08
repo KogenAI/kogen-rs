@@ -2,8 +2,9 @@ use super::approval::ApprovedBuild;
 use super::config::BuildOptions;
 use super::provider_error::provider_error;
 use super::provider_prompt::{
-    append_transcript, auditor_instructions, builder_instructions, builder_message, now_ms,
-    planner_instructions, user_item, workspace_changed, workspace_tree,
+    append_context_packet, append_transcript, auditor_instructions, builder_instructions,
+    builder_message, now_ms, planner_instructions, public_context_packet, user_item,
+    workspace_changed, workspace_tree,
 };
 use crate::error::CoreError;
 use crate::project::ProjectResolution;
@@ -417,6 +418,12 @@ impl<'a> BuildProvider<'a> {
         let mut session = if let Some(session) = existing {
             session
         } else {
+            let initial_message = if self.options.context_packet {
+                let packet = public_context_packet(workspace, &self.approved.intent_bytes);
+                append_context_packet(first_message, &packet)
+            } else {
+                first_message.to_owned()
+            };
             let context = self.request_context(
                 run_dir,
                 "develop",
@@ -425,7 +432,7 @@ impl<'a> BuildProvider<'a> {
                 model,
                 effort,
                 builder_instructions(recipe_direct),
-                vec![user_item(first_message)],
+                vec![user_item(&initial_message)],
                 callable.iter().map(|name| (*name).to_owned()).collect(),
                 true,
             )?;
@@ -991,6 +998,44 @@ mod tests {
     use serde_json::{Value, json};
     use serde_yaml::Value as YamlValue;
     use url::Url;
+
+    #[test]
+    fn context_packet_defaults_off_and_can_be_enabled_by_project_or_machine_config() {
+        let project = |yaml: &str| ProjectResolution {
+            checkout: Default::default(),
+            origin: Default::default(),
+            base: "main".to_owned(),
+            state_root: Default::default(),
+            config: Some(ProjectConfig {
+                name: "fixture".to_owned(),
+                base: None,
+                raw: serde_yaml::from_str(yaml).expect("parse project config"),
+            }),
+        };
+
+        let defaults = BuildOptions::load_with_machine(&project("build: {}"), &None)
+            .expect("load default options");
+        assert!(!defaults.context_packet);
+
+        let project_enabled =
+            BuildOptions::load_with_machine(&project("build:\n  context_packet: true\n"), &None)
+                .expect("load project option");
+        assert!(project_enabled.context_packet);
+
+        let machine = Some(
+            serde_yaml::from_str("context_packet: true\n").expect("parse machine build config"),
+        );
+        let machine_enabled = BuildOptions::load_with_machine(&project("build: {}"), &machine)
+            .expect("load machine option");
+        assert!(machine_enabled.context_packet);
+
+        let project_override = BuildOptions::load_with_machine(
+            &project("build:\n  context_packet: false\n"),
+            &machine,
+        )
+        .expect("load project override");
+        assert!(!project_override.context_packet);
+    }
 
     #[test]
     fn restored_protected_paths_are_appended_after_tool_results() {

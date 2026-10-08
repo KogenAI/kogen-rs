@@ -2,10 +2,10 @@
 
 use super::super::audit;
 use super::super::validation::{self, ValidationFailure};
-use super::checkout_lock::CheckoutLock;
 use super::execute::{PassResult, RunState};
 use super::files::write_json;
 use crate::intent;
+use crate::project::CheckoutLock;
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -16,7 +16,7 @@ pub(super) fn validate_pass(
     final_text: &str,
     style_repairs: usize,
 ) -> Result<PassResult, crate::error::CoreError> {
-    let _lock = CheckoutLock::acquire(&state.options.home, &state.checkout)?;
+    let _lock = CheckoutLock::acquire(&state.state_root, &state.checkout)?;
     add_concerns(state, final_text);
     let generated = fs::read(&state.intent_path)
         .map_err(|error| super::files::io_error("shape_output_unavailable", error))?;

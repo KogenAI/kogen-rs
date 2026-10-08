@@ -6,25 +6,42 @@ mod orchestration;
 mod queue;
 mod rebase;
 mod recovery;
+mod session;
 mod setup_cache;
 mod status;
 mod temp;
 
+pub(super) use session::SessionReplay;
+
 use kogen_core::queue::QueueScheduler;
 use serde_json::{Value, json};
-use temp::{ApprovalSummary, SourceBytes, TempProject};
+use std::collections::BTreeMap;
+use temp::TempProject;
 
 pub struct Adapter {
     slice: Slice,
     state: Value,
+    approval_aliases: BTreeMap<String, ApprovalAlias>,
+    intent_hash_aliases: BTreeMap<String, String>,
     project: TempProject,
     queue: QueueScheduler,
+    stream: kogen_core::provider::http::retry::RetryReplay,
+    session: SessionReplay,
     setup_cache: setup_cache::Replay,
     status: kogen_core::status::StatusReplay,
     recovery: kogen_core::recovery::RecoveryModel,
     landing: kogen_core::git::landing::LandingModel,
     orchestration: kogen_core::run::orchestration::replay::OrchestrationReplay,
     gate: kogen_core::run::orchestration::GateReplay,
+}
+
+#[derive(Clone)]
+struct ApprovalAlias {
+    sha: String,
+    actual_sha: String,
+    commit: String,
+    base: String,
+    actual_commit: String,
 }
 
 #[derive(Clone, Copy)]
@@ -36,6 +53,8 @@ enum Slice {
     Status,
     Recovery,
     Rebase,
+    Stream,
+    Session,
     Orchestration,
     Gate,
 }
@@ -50,6 +69,8 @@ impl Adapter {
             "status" => Slice::Status,
             "recovery" => Slice::Recovery,
             "rebase" => Slice::Rebase,
+            "stream" => Slice::Stream,
+            "session" => Slice::Session,
             "orchestration" => Slice::Orchestration,
             "gate" => Slice::Gate,
             _ => return Err(format!("unknown private slice `{name}`")),
@@ -60,8 +81,12 @@ impl Adapter {
         Ok(Self {
             slice,
             state,
+            approval_aliases: BTreeMap::new(),
+            intent_hash_aliases: BTreeMap::new(),
             project,
             queue: QueueScheduler::new(),
+            stream: kogen_core::provider::http::retry::RetryReplay::default(),
+            session: SessionReplay::default(),
             setup_cache,
             status: kogen_core::status::StatusReplay::new(),
             recovery: kogen_core::recovery::RecoveryModel::new(),
@@ -91,6 +116,16 @@ impl Adapter {
                         Slice::Intent => intent::apply(self, &event),
                         Slice::Approve => approve::apply(self, &event),
                         Slice::Queue => queue::apply(&mut self.queue, &event),
+                        Slice::Stream => {
+                            self.stream
+                                .apply(string(&event, "tag")?, event.get("value"));
+                            self.observation()
+                        }
+                        Slice::Session => {
+                            self.session
+                                .apply(string(&event, "tag")?, event.get("value"))?;
+                            self.observation()
+                        }
                         Slice::SetupCache => self.setup_cache.apply(&event),
                         Slice::Status => status::apply(&mut self.status, &event),
                         Slice::Recovery => recovery::apply(&mut self.recovery, &event),
@@ -113,6 +148,14 @@ impl Adapter {
         if matches!(self.slice, Slice::Intent | Slice::Approve) {
             self.project.reset()?;
         }
+        if matches!(self.slice, Slice::Stream) {
+            self.stream = kogen_core::provider::http::retry::RetryReplay::default();
+        }
+        if matches!(self.slice, Slice::Session) {
+            self.session.reset()?;
+        }
+        self.approval_aliases.clear();
+        self.intent_hash_aliases.clear();
         self.state = initial_state(self.slice);
         self.queue = QueueScheduler::new();
         self.status = kogen_core::status::StatusReplay::new();
@@ -120,32 +163,47 @@ impl Adapter {
         self.landing = kogen_core::git::landing::LandingModel::new();
         self.orchestration = kogen_core::run::orchestration::replay::OrchestrationReplay::new();
         self.gate = kogen_core::run::orchestration::GateReplay::new();
-        Ok(self.observation())
+        self.observation()
     }
 
-    fn observation(&self) -> Value {
+    fn observation(&self) -> Result<Value, String> {
         match self.slice {
             Slice::Intent => intent::observe(self),
             Slice::Approve => approve::observe(self),
-            Slice::Queue => serde_json::to_value(self.queue.observe())
-                .expect("queue observations are serializable"),
-            Slice::SetupCache => self.setup_cache.observe(),
-            Slice::Status => serde_json::to_value(self.status.observe())
-                .expect("status observations are serializable"),
-            Slice::Recovery => serde_json::to_value(self.recovery.observe())
-                .expect("recovery observations are serializable"),
-            Slice::Rebase => serde_json::to_value(self.landing.observe())
-                .expect("landing observations are serializable"),
-            Slice::Orchestration => orchestration::observe(&self.orchestration),
-            Slice::Gate => gate::observe(&self.gate),
+            Slice::Queue => Ok(serde_json::to_value(self.queue.observe())
+                .expect("queue observations are serializable")),
+            Slice::Stream => {
+                Ok(serde_json::to_value(&self.stream)
+                    .expect("stream observations are serializable"))
+            }
+            Slice::Session => {
+                Ok(serde_json::to_value(&self.session)
+                    .expect("session observations are serializable"))
+            }
+            Slice::SetupCache => Ok(self.setup_cache.observe()),
+            Slice::Status => Ok(serde_json::to_value(self.status.observe())
+                .expect("status observations are serializable")),
+            Slice::Recovery => Ok(serde_json::to_value(self.recovery.observe())
+                .expect("recovery observations are serializable")),
+            Slice::Rebase => Ok(serde_json::to_value(self.landing.observe())
+                .expect("landing observations are serializable")),
+            Slice::Orchestration => Ok(orchestration::observe(&self.orchestration)),
+            Slice::Gate => Ok(gate::observe(&self.gate)),
         }
     }
 }
 
 fn initial_state(slice: Slice) -> Value {
     match slice {
-        Slice::Intent => kogen_core::approval::replay::intent_initial(),
-        Slice::Approve => kogen_core::approval::replay::approve_initial(),
+        Slice::Intent => json!({
+            "last": "ok", "exit": 0, "did": "", "shown": "", "casTries": 0,
+            "life": {}, "refs": {},
+        }),
+        Slice::Approve => json!({
+            "last": "ok", "exit": 0, "sha8": "", "approver": "", "feas": "",
+            "bwarn": false, "lwarn": false, "ran": false, "checkRuns": 0,
+            "cache": ["", ""], "approvals": {},
+        }),
         Slice::Queue => Value::Null,
         Slice::SetupCache => serde_json::json!({
             "entryCount": 0,
@@ -155,7 +213,12 @@ fn initial_state(slice: Slice) -> Value {
             "setupRuns": 0,
             "last": "ok",
         }),
-        Slice::Status | Slice::Recovery | Slice::Orchestration | Slice::Gate => Value::Null,
+        Slice::Status
+        | Slice::Recovery
+        | Slice::Stream
+        | Slice::Session
+        | Slice::Orchestration
+        | Slice::Gate => Value::Null,
         Slice::Rebase => json!(kogen_core::git::landing::LandingModel::new().observe()),
     }
 }
@@ -179,16 +242,4 @@ fn boolean(value: &Value, key: &str) -> Result<bool, String> {
         .get(key)
         .and_then(Value::as_bool)
         .ok_or_else(|| format!("event requires boolean field `{key}`"))
-}
-
-fn value_with(event: &Value, value: Value) -> Value {
-    let mut event = event.clone();
-    if let Some(map) = event.as_object_mut() {
-        map.insert("value".to_owned(), value);
-    }
-    event
-}
-
-fn empty_observation() -> Value {
-    json!({})
 }
