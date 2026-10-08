@@ -15,12 +15,11 @@ use crate::ExitCode;
 use crate::error::{CliOutput, CoreError};
 use crate::git::GitRepo;
 use crate::intent::{Intent, approval_sha256, intent_sha256};
-use crate::project::{CheckoutLock, ProjectResolution, valid_slug};
+use crate::project::{ProjectResolution, valid_slug};
 use checks::{check_error, run_setup_and_baseline, stage_and_check};
 use manifest::{baseline_warning, protected_manifest, witness};
 use model::ApprovalDocument;
 use render::{ApprovalCard, render_card, render_warning_prefix};
-use std::fs;
 use support::*;
 
 const NEXT_LINE: &str = "Next: kogen queue start (does nothing if the queue is already running)";
@@ -220,17 +219,6 @@ fn approve_inner(
 
     let candidate_relative = acceptance_candidate_path(project, slug);
     let candidate = project.checkout.join(&candidate_relative);
-    {
-        let _lock = CheckoutLock::acquire(&project.state_root, &project.checkout)?;
-        if fs::symlink_metadata(&candidate).is_ok() {
-            return Err(environment_error(
-                "acceptance_check_path_conflict",
-                candidate_relative,
-                ExitCode::Environment,
-            ));
-        }
-    }
-
     let check_outcome =
         run_setup_and_baseline(project, &base_sha, run_dir.clone()).map_err(check_error)?;
     stage_and_check(

@@ -150,3 +150,61 @@ pub(crate) fn check_error(error: CheckError) -> CoreError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn staging_waits_for_checkout_lock_and_cleans_up_before_releasing_it() {
+        let root = std::env::temp_dir().join(format!(
+            "kogen-approval-stage-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let checkout = root.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let project = ProjectResolution {
+            checkout: checkout.clone(),
+            origin: checkout.clone(),
+            base: "main".to_owned(),
+            state_root: root.join("state"),
+            config: None,
+        };
+        let candidate = checkout.join("test/acceptance/greet.t.sh");
+        let check = CheckOutcome {
+            rows: Vec::new(),
+            run_dir: root.join("run"),
+            env: BTreeMap::new(),
+        };
+        let lock = CheckoutLock::acquire(&project.state_root, &checkout).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let staged = candidate.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = stage_and_check(
+                &project,
+                &staged,
+                "test/acceptance/greet.t.sh",
+                b"test bytes",
+                &check,
+            );
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(!candidate.exists());
+        drop(lock);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(!candidate.exists());
+        assert!(!candidate.parent().unwrap().exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
