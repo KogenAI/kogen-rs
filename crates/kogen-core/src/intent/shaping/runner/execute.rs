@@ -542,7 +542,7 @@ impl RunState<'_> {
                         &turn.call.model,
                         &turn.call.effort,
                         turn.http_attempts,
-                        &turn.call.usage,
+                        &turn.usages,
                     );
                     turn
                 }
@@ -553,7 +553,7 @@ impl RunState<'_> {
                         model,
                         effort,
                         failure.http_attempts,
-                        failure.usage.as_ref(),
+                        &failure.usages,
                     );
                     return Err(failure.error);
                 }
@@ -629,7 +629,7 @@ impl RunState<'_> {
                     &turn.call.model,
                     &turn.call.effort,
                     turn.http_attempts,
-                    &turn.call.usage,
+                    &turn.usages,
                 );
                 turn
             }
@@ -640,7 +640,7 @@ impl RunState<'_> {
                     session.effective_model(),
                     session.effective_effort(),
                     failure.http_attempts,
-                    failure.usage.as_ref(),
+                    &failure.usages,
                 );
                 return Err(failure.error);
             }

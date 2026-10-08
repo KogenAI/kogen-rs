@@ -143,9 +143,9 @@ impl ShapeAccounting {
         model: &str,
         effort: &str,
         attempts: usize,
-        usage: &ModelUsage,
+        usages: &[ModelUsage],
     ) {
-        self.record_turn(id, role, model, effort, attempts, Some(usage));
+        self.record_turn(id, role, model, effort, attempts, usages);
     }
 
     pub(super) fn record_failure(
@@ -155,9 +155,9 @@ impl ShapeAccounting {
         model: &str,
         effort: &str,
         attempts: usize,
-        usage: Option<&ModelUsage>,
+        usages: &[ModelUsage],
     ) {
-        self.record_turn(id, role, model, effort, attempts, usage);
+        self.record_turn(id, role, model, effort, attempts, usages);
     }
 
     fn record_turn(
@@ -167,7 +167,7 @@ impl ShapeAccounting {
         model: &str,
         effort: &str,
         attempts: usize,
-        usage: Option<&ModelUsage>,
+        usages: &[ModelUsage],
     ) {
         let role_totals = self.roles.entry(role.to_owned()).or_default();
         role_totals.effective_role = role.to_owned();
@@ -189,20 +189,16 @@ impl ShapeAccounting {
         }
 
         self.http_attempts = self.http_attempts.saturating_add(attempts);
-        if let Some(usage) = usage {
-            if attempts > 0 {
-                self.unknown_usage_attempts = self
-                    .unknown_usage_attempts
-                    .saturating_add(attempts.saturating_sub(1));
-            }
+        for usage in usages.iter().take(attempts) {
             role_totals.tokens.add(usage);
             self.tokens.add(usage);
-            if attempts > 0 && usage_is_unknown(usage) {
+            if usage_is_unknown(usage) {
                 self.unknown_usage_attempts = self.unknown_usage_attempts.saturating_add(1);
             }
-        } else {
-            self.unknown_usage_attempts = self.unknown_usage_attempts.saturating_add(attempts);
         }
+        self.unknown_usage_attempts = self
+            .unknown_usage_attempts
+            .saturating_add(attempts.saturating_sub(usages.len()));
     }
 
     pub(super) fn validation_pass(&mut self) {
@@ -342,13 +338,32 @@ mod tests {
             "gpt-6.1-sol",
             "high",
             2,
-            &ModelUsage {
-                input: Some(10),
-                output: Some(4),
-                ..ModelUsage::default()
-            },
+            &[
+                ModelUsage {
+                    input: Some(3),
+                    ..ModelUsage::default()
+                },
+                ModelUsage {
+                    input: Some(10),
+                    output: Some(4),
+                    ..ModelUsage::default()
+                },
+            ],
         );
-        accounting.record_failure("thread-1", "shaper", "gpt-6.1-sol", "high", 2, None);
+        accounting.record_failure(
+            "thread-1",
+            "shaper",
+            "gpt-6.1-sol",
+            "high",
+            2,
+            &[
+                ModelUsage::default(),
+                ModelUsage {
+                    input: Some(5),
+                    ..ModelUsage::default()
+                },
+            ],
+        );
         accounting.validation_pass();
         accounting.repair("validation");
         let error = CoreError::new(
@@ -368,8 +383,8 @@ mod tests {
         assert_eq!(receipt["validation_passes"], 1);
         assert_eq!(receipt["roles"]["shaper"]["logical_turns"], 2);
         assert_eq!(receipt["http_attempts"]["total"], 4);
-        assert_eq!(receipt["http_attempts"]["unknown_usage_attempts"], 3);
-        assert_eq!(receipt["tokens"]["input"], 10);
+        assert_eq!(receipt["http_attempts"]["unknown_usage_attempts"], 1);
+        assert_eq!(receipt["tokens"]["input"], 18);
         assert_eq!(receipt["terminal_reason"], "undeclared_gate_path");
         assert_eq!(
             receipt["diagnostic"],

@@ -70,7 +70,7 @@ impl ShapeProvider {
                     crate::ExitCode::Negative,
                 ),
                 http_attempts: 0,
-                usage: None,
+                usages: Vec::new(),
             }));
         }
         let credential = auth::credential_for_request(&self.home, &self.account)
@@ -105,14 +105,14 @@ impl ShapeProvider {
         let ended_at_ms = unix_ms().max(started_at_ms);
         let call = result.map_err(|failure| {
             let http_attempts = failure.attempts.len();
-            let usage = failure.failure.usage.as_deref().cloned();
             Box::new(ShapeTurnFailure {
                 error: provider_failure(*failure.failure),
                 http_attempts,
-                usage,
+                usages: failure.usages,
             })
         })?;
         let http_attempts = call.attempts.len();
+        let usages = call.usages;
         let wire = call.attempts.last().ok_or_else(|| {
             ShapeTurnFailure::without_attempts(CoreError::new(
                 ErrorClass::Provider,
@@ -149,6 +149,7 @@ impl ShapeProvider {
             response,
             call,
             http_attempts,
+            usages,
         })
     }
 }
@@ -236,12 +237,13 @@ pub(super) struct ShapeTurn {
     pub response: ModelResponse,
     pub call: ShapeModelCall,
     pub http_attempts: usize,
+    pub usages: Vec<ModelUsage>,
 }
 
 pub(super) struct ShapeTurnFailure {
     pub error: CoreError,
     pub http_attempts: usize,
-    pub usage: Option<ModelUsage>,
+    pub usages: Vec<ModelUsage>,
 }
 
 impl ShapeTurnFailure {
@@ -249,7 +251,7 @@ impl ShapeTurnFailure {
         Box::new(Self {
             error,
             http_attempts: 0,
-            usage: None,
+            usages: Vec::new(),
         })
     }
 }
