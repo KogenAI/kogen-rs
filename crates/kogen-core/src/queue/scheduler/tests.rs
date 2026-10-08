@@ -63,19 +63,20 @@ fn same_hash_reapproval_is_one_attempt_in_a_drain() {
 }
 
 #[test]
-fn failed_provider_continues_but_stopped_provider_stays_queued() {
+fn provider_exhaustion_stops_with_current_and_next_approval_queued() {
     let mut queue = QueueScheduler::new();
     enqueue(&mut queue, "alpha", 1, 0, "a");
     enqueue(&mut queue, "bravo", 2, 0, "b");
     queue.apply(Event::Start);
-    let failed = queue.apply(Event::Outcome(Outcome::FailedProvider));
-    assert_eq!(failed.current, "bravo");
-    assert!(failed.held);
-
     let stopped = queue.apply(Event::Outcome(Outcome::StoppedProvider));
     assert_eq!(stopped.line, "stopped_because");
     assert_eq!(stopped.exit, 4);
-    assert_eq!(stopped.queue, ["bravo"]);
+    assert_eq!(stopped.current, "");
+    assert_eq!(stopped.queue, ["alpha", "bravo"]);
+    assert_eq!(stopped.built, 1);
+    let resumed = queue.apply(Event::Start);
+    assert_eq!(resumed.current, "alpha");
+    assert_eq!(resumed.queue, ["bravo"]);
 }
 
 #[test]

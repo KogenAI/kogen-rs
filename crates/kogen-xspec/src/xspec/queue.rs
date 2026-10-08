@@ -62,7 +62,6 @@ fn outcome(kind: &str) -> DrainOutcome {
     match kind {
         "landed" => DrainOutcome::Landed,
         "failed" => DrainOutcome::Failed,
-        "failed_provider" => DrainOutcome::FailedProvider,
         "parked" => DrainOutcome::Parked,
         "stopped_environment" => DrainOutcome::StoppedEnvironment,
         "stopped_provider" => DrainOutcome::StoppedProvider,

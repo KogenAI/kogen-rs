@@ -43,7 +43,6 @@ impl QueueApproval {
 pub enum DrainOutcome {
     Landed,
     Failed,
-    FailedProvider,
     Parked,
     StoppedEnvironment,
     StoppedProvider,
@@ -209,10 +208,7 @@ impl QueueScheduler {
                 self.drop_current();
                 self.launch();
             }
-            DrainOutcome::Landed
-            | DrainOutcome::Failed
-            | DrainOutcome::FailedProvider
-            | DrainOutcome::Parked => {
+            DrainOutcome::Landed | DrainOutcome::Failed | DrainOutcome::Parked => {
                 self.built += 1;
                 if outcome == DrainOutcome::Landed {
                     self.landed += 1;

@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_limit_pauses_even_when_credentials_cannot_be_refreshed() {
+    fn usage_limit_pauses_without_refresh_even_with_refreshable_credentials() {
         let mut replay = RetryReplay::default();
         replay.apply(
             "Open",
@@ -391,7 +391,7 @@ mod tests {
                 "model":"luna",
                 "mode":"build",
                 "fallbackOn":false,
-                "refreshable":false,
+                "refreshable":true,
                 "bounded":true,
                 "wall":100_000
             })),
@@ -402,6 +402,17 @@ mod tests {
         assert_eq!(replay.decision, "pause");
         assert_eq!(replay.delay, 300_000);
         assert_eq!(replay.waited, 300_000);
+        assert!(!replay.refreshed);
+        replay.apply(
+            "Open",
+            Some(&json!({
+                "role":"builder", "model":"luna", "mode":"build",
+                "fallbackOn":false, "refreshable":true, "bounded":true, "wall":100_000
+            })),
+        );
+        replay.apply("Result", Some(&json!({"kind":"usage_limit"})));
+        assert_eq!(replay.waited, 600_000);
+        assert!(!replay.refreshed);
     }
 
     #[test]
