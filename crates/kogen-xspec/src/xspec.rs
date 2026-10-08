@@ -24,6 +24,7 @@ pub struct Adapter {
     approval_aliases: BTreeMap<String, ApprovalAlias>,
     intent_hash_aliases: BTreeMap<String, String>,
     project: TempProject,
+    project_resets: usize,
     queue: QueueScheduler,
     stream: kogen_core::provider::http::retry::RetryReplay,
     session: SessionReplay,
@@ -84,6 +85,7 @@ impl Adapter {
             approval_aliases: BTreeMap::new(),
             intent_hash_aliases: BTreeMap::new(),
             project,
+            project_resets: 0,
             queue: QueueScheduler::new(),
             stream: kogen_core::provider::http::retry::RetryReplay::default(),
             session: SessionReplay::default(),
@@ -145,8 +147,12 @@ impl Adapter {
         if matches!(self.slice, Slice::SetupCache) {
             return self.setup_cache.reset();
         }
-        if matches!(self.slice, Slice::Intent | Slice::Approve) {
+        if matches!(self.slice, Slice::Approve) && self.project_resets == 40 {
+            self.project = TempProject::new()?;
+            self.project_resets = 0;
+        } else if matches!(self.slice, Slice::Intent | Slice::Approve) {
             self.project.reset()?;
+            self.project_resets += 1;
         }
         if matches!(self.slice, Slice::Stream) {
             self.stream = kogen_core::provider::http::retry::RetryReplay::default();
@@ -242,4 +248,24 @@ fn boolean(value: &Value, key: &str) -> Result<bool, String> {
         .get(key)
         .and_then(Value::as_bool)
         .ok_or_else(|| format!("event requires boolean field `{key}`"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Adapter;
+    use serde_json::json;
+
+    #[test]
+    fn approval_replay_replaces_accumulated_git_fixture_without_changing_reset_state() {
+        let mut adapter = Adapter::new("approve").unwrap();
+        let first_root = adapter.project.root().to_path_buf();
+        for _ in 0..41 {
+            let observation = adapter.handle(json!({"op":"reset"})).unwrap();
+            assert_eq!(observation["approvals"], json!({}));
+            assert_eq!(observation["last"], "ok");
+        }
+        assert!(!first_root.exists());
+        assert!(adapter.project.root().exists());
+        assert_ne!(adapter.project.root(), first_root);
+    }
 }

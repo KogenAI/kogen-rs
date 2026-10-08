@@ -29,6 +29,11 @@ pub(super) struct SourceBytes {
 }
 
 impl TempProject {
+    #[cfg(test)]
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(super) fn new() -> Result<Self, String> {
         let id = NEXT_PROJECT.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("kogen-xspec-{}-{id}", std::process::id()));
