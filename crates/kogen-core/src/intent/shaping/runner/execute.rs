@@ -77,6 +77,7 @@ fn run_in_directory(
         home: Some(options.home.clone()),
     })
     .map_err(project_error)?;
+    accounting.set_state_receipt(&project.state_root, &run_dir);
     let config = project.config.as_ref();
     let intent_rel = format!(".kogen/intents/{}/intent.md", options.slug);
     let intent_path = project.checkout.join(&intent_rel);

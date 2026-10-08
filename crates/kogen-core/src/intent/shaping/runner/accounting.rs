@@ -61,10 +61,13 @@ struct Conversation {
     effective_effort: String,
     logical_turns: usize,
     http_attempts: usize,
+    validation_passes: usize,
+    style_repairs: usize,
 }
 
 pub(super) struct ShapeAccounting {
     path: PathBuf,
+    state_path: Option<PathBuf>,
     started: Instant,
     provider: Option<String>,
     roles: BTreeMap<String, RoleTotals>,
@@ -84,6 +87,7 @@ impl ShapeAccounting {
     pub(super) fn new(run_dir: &Path, started: Instant) -> Self {
         Self {
             path: run_dir.join("shape-accounting.json"),
+            state_path: None,
             started,
             provider: None,
             roles: BTreeMap::new(),
@@ -102,6 +106,15 @@ impl ShapeAccounting {
 
     pub(super) fn set_provider(&mut self, provider: &str) {
         self.provider = Some(provider.to_owned());
+    }
+
+    pub(super) fn set_state_receipt(&mut self, state_root: &Path, run_dir: &Path) {
+        self.state_path = Some(
+            state_root
+                .join("shaping")
+                .join(run_dir.file_name().expect("Shape run identity"))
+                .join("shape-accounting.json"),
+        );
     }
 
     pub(super) fn set_role(&mut self, role: &str, assigned_role: &str, model: &str, effort: &str) {
@@ -133,6 +146,8 @@ impl ShapeAccounting {
             effective_effort: effort.to_owned(),
             logical_turns: 0,
             http_attempts: 0,
+            validation_passes: 0,
+            style_repairs: 0,
         });
     }
 
@@ -203,6 +218,9 @@ impl ShapeAccounting {
 
     pub(super) fn validation_pass(&mut self) {
         self.validation_passes = self.validation_passes.saturating_add(1);
+        if let Some(conversation) = self.active_shaper() {
+            conversation.validation_passes = conversation.validation_passes.saturating_add(1);
+        }
     }
 
     pub(super) fn validation_passes(&self) -> usize {
@@ -216,6 +234,20 @@ impl ShapeAccounting {
     pub(super) fn repair(&mut self, kind: &str) {
         let count = self.repairs_by_kind.entry(kind.to_owned()).or_default();
         *count = count.saturating_add(1);
+        if kind == "style"
+            && let Some(conversation) = self.active_shaper()
+        {
+            conversation.style_repairs = conversation.style_repairs.saturating_add(1);
+        }
+    }
+
+    fn active_shaper(&mut self) -> Option<&mut Conversation> {
+        self.conversations.iter_mut().rev().find(|conversation| {
+            matches!(
+                conversation.effective_role.as_str(),
+                "shaper" | "fallback_shaper"
+            )
+        })
     }
 
     pub(super) fn finish(&mut self, result: &Result<impl Sized, CoreError>) {
@@ -268,6 +300,8 @@ impl ShapeAccounting {
                     "effective_effort": conversation.effective_effort,
                     "logical_turns": conversation.logical_turns,
                     "http_attempts": conversation.http_attempts,
+                    "validation_passes": conversation.validation_passes,
+                    "style_repairs": conversation.style_repairs,
                 })
             })
             .collect::<Vec<_>>();
@@ -293,7 +327,56 @@ impl ShapeAccounting {
             "diagnostic": self.diagnostic,
         });
         super::files::write_json(&self.path, &value)?;
-        super::files::secure_file(&self.path)
+        super::files::secure_file(&self.path)?;
+        if let Some(path) = &self.state_path {
+            let parent = path.parent().expect("state receipt has parent");
+            std::fs::create_dir_all(parent)
+                .map_err(|error| super::files::io_error("shape_accounting_unavailable", error))?;
+            super::files::secure_dir(parent)?;
+            let state_conversations = self
+                .conversations
+                .iter()
+                .filter(|conversation| {
+                    matches!(
+                        conversation.effective_role.as_str(),
+                        "shaper" | "fallback_shaper"
+                    )
+                })
+                .map(|conversation| {
+                    json!({
+                        "conversation_id": conversation.id,
+                        "role": conversation.effective_role,
+                        "model": conversation.effective_model,
+                        "effort": conversation.effective_effort,
+                        "logical_turns": conversation.logical_turns,
+                        "validation_passes": conversation.validation_passes,
+                        "style_repairs": conversation.style_repairs,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let state_value = json!({
+                "schema": 1,
+                "profile": PROFILE,
+                "outcome": self.outcome.unwrap_or("failure"),
+                "conversations": state_conversations,
+                "roles": self.roles.iter().map(|(role, totals)| (role.clone(), json!(totals.logical_turns))).collect::<serde_json::Map<_, _>>(),
+                "http_attempts": self.http_attempts,
+                "validation_passes": self.validation_passes,
+                "finish_guards": self.finish_guards,
+                "repairs": self.repairs_by_kind,
+                "tokens": {
+                    "input": self.tokens.input.unwrap_or_default(),
+                    "cached_input": self.tokens.cached_input.unwrap_or_default(),
+                    "output": self.tokens.output.unwrap_or_default(),
+                    "reasoning": self.tokens.reasoning.unwrap_or_default(),
+                },
+                "unknown_usage_attempts": self.unknown_usage_attempts,
+                "elapsed_ms": self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            });
+            super::files::write_json(path, &state_value)?;
+            super::files::secure_file(path)?;
+        }
+        Ok(())
     }
 }
 
@@ -305,10 +388,9 @@ fn add_count(total: &mut Option<u64>, count: Option<u64>) {
 
 fn usage_is_unknown(usage: &ModelUsage) -> bool {
     usage.input.is_none()
-        && usage.cached_input.is_none()
-        && usage.cache_write.is_none()
-        && usage.output.is_none()
-        && usage.reasoning.is_none()
+        || usage.cached_input.is_none()
+        || usage.output.is_none()
+        || usage.reasoning.is_none()
 }
 
 #[cfg(test)]
@@ -331,6 +413,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut accounting = ShapeAccounting::new(&root, Instant::now());
         accounting.set_provider("chatgpt");
+        accounting.set_state_receipt(&root.join("state"), &root);
         accounting.record_session("thread-1", "shaper", "shaper", "gpt-6.1-sol", "high");
         accounting.record_success(
             "thread-1",
@@ -341,11 +424,16 @@ mod tests {
             &[
                 ModelUsage {
                     input: Some(3),
+                    cached_input: Some(0),
+                    output: Some(0),
+                    reasoning: Some(0),
                     ..ModelUsage::default()
                 },
                 ModelUsage {
                     input: Some(10),
+                    cached_input: Some(0),
                     output: Some(4),
+                    reasoning: Some(0),
                     ..ModelUsage::default()
                 },
             ],
@@ -360,6 +448,9 @@ mod tests {
                 ModelUsage::default(),
                 ModelUsage {
                     input: Some(5),
+                    cached_input: Some(0),
+                    output: Some(0),
+                    reasoning: Some(0),
                     ..ModelUsage::default()
                 },
             ],
@@ -377,6 +468,15 @@ mod tests {
 
         let receipt: Value =
             serde_json::from_slice(&fs::read(root.join("shape-accounting.json")).unwrap()).unwrap();
+        let mirrored: Value = serde_json::from_slice(
+            &fs::read(
+                root.join("state/shaping")
+                    .join(root.file_name().unwrap())
+                    .join("shape-accounting.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(receipt["schema"], 1);
         assert_eq!(receipt["profile"], "shape-v1.3");
         assert_eq!(receipt["outcome"], "failure");
@@ -386,6 +486,13 @@ mod tests {
         assert_eq!(receipt["http_attempts"]["unknown_usage_attempts"], 1);
         assert_eq!(receipt["tokens"]["input"], 18);
         assert_eq!(receipt["terminal_reason"], "undeclared_gate_path");
+        assert_eq!(mirrored["http_attempts"], 4);
+        assert_eq!(mirrored["unknown_usage_attempts"], 1);
+        assert_eq!(mirrored["conversations"].as_array().unwrap().len(), 1);
+        assert_eq!(mirrored["conversations"][0]["validation_passes"], 1);
+        assert_eq!(mirrored["conversations"][0]["style_repairs"], 0);
+        assert_eq!(mirrored["tokens"]["input"], 18);
+        assert_eq!(mirrored["tokens"]["cached_input"], 0);
         assert_eq!(
             receipt["diagnostic"],
             "candidate/undeclared_gate_path: Kogen project configuration is protected.\n  Remove `.kogen/project.yaml` from the change list."
